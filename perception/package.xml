@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>perception</name>
+  <version>0.0.1</version>
+  <description>Fixed traffic monitoring perception package (camera + radar association)</description>
+
+  <maintainer email="you@example.com">sh</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- message generation -->
+  <build_depend>message_generation</build_depend>
+  <build_export_depend>message_runtime</build_export_depend>
+  <exec_depend>message_runtime</exec_depend>
+
+  <!-- runtime / build deps -->
+  <depend>rospy</depend>
+
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>message_filters</depend>
+
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+
+  <!-- system python deps (rosdep keys) -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+</package>

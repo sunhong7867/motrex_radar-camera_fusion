@@ -1,0 +1,24 @@
+<launch>
+  <!-- RViz만 띄울지, bringup까지 같이 띄울지 선택 -->
+  <arg name="with_bringup" default="false" />
+
+  <!-- bringup에 넘길 토픽/경로 인자 -->
+  <arg name="image_topic"       default="/camera/image_raw" />
+  <arg name="camera_info_topic" default="/camera/camera_info" />
+  <arg name="radar_topic"       default="/point_cloud" />
+
+  <!-- RViz config -->
+  <!-- 기본은 4fn_basic_viewer의 srs.rviz로 잡아두고,
+       나중에 perception 전용 rviz 파일 만들면 여기만 바꾸면 됨 -->
+  <arg name="rviz_config" default="$(find 4fn_basic_viewer)/share/srs.rviz" />
+
+  <group if="$(arg with_bringup)">
+    <include file="$(find perception)/launch/bringup.launch">
+      <arg name="image_topic" value="$(arg image_topic)" />
+      <arg name="camera_info_topic" value="$(arg camera_info_topic)" />
+      <arg name="radar_topic" value="$(arg radar_topic)" />
+    </include>
+  </group>
+
+  <node pkg="rviz" type="rviz" name="rviz" args="-d $(arg rviz_config)" output="screen" />
+</launch>

@@ -1,0 +1,24 @@
+<!--
+  This file will launch RVIZ along with SRS Retina Radar node and configure the radar sensor
+ -->
+
+<launch>
+  <!-- Input arguments -->
+  <arg name="ip_addr" default="192.168.137.15" doc="SRS RADAR IP Address"/>
+  <arg name="z_offset" default="0" doc="Z offset"/>
+
+  <!-- Smart Radar System radar node -->
+  <node pkg="4fn_basic_viewer" type="radar_node" name="radar_node" output="screen">
+    <param name="ip_addr" value="$(arg ip_addr)"/>
+    <param name="z_offset" value="$(arg z_offset)"/>
+  </node>
+
+<!--
+  for RVIZ
+-->   
+  <node pkg="rviz" type="rviz" name="rviz" args="-d $(find 4fn_basic_viewer)/share/srs.rviz"/>
+
+<!--
+  for Camera
+ -->   
+</launch>
