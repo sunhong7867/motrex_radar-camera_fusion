@@ -3,285 +3,281 @@
 
 """
 tracker_node.py
-
-역할:
-- 프레임별 DetectionArray(검출 bbox 리스트)를 입력으로 받아
-  IoU 기반 매칭으로 동일 객체를 track으로 유지하면서 "안정적인 id"를 부여
-- output은 동일 msg 타입(DetectionArray)이지만, Detection.id가 tracker가 생성한 track_id로 고정됨
-- speed_estimator_node에서 Kalman(속도 안정화)을 id 기준으로 돌리기 위해 필수 단계
-
-입력:
-- ~in_topic (perception/DetectionArray)  [default: /perception/detections_roi]
-
-출력:
-- ~out_topic (perception/DetectionArray) [default: /perception/tracks]
-
-파라미터:
-- ~iou_threshold (default: 0.3) : track-검출 매칭 최소 IoU
-- ~use_class (default: True)    : cls가 같을 때만 매칭
-- ~max_age_sec (default: 0.8)   : 이 시간 이상 업데이트 없으면 track 제거
-- ~min_hits (default: 2)        : 이 횟수 이상 매칭된 track만 출력(안정화)
-- ~publish_unconfirmed (default: True) : min_hits 미만 track도 출력할지
-- ~min_score (default: 0.0)     : 입력 detection score 필터
-- ~min_bbox_area (default: 0.0) : 입력 bbox area 필터
-- ~debug/enable (default: True)
-- ~debug/topic (default: /perception/tracker_debug)
+역할: YOLO 검출 결과(Bounding Box)를 받아 칼만 필터(SORT)로 추적하여 ID를 부여합니다.
 """
 
-import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
 import rospy
-from std_msgs.msg import String
-
+import numpy as np
 from perception.msg import DetectionArray, Detection, BoundingBox
+from filterpy.kalman import KalmanFilter
+
+# ==============================================================================
+# 1. SORT Algorithm Classes (KalmanBoxTracker, Sort)
+# ==============================================================================
+
+def linear_assignment(cost_matrix):
+    try:
+        from scipy.optimize import linear_sum_assignment
+        x, y = linear_sum_assignment(cost_matrix)
+        return np.array(list(zip(x, y)))
+    except ImportError:
+        rospy.logerr("Scipy not found. Please install: pip3 install scipy")
+        return np.empty((0, 2))
+
+def iou_batch(bb_test, bb_gt):
+    """
+    bb_test: (N, 4)
+    bb_gt: (K, 4)
+    Returns: (N, K) IoU matrix
+    """
+    bb_gt = np.expand_dims(bb_gt, 0)
+    bb_test = np.expand_dims(bb_test, 1)
+    
+    xx1 = np.maximum(bb_test[..., 0], bb_gt[..., 0])
+    yy1 = np.maximum(bb_test[..., 1], bb_gt[..., 1])
+    xx2 = np.minimum(bb_test[..., 2], bb_gt[..., 2])
+    yy2 = np.minimum(bb_test[..., 3], bb_gt[..., 3])
+    
+    w = np.maximum(0., xx2 - xx1)
+    h = np.maximum(0., yy2 - yy1)
+    wh = w * h
+    
+    o = wh / ((bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3] - bb_test[..., 1]) +
+              (bb_gt[..., 2] - bb_gt[..., 0]) * (bb_gt[..., 3] - bb_gt[..., 1]) - wh)
+    return o
+
+def convert_bbox_to_z(bbox):
+    """
+    Takes a bounding box [x1,y1,x2,y2] and returns form [x,y,s,r] where x,y is center
+    s is scale/area and r is aspect ratio
+    """
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    x = bbox[0] + w/2.
+    y = bbox[1] + h/2.
+    s = w * h
+    r = w / float(h)
+    return np.array([x, y, s, r]).reshape((4, 1))
+
+def convert_x_to_bbox(x, score=None):
+    """
+    Takes a bounding box in the centre form [x,y,s,r] and returns it in the form
+    [x1,y1,x2,y2] where x1,y1 is the top left and x2,y2 is the bottom right
+    """
+    w = np.sqrt(x[2] * x[3])
+    h = x[2] / w
+    if score is None:
+        return np.array([x[0]-w/2., x[1]-h/2., x[0]+w/2., x[1]+h/2.]).reshape((1, 4))
+    else:
+        return np.array([x[0]-w/2., x[1]-h/2., x[0]+w/2., x[1]+h/2., score]).reshape((1, 5))
+
+class KalmanBoxTracker(object):
+    """
+    This class represents the internal state of individual tracked objects observed as bbox.
+    """
+    count = 0
+    def __init__(self, bbox):
+        # define constant velocity model
+        self.kf = KalmanFilter(dim_x=7, dim_z=4) 
+        self.kf.F = np.array([[1,0,0,0,1,0,0],[0,1,0,0,0,1,0],[0,0,1,0,0,0,1],[0,0,0,1,0,0,0],  
+                              [0,0,0,0,1,0,0],[0,0,0,0,0,1,0],[0,0,0,0,0,0,1]])
+        self.kf.H = np.array([[1,0,0,0,0,0,0],[0,1,0,0,0,0,0],[0,0,1,0,0,0,0],[0,0,0,1,0,0,0]])
+        self.kf.R[2:,2:] *= 10.
+        self.kf.P[4:,4:] *= 1000.
+        self.kf.P *= 10.
+        self.kf.Q[-1,-1] *= 0.01
+        self.kf.Q[4:,4:] *= 0.01
+
+        self.kf.x[:4] = convert_bbox_to_z(bbox)
+        self.time_since_update = 0
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+        self.history = []
+        self.hits = 0
+        self.hit_streak = 0
+        self.age = 0
+
+    def update(self, bbox):
+        self.time_since_update = 0
+        self.history = []
+        self.hits += 1
+        self.hit_streak += 1
+        self.kf.update(convert_bbox_to_z(bbox))
+
+    def predict(self):
+        if((self.kf.x[6]+self.kf.x[2])<=0):
+            self.kf.x[6] *= 0.0
+        self.kf.predict()
+        self.age += 1
+        if(self.time_since_update>0):
+            self.hit_streak = 0
+        self.time_since_update += 1
+        self.history.append(convert_x_to_bbox(self.kf.x))
+        # [중요] 배열의 첫 번째 요소(bbox)를 반환
+        return self.history[-1][0] 
+
+    def get_state(self):
+        return convert_x_to_bbox(self.kf.x)[0]
+
+class Sort(object):
+    def __init__(self, max_age=1, min_hits=3, iou_threshold=0.1):
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self.trackers = []
+        self.frame_count = 0
+
+    def update(self, dets=np.empty((0, 5))):
+        self.frame_count += 1
+        
+        # 1. Predict existing trackers
+        trks = np.zeros((len(self.trackers), 5))
+        to_del = []
+        ret = []
+        
+        for t, trk in enumerate(trks):
+            # [수정] predict()가 bbox 좌표 [x1, y1, x2, y2]를 반환함
+            pos = self.trackers[t].predict()
+            trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
+            if np.any(np.isnan(pos)):
+                to_del.append(t)
+                
+        trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
+        for t in reversed(to_del):
+            self.trackers.pop(t)
+            
+        # 2. Match detections to trackers
+        matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(dets, trks, self.iou_threshold)
+
+        # 3. Update matched trackers
+        for m in matched:
+            self.trackers[m[1]].update(dets[m[0], :])
+
+        # 4. Create new trackers for unmatched detections
+        for i in unmatched_dets:
+            trk = KalmanBoxTracker(dets[i,:])
+            self.trackers.append(trk)
+            
+        # 5. Output logic
+        i = len(self.trackers)
+        for trk in reversed(self.trackers):
+            d = trk.get_state()
+            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+                ret.append(np.concatenate((d, [trk.id])).reshape(1, -1))
+            i -= 1
+            if (trk.time_since_update > self.max_age):
+                self.trackers.pop(i)
+                
+        if len(ret) > 0:
+            return np.concatenate(ret)
+        return np.empty((0, 5))
+
+def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
+    if len(trackers)==0:
+        return np.empty((0,2),dtype=int), np.arange(len(detections)), np.empty((0,5),dtype=int)
+
+    iou_matrix = iou_batch(detections, trackers)
+
+    if min(iou_matrix.shape) > 0:
+        a = (iou_matrix > iou_threshold).astype(np.int32)
+        if a.sum(1).max() == 1 and a.sum(0).max() == 1:
+            matched_indices = np.stack(np.where(a), axis=1)
+        else:
+            matched_indices = linear_assignment(-iou_matrix)
+    else:
+        matched_indices = np.empty((0,2))
+
+    unmatched_detections = []
+    for d, det in enumerate(detections):
+        if d not in matched_indices[:,0]:
+            unmatched_detections.append(d)
+            
+    unmatched_trackers = []
+    for t, trk in enumerate(trackers):
+        if t not in matched_indices[:,1]:
+            unmatched_trackers.append(t)
+
+    # Filter out matches with low IoU
+    matches = []
+    for m in matched_indices:
+        if iou_matrix[m[0], m[1]] < iou_threshold:
+            unmatched_detections.append(m[0])
+            unmatched_trackers.append(m[1])
+        else:
+            matches.append(m.reshape(1,2))
+            
+    if len(matches) == 0:
+        matches = np.empty((0,2),dtype=int)
+    else:
+        matches = np.concatenate(matches, axis=0)
+
+    return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
 
 
-def _param(name: str, default):
-    return rospy.get_param(name, default) if rospy.has_param(name) else default
-
-
-def bbox_area(bb: BoundingBox) -> float:
-    w = float(bb.xmax) - float(bb.xmin)
-    h = float(bb.ymax) - float(bb.ymin)
-    if w <= 0 or h <= 0:
-        return 0.0
-    return w * h
-
-
-def iou_bbox(a: BoundingBox, b: BoundingBox) -> float:
-    ax1, ay1, ax2, ay2 = float(a.xmin), float(a.ymin), float(a.xmax), float(a.ymax)
-    bx1, by1, bx2, by2 = float(b.xmin), float(b.ymin), float(b.xmax), float(b.ymax)
-
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    inter = iw * ih
-    if inter <= 0.0:
-        return 0.0
-
-    area_a = max(0.0, (ax2 - ax1)) * max(0.0, (ay2 - ay1))
-    area_b = max(0.0, (bx2 - bx1)) * max(0.0, (by2 - by1))
-    union = area_a + area_b - inter
-    if union <= 0.0:
-        return 0.0
-    return float(inter / union)
-
-
-@dataclass
-class Track:
-    tid: int
-    cls: int
-    bbox: BoundingBox
-    score: float
-    created_ts: float
-    last_ts: float
-    hits: int = 1
-    misses: int = 0
-
+# ==============================================================================
+# 2. ROS Wrapper Node
+# ==============================================================================
 
 class TrackerNode:
     def __init__(self):
-        self.in_topic = _param("~in_topic", "/perception/detections_roi")
-        self.out_topic = _param("~out_topic", "/perception/tracks")
+        rospy.init_node('tracker_node', anonymous=True)
+        
+        # Parameters
+        self.iou_thres = rospy.get_param('~iou_threshold', 0.1)
+        self.min_hits = rospy.get_param('~min_hits', 1)
+        self.max_age = rospy.get_param('~max_age', 15) 
+        
+        self.tracker = Sort(max_age=self.max_age, min_hits=self.min_hits, iou_threshold=self.iou_thres)
+        
+        self.sub = rospy.Subscriber(rospy.get_param('~in_topic', '/perception/detections'), 
+                                    DetectionArray, self.callback, queue_size=1)
+        self.pub = rospy.Publisher(rospy.get_param('~out_topic', '/perception/tracks'), 
+                                   DetectionArray, queue_size=1)
+        
+        rospy.loginfo(f"[tracker] iou_th={self.iou_thres} max_age={self.max_age} min_hits={self.min_hits}")
 
-        self.iou_threshold = float(_param("~iou_threshold", 0.30))
-        self.use_class = bool(_param("~use_class", True))
-        self.max_age_sec = float(_param("~max_age_sec", 0.8))
-        self.min_hits = int(_param("~min_hits", 2))
-        self.publish_unconfirmed = bool(_param("~publish_unconfirmed", True))
+    def callback(self, msg):
+        # 1. Convert DetectionArray -> Numpy
+        dets_list = []
+        for d in msg.detections:
+            # [x1, y1, x2, y2, score]
+            dets_list.append([d.bbox.xmin, d.bbox.ymin, d.bbox.xmax, d.bbox.ymax, d.score])
+        
+        dets = np.array(dets_list)
+        if len(dets) == 0:
+            dets = np.empty((0, 5))
 
-        self.min_score = float(_param("~min_score", 0.0))
-        self.min_bbox_area = float(_param("~min_bbox_area", 0.0))
-
-        self.debug_enable = bool(_param("~debug/enable", True))
-        self.debug_topic = _param("~debug/topic", "/perception/tracker_debug")
-        self.pub_debug = rospy.Publisher(self.debug_topic, String, queue_size=3) if self.debug_enable else None
-
-        self.pub_out = rospy.Publisher(self.out_topic, DetectionArray, queue_size=5)
-        rospy.Subscriber(self.in_topic, DetectionArray, self._on_dets, queue_size=1)
-
-        self._tracks: Dict[int, Track] = {}
-        self._next_id = 1
-
-        rospy.loginfo(f"[tracker] in={self.in_topic} out={self.out_topic}")
-        rospy.loginfo(f"[tracker] iou_th={self.iou_threshold} use_class={self.use_class} max_age={self.max_age_sec}s min_hits={self.min_hits}")
-
-    def _now(self, msg_header_stamp) -> float:
-        # ROS time stamp가 들어오면 그걸 쓰고, 없으면 wall time 사용
+        # 2. SORT Update
         try:
-            if msg_header_stamp is not None and msg_header_stamp.to_sec() > 0:
-                return float(msg_header_stamp.to_sec())
-        except Exception:
-            pass
-        return time.time()
+            trackers = self.tracker.update(dets)
+        except Exception as e:
+            rospy.logerr(f"Tracker Update Error: {e}")
+            return
 
-    def _filter_dets(self, dets: List[Detection]) -> List[Detection]:
-        out = []
-        for d in dets:
-            if float(d.score) < self.min_score:
-                continue
-            if self.min_bbox_area > 0.0 and bbox_area(d.bbox) < self.min_bbox_area:
-                continue
-            out.append(d)
-        return out
-
-    def _cleanup_dead_tracks(self, now: float):
-        dead = []
-        for tid, trk in self._tracks.items():
-            if (now - trk.last_ts) > self.max_age_sec:
-                dead.append(tid)
-        for tid in dead:
-            self._tracks.pop(tid, None)
-
-    def _greedy_match(
-        self,
-        dets: List[Detection],
-        track_ids: List[int]
-    ) -> Tuple[List[Tuple[int, int, float]], List[int], List[int]]:
-        """
-        returns:
-        - matches: list of (det_idx, track_idx, iou)
-        - unmatched_det_idx list
-        - unmatched_track_idx list
-        """
-        if len(dets) == 0 or len(track_ids) == 0:
-            return [], list(range(len(dets))), list(range(len(track_ids)))
-
-        T = len(track_ids)
-        D = len(dets)
-        iou_mat = np.zeros((D, T), dtype=np.float64)
-
-        for di, d in enumerate(dets):
-            for ti, tid in enumerate(track_ids):
-                trk = self._tracks[tid]
-                if self.use_class and int(d.cls) != int(trk.cls):
-                    iou_mat[di, ti] = 0.0
-                else:
-                    iou_mat[di, ti] = iou_bbox(d.bbox, trk.bbox)
-
-        matches = []
-        det_used = set()
-        trk_used = set()
-
-        while True:
-            # 가장 큰 IoU 찾기
-            max_idx = np.unravel_index(np.argmax(iou_mat), iou_mat.shape)
-            max_val = float(iou_mat[max_idx])
-            if max_val < self.iou_threshold:
-                break
-
-            di, ti = int(max_idx[0]), int(max_idx[1])
-            if di in det_used or ti in trk_used:
-                iou_mat[di, ti] = 0.0
-                continue
-
-            matches.append((di, ti, max_val))
-            det_used.add(di)
-            trk_used.add(ti)
-
-            # greedy니까 해당 행/열 제거 효과로 0 처리
-            iou_mat[di, :] = 0.0
-            iou_mat[:, ti] = 0.0
-
-        unmatched_dets = [i for i in range(D) if i not in det_used]
-        unmatched_trks = [i for i in range(T) if i not in trk_used]
-        return matches, unmatched_dets, unmatched_trks
-
-    def _create_track(self, d: Detection, now: float) -> int:
-        tid = self._next_id
-        self._next_id += 1
-
-        bb = BoundingBox(xmin=int(d.bbox.xmin), ymin=int(d.bbox.ymin), xmax=int(d.bbox.xmax), ymax=int(d.bbox.ymax))
-        self._tracks[tid] = Track(
-            tid=tid,
-            cls=int(d.cls),
-            bbox=bb,
-            score=float(d.score),
-            created_ts=now,
-            last_ts=now,
-            hits=1,
-            misses=0
-        )
-        return tid
-
-    def _on_dets(self, msg: DetectionArray):
-        now = self._now(msg.header.stamp)
-        self._cleanup_dead_tracks(now)
-
-        dets = self._filter_dets(list(msg.detections))
-        track_ids = list(self._tracks.keys())
-
-        matches, unmatched_det_idx, unmatched_trk_idx = self._greedy_match(dets, track_ids)
-
-        # 1) 매칭된 track 업데이트
-        for di, ti, _ in matches:
-            d = dets[di]
-            tid = track_ids[ti]
-            trk = self._tracks[tid]
-            trk.bbox = BoundingBox(
-                xmin=int(d.bbox.xmin), ymin=int(d.bbox.ymin),
-                xmax=int(d.bbox.xmax), ymax=int(d.bbox.ymax)
-            )
-            trk.score = float(d.score)
-            trk.cls = int(d.cls)
-            trk.last_ts = now
-            trk.hits += 1
-            trk.misses = 0
-            self._tracks[tid] = trk
-
-        # 2) 매칭 안 된 track은 misses 증가 (시간 기반 제거는 cleanup에서 함)
-        for ti in unmatched_trk_idx:
-            tid = track_ids[ti]
-            trk = self._tracks[tid]
-            trk.misses += 1
-            self._tracks[tid] = trk
-
-        # 3) 매칭 안 된 detection은 새 track 생성
-        new_cnt = 0
-        for di in unmatched_det_idx:
-            self._create_track(dets[di], now)
-            new_cnt += 1
-
-        # 4) 출력: track들을 DetectionArray로 변환
-        out = DetectionArray()
-        out.header = msg.header
-        out.detections = []
-
-        pub_cnt = 0
-        for tid, trk in self._tracks.items():
-            confirmed = (trk.hits >= self.min_hits)
-            if (not self.publish_unconfirmed) and (not confirmed):
-                continue
-
+        # 3. Publish Result
+        out_msg = DetectionArray()
+        out_msg.header = msg.header
+        
+        for trk in trackers:
+            # trk: [x1, y1, x2, y2, id]
             d = Detection()
-            d.id = int(tid)
-            d.cls = int(trk.cls)
-            d.score = float(trk.score)
-            d.bbox = trk.bbox
-            out.detections.append(d)
-            pub_cnt += 1
+            d.id = int(trk[4])
+            d.score = 1.0 # Tracking success
+            
+            bbox = BoundingBox()
+            bbox.xmin = int(trk[0])
+            bbox.ymin = int(trk[1])
+            bbox.xmax = int(trk[2])
+            bbox.ymax = int(trk[3])
+            d.bbox = bbox
+            
+            out_msg.detections.append(d)
+            
+        self.pub.publish(out_msg)
 
-        self.pub_out.publish(out)
-
-        if self.pub_debug:
-            self.pub_debug.publish(String(
-                data=f"det_in={len(msg.detections)} det_used={len(dets)} tracks={len(self._tracks)} "
-                     f"matched={len(matches)} new={new_cnt} pub={pub_cnt}"
-            ))
-
-
-def main():
-    rospy.init_node("tracker_node", anonymous=False)
-    TrackerNode()
-    rospy.spin()
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    try:
+        TrackerNode()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

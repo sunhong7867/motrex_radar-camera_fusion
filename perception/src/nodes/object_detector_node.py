@@ -2,284 +2,170 @@
 # -*- coding: utf-8 -*-
 
 """
-object_detector_node.py
+object_detector_node.py (Final)
 
 역할:
-- 카메라 Image 토픽을 구독하여 YOLO로 객체(차량 등)를 검출
-- 검출 결과를 perception/DetectionArray(msg)로 publish
-- (옵션) 디버그용 bbox 오버레이 이미지 publish
+- 카메라 이미지(/camera/image_raw)를 받아 YOLO 추론 수행
+- 결과(BBox, Class, Conf)를 DetectionArray 메시지로 변환하여 발행
+- [중요] 흑백(Mono8) 이미지가 들어오면 RGB로 변환하여 YOLO에 입력
+- detector.yaml 설정 파일과 완벽 연동
 
-입력:
-- ~camera/image_topic (sensor_msgs/Image) [default: /mv_camera/image_raw]
-- (선택) ~camera/camera_info_topic (sensor_msgs/CameraInfo)  # 여기선 필수 아님
-
-출력:
-- ~out_topic (perception/DetectionArray) [default: /perception/detections]
-- ~debug/image_out_topic (sensor_msgs/Image) [default: /perception/detections_vis] (옵션)
-
-파라미터(여러 키를 지원):
-- weights:  ~detector/weights, ~detector/weights_path, ~weights, ~weights_path
-- imgsz:    ~detector/img_size, ~detector/imgsz, ~img_size, ~imgsz
-- conf:     ~detector/conf_thres, ~detector/conf, ~conf_thres, ~conf
-- iou:      ~detector/iou_thres, ~detector/iou, ~iou_thres, ~iou
-- classes:  ~detector/classes, ~classes  (예: [2,3,5,7])
-- max_det:  ~detector/max_det, ~max_det
-- device:   ~detector/device, ~device  (예: "cuda:0" / "cpu")
-- half:     ~detector/half, ~half
-- rate:     ~run_rate_hz, ~max_fps (처리율 제한, default 15Hz)
-- skip:     ~skip_frames (N이면 N프레임마다 1번 처리)
-- debug:    ~debug/publish_image, ~publish_image (bbox 그린 이미지 publish)
+데이터 흐름:
+[Camera] (/camera/image_raw)
+       ⬇
+[Object Detector] (YOLO 추론)
+       ⬇ (/perception/detections_raw)
+[Lane Detector] (차선 필터링)
 """
 
-import os
-import time
-from typing import Any, List, Optional
-
-import numpy as np
 import rospy
-
+import cv2
+import numpy as np
+import os
+import re
+import rospkg
+from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
-
 from perception.msg import DetectionArray, Detection, BoundingBox
 
+# YOLO 라이브러리 (ultralytics)
 try:
-    import cv2
-except Exception:
-    cv2 = None
-
-
-def get_param_first(names: List[str], default: Any) -> Any:
-    for n in names:
-        if rospy.has_param(n):
-            return rospy.get_param(n)
-    return default
-
+    from ultralytics import YOLO
+except ImportError:
+    print("[Error] ultralytics not installed. Run: pip3 install ultralytics")
+    YOLO = None
 
 class ObjectDetectorNode:
     def __init__(self):
-        # --------------------
-        # Topics
-        # --------------------
-        self.image_topic = get_param_first(
-            ["~camera/image_topic", "~image_topic", "~camera_topic"],
-            "/mv_camera/image_raw"
-        )
-        self.out_topic = get_param_first(
-            ["~out_topic", "~detector/out_topic", "~detections_topic"],
-            "/perception/detections"
-        )
+        rospy.init_node("object_detector_node")
 
-        # debug image publish
-        self.publish_debug_image = bool(get_param_first(
-            ["~debug/publish_image", "~publish_image"],
-            True
-        ))
-        self.debug_image_topic = get_param_first(
-            ["~debug/image_out_topic", "~image_out_topic"],
-            "/perception/detections_vis"
-        )
+        if YOLO is None:
+            rospy.logerr("[ObjectDetector] ultralytics library is missing!")
+            return
 
-        # --------------------
-        # Detector params
-        # --------------------
-        self.weights = str(get_param_first(
-            ["~detector/weights", "~detector/weights_path", "~weights", "~weights_path"],
-            "$(find perception)/models/best.pt"  # launch에서 subst_value 쓰는 걸 권장
-        ))
+        # 1. 파라미터 로드 (detector.yaml 대응)
+        # weights 경로 처리 ($(find perception) 치환)
+        raw_weights = rospy.get_param("~detector/weights", "$(find perception)/models/yolo11m.pt")
+        self.weights_path = self.resolve_ros_path(raw_weights)
 
-        self.imgsz = int(get_param_first(
-            ["~detector/img_size", "~detector/imgsz", "~img_size", "~imgsz"],
-            640
-        ))
-        self.conf = float(get_param_first(
-            ["~detector/conf_thres", "~detector/conf", "~conf_thres", "~conf"],
-            0.25
-        ))
-        self.iou = float(get_param_first(
-            ["~detector/iou_thres", "~detector/iou", "~iou_thres", "~iou"],
-            0.45
-        ))
-        self.max_det = int(get_param_first(
-            ["~detector/max_det", "~max_det"],
-            50
-        ))
-        self.device = str(get_param_first(
-            ["~detector/device", "~device"],
-            "cuda:0"
-        ))
-        self.half = bool(get_param_first(
-            ["~detector/half", "~half"],
-            False
-        ))
-        self.agnostic_nms = bool(get_param_first(
-            ["~detector/agnostic_nms", "~agnostic_nms"],
-            False
-        ))
-        self.verbose = bool(get_param_first(
-            ["~detector/verbose", "~verbose"],
-            False
-        ))
+        self.conf_thres = float(rospy.get_param("~detector/conf_thres", 0.25))
+        self.iou_thres = float(rospy.get_param("~detector/iou_thres", 0.45))
+        self.classes = rospy.get_param("~detector/classes", [2, 3, 5, 7]) # Car, Motorcycle, Bus, Truck
+        self.device = rospy.get_param("~detector/device", "cuda:0")
+        self.img_size = int(rospy.get_param("~detector/img_size", 640))
+        
+        # 디버그용 이미지 발행 여부
+        self.publish_debug = rospy.get_param("~runtime/publish_debug", True)
 
-        classes = get_param_first(["~detector/classes", "~classes"], [])
-        self.classes: Optional[List[int]] = None
+        # 2. 토픽 설정
+        # 입력: 카메라 노드에서 오는 영상
+        self.sub_topic = rospy.get_param("~topics/image_in", "/camera/image_raw")
+        # 출력: Lane Detector로 보낼 원본 검출 결과 (_raw 권장)
+        self.pub_topic = rospy.get_param("~topics/detections_out", "/perception/detections_raw")
+        self.debug_topic = rospy.get_param("~topics/debug_image", "/perception/detector_debug")
+
+        # 3. 모델 로딩
+        rospy.loginfo(f"[YOLO] Loading model from {self.weights_path} to {self.device}")
         try:
-            if isinstance(classes, list) and len(classes) > 0:
-                self.classes = [int(x) for x in classes]
-        except Exception:
-            self.classes = None
+            self.model = YOLO(self.weights_path)
+        except Exception as e:
+            rospy.logerr(f"[YOLO] Failed to load model: {e}")
+            # 모델 로드 실패 시 노드 종료 방지를 위해 더미 처리하거나 exit(1)
+            exit(1)
 
-        # --------------------
-        # Rate limiting
-        # --------------------
-        self.run_rate_hz = float(get_param_first(["~run_rate_hz", "~max_fps"], 15.0))
-        self.min_interval = 1.0 / max(1e-3, self.run_rate_hz)
-        self.skip_frames = int(get_param_first(["~skip_frames"], 0))
-        self._frame_count = 0
-        self._last_run_time = 0.0
-
-        # --------------------
-        # ROS I/O
-        # --------------------
+        # 4. 초기화
         self.bridge = CvBridge()
-        self.pub_det = rospy.Publisher(self.out_topic, DetectionArray, queue_size=5)
-        self.pub_img = rospy.Publisher(self.debug_image_topic, Image, queue_size=2) if self.publish_debug_image else None
+        self.pub = rospy.Publisher(self.pub_topic, DetectionArray, queue_size=5)
+        self.pub_debug = rospy.Publisher(self.debug_topic, Image, queue_size=1)
+        self.sub = rospy.Subscriber(self.sub_topic, Image, self.callback, queue_size=1, buff_size=2**24)
 
-        # --------------------
-        # Load model
-        # --------------------
-        self.model = self._load_model()
+        rospy.loginfo(f"[ObjectDetector] Ready. In: {self.sub_topic}, Out: {self.pub_topic}")
 
-        rospy.Subscriber(self.image_topic, Image, self._on_image, queue_size=1, buff_size=2**24)
+    def resolve_ros_path(self, path: str) -> str:
+        """$(find pkg) 패턴을 절대 경로로 변환"""
+        if "$(" in path:
+            try:
+                rp = rospkg.RosPack()
+                def _sub(m): return rp.get_path(m.group(1))
+                return re.sub(r"\$\(\s*find\s+([A-Za-z0-9_]+)\s*\)", _sub, path)
+            except Exception as e:
+                rospy.logwarn(f"[ObjectDetector] Path resolution failed: {e}")
+                return path
+        return path
 
-        rospy.loginfo(f"[detector] image_topic={self.image_topic}")
-        rospy.loginfo(f"[detector] out_topic={self.out_topic}")
-        rospy.loginfo(f"[detector] weights={self.weights}, imgsz={self.imgsz}, conf={self.conf}, iou={self.iou}, classes={self.classes}")
-
-    def _load_model(self):
-        # ultralytics YOLO 사용(실사용에서 제일 간단/안정)
+    def callback(self, msg: Image):
         try:
-            from ultralytics import YOLO
-        except Exception as e:
-            rospy.logerr("[detector] ultralytics not found. Install: pip install ultralytics")
-            raise
-
-        # weights 경로가 $(find ...) 형태면 launch subst_value가 해결해주는 게 정석
-        # 그래도 파일이 없으면 바로 로그로 알려주기
-        if os.path.isabs(self.weights) and (not os.path.exists(self.weights)):
-            rospy.logwarn(f"[detector] weights file not found: {self.weights}")
-
-        model = YOLO(self.weights)
-        return model
-
-    def _should_run(self) -> bool:
-        # skip_frames: N이면 N프레임마다 1번 처리 (예: 2면 2프레임마다 1회)
-        if self.skip_frames > 0:
-            self._frame_count += 1
-            if (self._frame_count % (self.skip_frames + 1)) != 1:
-                return False
-
-        now = time.time()
-        if (now - self._last_run_time) < self.min_interval:
-            return False
-
-        self._last_run_time = now
-        return True
-
-    def _on_image(self, msg: Image):
-        if not self._should_run():
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        except CvBridgeError as e:
             return
 
-        # ROS Image -> cv2 BGR
-        try:
-            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception as e:
-            rospy.logwarn_throttle(2.0, f"[detector] cv_bridge convert failed: {e}")
-            return
+        if len(cv_img.shape) == 2: 
+            img_input = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
+        else:
+            img_input = cv_img
 
-        # YOLO inference
+        # YOLO 추론
+        results = self.model.predict(
+            source=img_input,
+            conf=self.conf_thres,
+            iou=self.iou_thres,
+            device=self.device,
+            imgsz=self.img_size,
+            classes=self.classes,
+            verbose=False,
+            agnostic_nms=True # 여기서도 강제 적용
+        )
+
         det_array = DetectionArray()
         det_array.header = msg.header
+        det_array.detections = []
 
+        if len(results) > 0:
+            result = results[0]
+            if result.boxes:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    
+                    detection = Detection()
+                    detection.id = 0 
+                    
+                    # [핵심 수정] 
+                    # 원래 코드: detection.cls = int(box.cls[0].item())
+                    # 수정 코드: 무조건 0번(단일 클래스)으로 통일
+                    detection.cls = 0  
+                    
+                    detection.score = float(box.conf[0].item())
+                    
+                    bbox = BoundingBox()
+                    bbox.xmin = x1; bbox.ymin = y1; bbox.xmax = x2; bbox.ymax = y2
+                    detection.bbox = bbox
+
+                    det_array.detections.append(detection)
+
+        self.pub.publish(det_array)
+        
+    def publish_debug_image(self, img, det_array):
+        """검출 결과를 그린 이미지를 발행 (Rviz 확인용)"""
+        debug_img = img.copy()
+        for det in det_array.detections:
+            bb = det.bbox
+            cv2.rectangle(debug_img, (bb.xmin, bb.ymin), (bb.xmax, bb.ymax), (0, 255, 0), 2)
+            label = f"{det.cls} {det.score:.2f}"
+            cv2.putText(debug_img, label, (bb.xmin, max(0, bb.ymin-5)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
         try:
-            # ultralytics predict
-            # classes=None이면 전체 클래스, 리스트면 필터
-            results = self.model.predict(
-                source=cv_img,
-                imgsz=self.imgsz,
-                conf=self.conf,
-                iou=self.iou,
-                classes=self.classes,
-                max_det=self.max_det,
-                device=self.device,
-                half=self.half,
-                agnostic_nms=self.agnostic_nms,
-                verbose=self.verbose
-            )
-            if results is None or len(results) == 0:
-                self.pub_det.publish(det_array)
-                return
-
-            r0 = results[0]
-            boxes = getattr(r0, "boxes", None)
-            if boxes is None or len(boxes) == 0:
-                self.pub_det.publish(det_array)
-                return
-
-            # boxes.xyxy, boxes.conf, boxes.cls
-            xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else np.array(boxes.xyxy)
-            conf = boxes.conf.cpu().numpy() if hasattr(boxes.conf, "cpu") else np.array(boxes.conf)
-            cls = boxes.cls.cpu().numpy() if hasattr(boxes.cls, "cpu") else np.array(boxes.cls)
-
-            # publish detections
-            for i in range(xyxy.shape[0]):
-                x1, y1, x2, y2 = xyxy[i].tolist()
-                d = Detection()
-                d.id = int(i)              # tracker 전이면 프레임 내 인덱스로 id 부여
-                d.cls = int(cls[i])
-                d.score = float(conf[i])
-
-                bb = BoundingBox()
-                bb.xmin = int(max(0, round(x1)))
-                bb.ymin = int(max(0, round(y1)))
-                bb.xmax = int(max(0, round(x2)))
-                bb.ymax = int(max(0, round(y2)))
-                d.bbox = bb
-
-                det_array.detections.append(d)
-
-            self.pub_det.publish(det_array)
-
-        except Exception as e:
-            rospy.logwarn_throttle(1.0, f"[detector] inference failed: {e}")
-            # 그래도 빈 DetectionArray는 publish (downstream 안정)
-            self.pub_det.publish(det_array)
-            return
-
-        # debug image (optional)
-        if self.publish_debug_image and self.pub_img is not None and (cv2 is not None):
-            dbg = cv_img.copy()
-            for d in det_array.detections:
-                x1, y1, x2, y2 = d.bbox.xmin, d.bbox.ymin, d.bbox.xmax, d.bbox.ymax
-                cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(
-                    dbg, f"id:{d.id} c:{d.cls} {d.score:.2f}",
-                    (x1, max(0, y1 - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
-                )
-            try:
-                out_msg = self.bridge.cv2_to_imgmsg(dbg, encoding="bgr8")
-                out_msg.header = msg.header
-                self.pub_img.publish(out_msg)
-            except Exception:
-                pass
-
+            msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="bgr8")
+            self.pub_debug.publish(msg)
+        except Exception:
+            pass
 
 def main():
-    rospy.init_node("object_detector_node", anonymous=False)
-    ObjectDetectorNode()
-    rospy.spin()
-
+    try:
+        ObjectDetectorNode()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
 
 if __name__ == "__main__":
     main()

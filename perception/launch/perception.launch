@@ -1,0 +1,42 @@
+<launch>
+    <arg name="detector_yaml" default="$(find perception)/config/detector.yaml" />
+    <arg name="roi_lanes_yaml" default="$(find perception)/config/roi_lanes.yaml" />
+    
+    <node pkg="perception" type="object_detector_node.py" name="object_detector" output="screen">
+        <rosparam command="load" file="$(arg detector_yaml)" />
+        <param name="topics/image_in" value="/camera/image_raw" />
+        <param name="topics/detections_out" value="/perception/detections_raw" />
+    </node>
+
+    <node pkg="perception" type="lane_detector_node.py" name="lane_detector" output="screen">
+        <param name="input_topic" value="/perception/detections_raw" />
+        <param name="output_topic" value="/perception/detections" />
+        <param name="roi_source/path" value="$(find perception)/src/nodes/lane_polys.json" />
+        <rosparam param="policy/target_lanes">["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]</rosparam>
+    </node>
+
+    <node pkg="perception" type="tracker_node.py" name="tracker" output="screen">
+        <param name="in_topic" value="/perception/detections" />
+        <param name="out_topic" value="/perception/tracks" />
+        <param name="iou_threshold" value="0.3" />
+    </node>
+
+    <node pkg="perception" type="association_node.py" name="association" output="screen">
+        <param name="radar/pointcloud_topic" value="/point_cloud" />
+        <param name="bbox_topic" value="/perception/tracks" /> <param name="associated_topic" value="/perception/associated" />
+        
+        <param name="extrinsic_source/path" value="$(find perception)/src/nodes/extrinsic.json" />
+        
+        <param name="association/min_range_m" value="1.0" />
+        <param name="projection/use_distortion" value="true" />
+    </node>
+
+    <node pkg="perception" type="speed_estimator_node.py" name="speed_estimator" output="screen">
+        <param name="in_topic" value="/perception/associated" />
+        <param name="out_topic" value="/perception/output" />
+        
+        <param name="gate/max_speed_kph" value="180.0" />
+        <param name="kf/enable" value="true" />
+    </node>
+
+    </launch>

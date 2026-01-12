@@ -25,13 +25,13 @@ add_message_files(
     AssociationArray.msg
 )
 
+catkin_python_setup()
+
 ## 메시지 생성
 generate_messages(
   DEPENDENCIES
     std_msgs
 )
-
-catkin_python_setup()
 
 catkin_package(
   CATKIN_DEPENDS

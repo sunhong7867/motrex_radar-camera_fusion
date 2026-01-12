@@ -1,25 +1,18 @@
-# detector.yaml
-# 객체 검출 설정(운용 파라미터)
+# config/detector.yaml
 
 detector:
-  type: ultralytics_yolo
-  # best.pt는 패키지 안에 두는 걸 권장 (perception/models/best.pt)
-  weights: "$(find perception)/models/best.pt"
-  device: "cuda:0"          # "cpu" 또는 "cuda:0"
+  weights: "$(find perception)/models/yolo11m.pt"
   img_size: 640
-  conf_thres: 0.25
+  conf_thres: 0.25                            
   iou_thres: 0.45
-  max_det: 50
-
-  # COCO 기준 차량 계열만 사용 예시
-  # 2=car, 3=motorcycle, 5=bus, 7=truck
-  classes: [2, 3, 5, 7]
+  device: "cuda:0"
+  classes: [2, 3, 5, 7] # car, motorcycle, bus, truck
 
 runtime:
-  half: true                # GPU fp16 사용(가능한 경우)
-  agnostic_nms: false
+  half: true
+  agnostic_nms: true  # [수정] false -> true (클래스 무관하게 겹치면 제거)
   verbose: false
 
 topics:
   image_in: /camera/image_raw
-  detections_out: /perception/detections   # (JSON/String 또는 msg로 이후 교체)
+  detections_out: /perception/detections_raw # 노드 이름과 맞춤
