@@ -1,0 +1,42 @@
+<launch>
+    <arg name="detector_yaml" default="$(find perception_test)/config/detector.yaml" />
+    <arg name="roi_lanes_yaml" default="$(find perception_test)/config/roi_lanes.yaml" />
+    
+    <node pkg="perception_test" type="offline_provider.py" name="offline_provider" output="screen">
+        <param name="video_path" value="$(find perception_test)/models/test_video.mp4" />
+        <param name="radar_log_path" value="$(find perception_test)/models/log.txt" />
+        <param name="image_topic" value="/camera/image_raw" />
+        <param name="radar_topic" value="/point_cloud" />
+    </node>
+
+    <node pkg="perception_test" type="object_detector_node.py" name="object_detector" output="screen">
+        <rosparam command="load" file="$(arg detector_yaml)" />
+        <param name="topics/image_in" value="/camera/image_raw" />
+        <param name="topics/detections_out" value="/perception_test/detections_raw" />
+    </node>
+
+    <node pkg="perception_test" type="lane_detector_node.py" name="lane_detector" output="screen">
+        <rosparam command="load" file="$(arg roi_lanes_yaml)" />
+        <param name="input_topic" value="/perception_test/detections_raw" />
+        <param name="output_topic" value="/perception_test/detections" />
+        <param name="roi_source/path" value="$(find perception_test)/src/nodes/lane_polys.json" />
+    </node>
+
+    <node pkg="perception_test" type="tracker_node.py" name="tracker" output="screen">
+        <param name="in_topic" value="/perception_test/detections" />
+        <param name="out_topic" value="/perception_test/tracks" />
+        <param name="iou_threshold" value="0.3" />
+    </node>
+
+    <node pkg="perception_test" type="association_node.py" name="association" output="screen">
+        <param name="radar/pointcloud_topic" value="/point_cloud" />
+        <param name="bbox_topic" value="/perception_test/tracks" />
+        <param name="associated_topic" value="/perception_test/associated" />
+        <param name="extrinsic_source/path" value="$(find perception_test)/src/nodes/extrinsic.json" />
+    </node>
+
+    <node pkg="perception_test" type="speed_estimator_node.py" name="speed_estimator" output="screen">
+        <param name="in_topic" value="/perception_test/associated" />
+        <param name="out_topic" value="/perception_test/output" />
+    </node>
+</launch>

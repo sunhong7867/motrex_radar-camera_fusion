@@ -1,0 +1,48 @@
+# camera_radar_extrinsic.yaml
+# 레이더(RETINA-4FN) 포인트를 카메라로 투영하기 위한 외부파라미터 소스(=extrinsic.json) 경로와 정책
+
+radar:
+  model: RETINA-4FN
+  pointcloud_topic: /point_cloud
+  frame_id: retina_link
+  fields:
+    - { name: x,       type: float32, unit: m }
+    - { name: y,       type: float32, unit: m }
+    - { name: z,       type: float32, unit: m }
+    - { name: power,   type: float32, unit: arbitrary }
+    - { name: doppler, type: float32, unit: mps }
+
+camera:
+  model: MV-GE231GC-M
+  image_topic: /camera/image_raw
+  camera_info_topic: /camera/camera_info
+  optical_frame_id: camera_optical_frame
+
+frames:
+  radar_frame: retina_link
+  camera_frame: camera_optical_frame
+
+extrinsic_source:
+  # 캘리브레이션 수행 결과가 "자동으로 갱신"되는 파일
+  format: json
+  # association_node에서 $(find perception_test) 치환해서 로드
+  path: "$(find perception_test)/src/nodes/extrinsic.json"
+  # extrinsic.json 포맷(고정):
+  # { "R": [[...],[...],[...]], "t": [tx,ty,tz] }  (t: meters)
+
+projection:
+  # 왜곡계수를 투영에 반영할지 (CameraInfo에 D가 있고, 코드가 지원하면 true)
+  use_distortion: false
+  # 카메라 앞쪽 점만 사용 (z가 너무 작거나 음수면 제외)
+  z_min_m: 0.10
+
+association:
+  # CARLA에서 하던 것처럼 최근 N프레임 레이더를 누적해서 사용할지
+  radar_history_frames: 5
+  # bbox 내부 레이더 점 기반 속도/거리 산출 필터
+  min_range_m: 20.0
+  min_abs_doppler_mps: 0.10
+
+time_sync:
+  # 센서 타임스탬프 오프셋이 있으면 보정(초)
+  time_offset_sec: 0.0

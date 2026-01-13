@@ -1,0 +1,24 @@
+[Perception Test Package - Offline Mode]
+
+1. Build Package
+cd ~/motrex/catkin_ws
+catkin_make
+
+2. Source Environment
+source devel/setup.bash
+
+3. Execution Steps (Run in separate terminals)
+
+   (1) Run Data Provider (Video + CSV)
+rosrun perception_test offline_provider.py
+
+   (2) Run Perception System (Detectors, Tracker)
+roslaunch perception_test perception.launch
+
+   (3) Run GUI (Visualizer)
+rosrun perception_test real_gui.py
+
+4. Notes
+   - Ensure 'test_video.mp4' and 'log.csv' are in the 'models' folder.
+   - If permission denied:
+chmod +x src/perception_test/src/nodes/*.py
