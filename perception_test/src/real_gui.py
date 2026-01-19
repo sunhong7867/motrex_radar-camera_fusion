@@ -2,11 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-real_gui.py (Local ID Mapping Version)
+real_gui.py (Data-Driven Axis Fix)
 
-[업데이트 사항]
-- 차선별 로컬 ID 관리: 활성화된 차선에 진입한 차량 순서대로 1, 2, 3... 번호 부여
-- 글로벌-로컬 ID 매핑: 동일 차량(Global ID)에 대해 로컬 번호 유지
+[데이터 분석 결과 반영]
+- log.txt 분석 결과: X축(-42~24m)이 좌우, Y축(11~97m)이 전방임이 확인됨.
+- 수정 사항:
+  1. BEV 그래프 매핑을 scatter(X, Y)로 설정하여 좌우/전방을 올바르게 표시.
+  2. 축 범위를 데이터 분포에 맞춰 좌우(-50~50), 전방(0~100)으로 최적화.
+  3. message_filters로 영상-레이더 시간 동기화 적용.
 """
 
 import sys
@@ -19,8 +22,55 @@ import numpy as np
 import cv2
 
 # ==============================================================================
-# 경로 및 임포트
+# [PARAMETER SETTINGS] 사용자 설정
 # ==============================================================================
+
+# 1. 시스템 및 타이밍
+REFRESH_RATE_MS = 33           # GUI 갱신 주기 (33ms = 30FPS)
+
+# 2. 레이더 필터링
+MIN_SPEED_KMH = 0.2           # 최소 속도 필터 (정지 물체 노이즈 제거용)
+SPEED_THRESHOLD_RED = -0.5       # 접근 기준 (이보다 낮으면 빨강/접근)
+SPEED_THRESHOLD_BLUE = 0.5       # 이탈 기준 (이보다 높으면 파랑/이탈)
+
+# 3. 시각화 크기
+OVERLAY_POINT_RADIUS = 6       # 영상 위 점 크기
+GRAPH_POINT_SIZE = 20          # 그래프 점 크기
+BBOX_LINE_THICKNESS = 2        # 박스 두께
+
+# 4. 그래프 축 범위 (단위: m) - [데이터 분석 기반 설정]
+# X축 데이터가 -42~24m (좌우), Y축 데이터가 11~97m (전방)임
+BEV_LATERAL_LIMIT = (-70, 70)  # 그래프 가로축 (Screen X) 범위
+BEV_FORWARD_LIMIT = (0, 120)   # 그래프 세로축 (Screen Y) 범위
+
+# 3D View 범위
+VIEW3D_X_LIMIT = (-70, 70)     # 좌우
+VIEW3D_Y_LIMIT = (0, 120)      # 전방
+VIEW3D_Z_LIMIT = (-5, 15)      # 높이
+
+# 4. 토글 킬 차선
+START_ACTIVE_LANES = ["IN1"]
+
+# 5. 토픽 이름
+TOPIC_IMAGE = "/camera/image_raw"
+TOPIC_RADAR = "/point_cloud"
+TOPIC_CAMERA_INFO = "/camera/camera_info"
+TOPIC_FINAL_OUT = "/perception_test/output"
+TOPIC_TRACKS = "/perception_test/tracks"
+
+# ==============================================================================
+# Setup
+# ==============================================================================
+try:
+    import matplotlib
+    matplotlib.use('qtagg')
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    from mpl_toolkits.mplot3d import Axes3D
+except ImportError:
+    print("[Error] Matplotlib backend_qtagg 로드 실패.")
+    sys.exit(1)
+
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.append(CURRENT_DIR)
@@ -28,25 +78,110 @@ if CURRENT_DIR not in sys.path:
 try:
     from PySide6 import QtWidgets, QtGui, QtCore
     from PySide6.QtCore import Qt
-
     import rospy
-    import rospkg
+    import message_filters # [동기화 핵심]
     from sensor_msgs.msg import Image, PointCloud2, CameraInfo
     from cv_bridge import CvBridge
     import sensor_msgs.point_cloud2 as pc2
     
-    from perception.msg import AssociationArray, DetectionArray
+    from perception_test.msg import AssociationArray, DetectionArray
     from perception_lib import perception_utils
     from perception_lib import lane_utils
-
 except ImportError as e:
     print(f"\n[GUI Error] 라이브러리 로드 실패: {e}")
     sys.exit(1)
 
 
 # ==============================================================================
-# UI Classes (Canvas & Editor)
+# UI Classes
 # ==============================================================================
+
+class RadarGraphCanvas(FigureCanvas):
+    def __init__(self, parent=None, width=5, height=4, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi, facecolor='#101010')
+        super(RadarGraphCanvas, self).__init__(self.fig)
+        self.setParent(parent)
+        
+        self.ax_bev = self.fig.add_subplot(121, facecolor='#202020')
+        self.ax_3d = self.fig.add_subplot(122, projection='3d', facecolor='#101010')
+        self.fig.tight_layout()
+
+    def update_graphs(self, points, dopplers, powers):
+        self.ax_bev.clear()
+        self.ax_3d.clear()
+        
+        # ---------------------------------------------------------
+        # 1. BEV (Top View) - 전방을 위쪽으로 설정
+        # ---------------------------------------------------------
+        self.ax_bev.set_title("Top View (Forward=Up)", color='white')
+        self.ax_bev.tick_params(colors='white')
+        self.ax_bev.grid(True, color='#404040')
+        self.ax_bev.set_facecolor('#202020')
+        
+        # 분석 결과에 따라 축 설정
+        self.ax_bev.set_xlim(BEV_LATERAL_LIMIT)  # Screen X = Data X (Lateral)
+        self.ax_bev.set_ylim(BEV_FORWARD_LIMIT)  # Screen Y = Data Y (Forward)
+        self.ax_bev.set_xlabel("Lateral (X) [m]", color='gray')
+        self.ax_bev.set_ylabel("Forward (Y) [m]", color='gray')
+        
+        # 비율 고정 (1:1 비율로 보이게 하여 왜곡 방지)
+        self.ax_bev.set_aspect('equal', adjustable='box')
+
+        # ---------------------------------------------------------
+        # 2. 3D View
+        # ---------------------------------------------------------
+        self.ax_3d.set_title("3D View", color='white')
+        self.ax_3d.tick_params(colors='white')
+        
+        self.ax_3d.set_xlim(VIEW3D_X_LIMIT)
+        self.ax_3d.set_ylim(VIEW3D_Y_LIMIT)
+        self.ax_3d.set_zlim(VIEW3D_Z_LIMIT)
+        self.ax_3d.set_xlabel("Lat(X)", color='gray')
+        self.ax_3d.set_ylabel("Fwd(Y)", color='gray')
+        self.ax_3d.set_zlabel("Hgt(Z)", color='gray')
+        
+        try:
+            self.ax_3d.xaxis.set_pane_color((0.1, 0.1, 0.1, 1.0))
+            self.ax_3d.yaxis.set_pane_color((0.1, 0.1, 0.1, 1.0))
+            self.ax_3d.zaxis.set_pane_color((0.1, 0.1, 0.1, 1.0))
+        except: pass
+
+        if points is None or len(points) == 0:
+            self.draw()
+            return
+
+        colors = []
+        valid_indices = []
+        
+        for i in range(len(points)):
+            speed_kmh = dopplers[i] * 3.6
+            if abs(speed_kmh) < MIN_SPEED_KMH: continue
+                
+            valid_indices.append(i)
+            if speed_kmh < SPEED_THRESHOLD_RED: colors.append('red')
+            elif speed_kmh > SPEED_THRESHOLD_BLUE: colors.append('blue')
+            else: colors.append('white')
+
+        if not valid_indices:
+            self.draw()
+            return
+            
+        idx = valid_indices
+        pts_x = points[idx, 0] # Data X = Lateral
+        pts_y = points[idx, 1] # Data Y = Forward
+        pts_z = points[idx, 2] # Data Z = Height
+
+        # ---------------------------------------------------------
+        # [수정 완료] 올바른 매핑
+        # scatter(가로축, 세로축) = (Lateral, Forward) = (pts_x, pts_y)
+        # 이제 전방 거리(Y)가 증가하면 화면 위쪽으로 점이 찍힙니다.
+        # ---------------------------------------------------------
+        self.ax_bev.scatter(pts_x, pts_y, c=colors, s=GRAPH_POINT_SIZE) 
+        
+        self.ax_3d.scatter(pts_x, pts_y, pts_z, c=colors, s=GRAPH_POINT_SIZE)
+        self.draw()
+
+
 class LaneCanvas(QtWidgets.QWidget):
     def __init__(self, bg_img, lane_polys, parent=None):
         super().__init__(parent)
@@ -124,7 +259,7 @@ class LaneCanvas(QtWidgets.QWidget):
 class LaneEditorDialog(QtWidgets.QDialog):
     def __init__(self, bg_img, current_polys, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Lane Polygon Editor (Pop-up)")
+        self.setWindowTitle("Lane Polygon Editor")
         img_h, img_w = bg_img.shape[:2]
         self.resize(img_w + 50, img_h + 150)
         self.polys = {}
@@ -133,10 +268,8 @@ class LaneEditorDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         h_ctrl = QtWidgets.QHBoxLayout()
         self.combo = QtWidgets.QComboBox()
-        
         self.lane_list = ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]
         self.combo.addItems(self.lane_list)
-        
         self.combo.currentTextChanged.connect(lambda t: self.canvas.set_current_lane(t))
         btn_finish = QtWidgets.QPushButton("영역 닫기 (Close)")
         btn_finish.clicked.connect(lambda: self.canvas.finish_current_polygon())
@@ -189,13 +322,13 @@ class ImageCanvasViewer(QtWidgets.QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "Waiting for Camera Stream...")
 
 # ==============================================================================
-# 메인 GUI Class
+# 메인 GUI Class (동기화 적용)
 # ==============================================================================
 class RealWorldGUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Motrex-SKKU Sensor Fusion GUI")
-        self.resize(1280, 850)
+        self.resize(1280, 950)
 
         rospy.init_node('real_gui_node', anonymous=True)
         self.bridge = CvBridge()
@@ -210,31 +343,48 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.Extr_R = np.eye(3)
         self.Extr_t = np.zeros((3,1))
         self.vis_objects = [] 
-        
-        # [신규 추가] ID 매핑을 위한 변수
         self.lane_counters = {name: 0 for name in ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]}
-        self.global_to_local_ids = {} # {global_id: local_id}
+        self.global_to_local_ids = {} 
 
         self.load_extrinsic()
         self.load_lane_polys()
         self.init_ui()
 
-        rospy.Subscriber("/camera/image_raw", Image, self.cb_image, queue_size=1, buff_size=2**24)
-        rospy.Subscriber("/point_cloud", PointCloud2, self.cb_radar, queue_size=1)
-        rospy.Subscriber("/camera/camera_info", CameraInfo, self.cb_info, queue_size=1)
-        rospy.Subscriber("/perception/output", AssociationArray, self.cb_final_result, queue_size=1)
-        rospy.Subscriber("/perception/tracks", DetectionArray, self.cb_tracker_result, queue_size=1)
+        # -------------------------------------------------------------
+        # Time Synchronizer (타이밍 문제 해결)
+        # -------------------------------------------------------------
+        image_sub = message_filters.Subscriber(TOPIC_IMAGE, Image)
+        radar_sub = message_filters.Subscriber(TOPIC_RADAR, PointCloud2)
+        
+        # slop=0.1s (100ms) 이내의 오차를 가진 데이터끼리 묶어서 콜백 실행
+        self.ts = message_filters.ApproximateTimeSynchronizer([image_sub, radar_sub], 10, 0.1)
+        self.ts.registerCallback(self.cb_sync)
+
+        rospy.Subscriber(TOPIC_CAMERA_INFO, CameraInfo, self.cb_info, queue_size=1)
+        rospy.Subscriber(TOPIC_FINAL_OUT, AssociationArray, self.cb_final_result, queue_size=1)
+        rospy.Subscriber(TOPIC_TRACKS, DetectionArray, self.cb_tracker_result, queue_size=1)
 
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_loop)
-        self.timer.start(33)
+        self.timer.start(REFRESH_RATE_MS)
+        
+        self.timer_graph = QtCore.QTimer()
+        self.timer_graph.timeout.connect(self.update_graphs)
+        self.timer_graph.start(REFRESH_RATE_MS)
+
         self.last_update_time = time.time()
 
     def init_ui(self):
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
+        
+        left_widget = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_widget)
         self.viewer = ImageCanvasViewer()
-        layout.addWidget(self.viewer, stretch=4)
+        self.graph_canvas = RadarGraphCanvas(width=5, height=3) 
+        left_layout.addWidget(self.viewer, stretch=2) 
+        left_layout.addWidget(self.graph_canvas, stretch=1) 
+        layout.addWidget(left_widget, stretch=4)
         
         panel = QtWidgets.QWidget(); panel.setFixedWidth(280)
         vbox = QtWidgets.QVBoxLayout(panel); vbox.setAlignment(Qt.AlignTop)
@@ -258,28 +408,28 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         gb_vis = QtWidgets.QGroupBox("3. View Options")
         v_vis = QtWidgets.QVBoxLayout()
-        
         self.chk_show_poly = QtWidgets.QCheckBox("Show Lane Polygons (ROI)")
-        self.chk_show_poly.setChecked(True)
+        self.chk_show_poly.setChecked(False)
         v_vis.addWidget(self.chk_show_poly)
         v_vis.addWidget(QtWidgets.QLabel("--- Filter Lane (Box & Poly) ---"))
 
         self.chk_lanes = {}
         display_order = ["IN1", "OUT1", "IN2", "OUT2", "IN3", "OUT3"]
         g_vis = QtWidgets.QGridLayout()
+        
         for i, name in enumerate(display_order):
             chk = QtWidgets.QCheckBox(name)
-            chk.setChecked(True)
+            is_active = name in START_ACTIVE_LANES
+            chk.setChecked(is_active)
+            
             self.chk_lanes[name] = chk
             g_vis.addWidget(chk, i//2, i%2)
             
         v_vis.addLayout(g_vis)
         
-        # [추가] ID 리셋 버튼
         btn_reset_id = QtWidgets.QPushButton("Reset Local IDs")
         btn_reset_id.clicked.connect(self.reset_ids)
         v_vis.addWidget(btn_reset_id)
-        
         gb_vis.setLayout(v_vis)
         vbox.addWidget(gb_vis)
 
@@ -289,12 +439,43 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         layout.addWidget(panel, stretch=1)
 
     def reset_ids(self):
-        """로컬 ID 카운터 및 매핑 초기화"""
         self.lane_counters = {name: 0 for name in self.lane_counters.keys()}
         self.global_to_local_ids = {}
         self.lbl_log.setText("Local IDs Reset.")
 
-    # ------------------ Callback Logic ------------------
+    # ------------------ Callback (Synchronized) ------------------
+    def cb_sync(self, img_msg, radar_msg):
+        # 1. 이미지 저장
+        try:
+            self.cv_image = self.bridge.imgmsg_to_cv2(img_msg, "bgr8")
+        except: pass
+
+        # 2. 레이더 저장
+        try:
+            target_fields = ("x", "y", "z", "power", "doppler")
+            field_names = [f.name for f in radar_msg.fields]
+            if "power" not in field_names and "intensity" in field_names:
+                target_fields = ("x", "y", "z", "intensity", "doppler")
+            
+            g = pc2.read_points(radar_msg, field_names=target_fields, skip_nans=True)
+            self.radar_points_all = np.array(list(g))
+            
+            if self.radar_points_all.shape[0] > 0:
+                self.radar_points = self.radar_points_all[:, :3]
+                if self.radar_points_all.shape[1] >= 5:
+                    self.radar_power = self.radar_points_all[:, 3]
+                    self.radar_doppler = self.radar_points_all[:, 4]
+                else:
+                    self.radar_power = np.zeros(len(self.radar_points))
+                    self.radar_doppler = np.zeros(len(self.radar_points))
+            else:
+                self.radar_points = None
+        except: pass
+
+    def cb_info(self, msg):
+        if self.cam_K is None:
+            self.cam_K = np.array(msg.K).reshape(3, 3)
+
     def cb_final_result(self, msg):
         objects = []
         for obj in msg.objects:
@@ -317,36 +498,28 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 })
             self.vis_objects = objects
 
-    def cb_image(self, msg):
-        try:
-            f = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-            if len(f.shape) == 2: f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
-            self.cv_image = f
-        except: pass
-    
-    def cb_radar(self, msg):
-        try:
-            g = pc2.read_points(msg, field_names=("x","y","z"), skip_nans=True)
-            self.radar_points = np.array(list(g))
-        except: pass
-
-    def cb_info(self, msg):
-        if self.cam_K is None: self.cam_K = np.array(msg.K).reshape(3,3)
-
     def get_text_position(self, pts):
         sorted_indices = np.argsort(pts[:, 1])[::-1] 
         bottom_two = pts[sorted_indices[:2]] 
         left_idx = np.argmin(bottom_two[:, 0])
         return tuple(bottom_two[left_idx])
     
-    # ------------------ Update Loop (Rendering) ------------------
+    # ------------------ Update Loops ------------------
+    def update_graphs(self):
+        if self.radar_points is not None:
+            if not hasattr(self, 'radar_doppler'):
+                self.radar_doppler = np.zeros(len(self.radar_points))
+                self.radar_power = np.zeros(len(self.radar_points))
+                
+            self.graph_canvas.update_graphs(self.radar_points, self.radar_doppler, self.radar_power)
+
     def update_loop(self):
         if self.cv_image is None: return
         disp = self.cv_image.copy()
 
-        # 1. Objects Draw
+        # 1. Objects
         for obj in self.vis_objects:
-            g_id = obj['id'] # 트래커의 글로벌 ID
+            g_id = obj['id'] 
             x1, y1, x2, y2 = obj['bbox']
             cx, cy = (x1 + x2) // 2, y2 
             
@@ -359,27 +532,21 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                             target_lane = name
                             break
             
-            # [필터링 로직] 활성화된 차선에 있는 경우만 표시
             if target_lane:
-                # [로컬 ID 매핑] 처음 보는 차라면 해당 차선 번호 부여
                 if g_id not in self.global_to_local_ids:
                     self.lane_counters[target_lane] += 1
                     self.global_to_local_ids[g_id] = self.lane_counters[target_lane]
-                
                 local_id = self.global_to_local_ids[g_id]
 
-                cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), BBOX_LINE_THICKNESS)
                 vel = obj['vel']
                 v_str = f"{int(vel)}km/h" if np.isfinite(vel) else "--km/h"
-                
-                # 글로벌 ID 대신 로컬 ID(local_id) 표시
                 line1 = f"No: {local_id} ({target_lane})"
                 line2 = f"Vel: {v_str}"
                 
                 font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
                 (w1, h1), _ = cv2.getTextSize(line1, font, scale, thick)
                 (w2, h2), _ = cv2.getTextSize(line2, font, scale, thick)
-                
                 max_w = max(w1, w2)
                 total_h = h1 + h2 + 8 
                 bg_top = y1 - total_h - 12
@@ -387,27 +554,40 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 cv2.putText(disp, line1, (x1 + 5, y1 - h2 - 10), font, scale, (255, 255, 255), thick)
                 cv2.putText(disp, line2, (x1 + 5, y1 - 5), font, scale, (255, 255, 255), thick)
 
-        # 2. Radar
+        # 2. Radar Overlay
         if self.radar_points is not None and self.cam_K is not None:
             pts_r = self.radar_points.T
             pts_c = self.Extr_R @ pts_r + self.Extr_t.reshape(3,1)
-            valid = pts_c[2, :] > 0.5
-            if np.any(valid):
-                pts_c = pts_c[:, valid]
+            valid_idx = pts_c[2, :] > 0.5
+            
+            if np.any(valid_idx):
+                pts_c = pts_c[:, valid_idx]
+                if hasattr(self, 'radar_doppler'):
+                    dopplers = self.radar_doppler[valid_idx]
+                else:
+                    dopplers = np.zeros(pts_c.shape[1])
+
                 uvs = self.cam_K @ pts_c
                 uvs /= uvs[2, :]
                 h, w = disp.shape[:2]
+                
                 for i in range(uvs.shape[1]):
                     u, v = int(uvs[0, i]), int(uvs[1, i])
                     if 0 <= u < w and 0 <= v < h:
-                        cv2.circle(disp, (u, v), 2, (0, 255, 255), -1)
+                        speed_kmh = dopplers[i] * 3.6
+                        if abs(speed_kmh) < MIN_SPEED_KMH: continue
 
-        # 3. Lane Polygons
+                        if speed_kmh < SPEED_THRESHOLD_RED: color = (0, 0, 255)
+                        elif speed_kmh > SPEED_THRESHOLD_BLUE: color = (255, 0, 0)
+                        else: color = (255, 255, 255)
+                        
+                        cv2.circle(disp, (u, v), OVERLAY_POINT_RADIUS, color, -1)
+
+        # 3. Lane
         if self.chk_show_poly.isChecked():
             for name, pts in self.lane_polys.items():
                 if name in self.chk_lanes and not self.chk_lanes[name].isChecked():
                     continue
-
                 if pts is not None and len(pts) > 0:
                     cv2.polylines(disp, [pts], True, (0, 255, 255), 2)
                     text_pos = self.get_text_position(pts)
@@ -442,7 +622,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             except: pass
 
     def run_calibration(self):
-        calib_path = os.path.join(self.nodes_dir, "..", "perception_lib", "calibration_manager.py")
+        calib_path = os.path.join(CURRENT_DIR, "perception_lib", "calibration_manager.py")
         subprocess.Popen(["python3", calib_path])
 
 def main():

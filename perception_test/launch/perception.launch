@@ -3,10 +3,16 @@
     <arg name="roi_lanes_yaml" default="$(find perception_test)/config/roi_lanes.yaml" />
     
     <node pkg="perception_test" type="offline_provider.py" name="offline_provider" output="screen">
-        <param name="video_path" value="$(find perception_test)/models/test_video.mp4" />
-        <param name="radar_log_path" value="$(find perception_test)/models/log.txt" />
-        <param name="image_topic" value="/camera/image_raw" />
-        <param name="radar_topic" value="/point_cloud" />
+        <param name="bag_path" value="$(find perception_test)/models/my_test_data.bag" />
+        
+        <param name="intrinsic_path" value="$(find perception_test)/config/camera_intrinsic.yaml" />
+        
+        <param name="bag_image_topic" value="/camera/image_raw" />
+        <param name="bag_radar_topic" value="/point_cloud" />
+        
+        <param name="out_image_topic" value="/camera/image_raw" />
+        <param name="out_radar_topic" value="/point_cloud" />
+        <param name="out_info_topic" value="/camera/camera_info" />
     </node>
 
     <node pkg="perception_test" type="object_detector_node.py" name="object_detector" output="screen">

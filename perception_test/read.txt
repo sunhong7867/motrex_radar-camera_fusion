@@ -9,9 +9,6 @@ source devel/setup.bash
 
 3. Execution Steps (Run in separate terminals)
 
-   (1) Run Data Provider (Video + CSV)
-rosrun perception_test offline_provider.py
-
    (2) Run Perception System (Detectors, Tracker)
 roslaunch perception_test perception.launch
 

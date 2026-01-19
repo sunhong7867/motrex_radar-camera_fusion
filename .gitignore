@@ -1,0 +1,10 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Large data / media
+*.mp4
+*.bag
+*.bag.active
+*.db3
+*.mcap
