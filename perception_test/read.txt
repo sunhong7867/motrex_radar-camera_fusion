@@ -33,5 +33,5 @@ rosrun perception_test radar_metrics_node.py
 
 chmod +x ~/motrex/catkin_ws/src/perception_test/src/nodes/radar_cluster_bbox_viz.py
 rosrun perception_test radar_cluster_bbox_viz.py _frame_id:=retina_link _point_scale:=0.8 _bbox_width:=0.15
-rosrun perception_test radar_cluster_bbox_viz.py _frame_id:=retina_link _draw_text:=true _text_size:=0.7
+rosrun perception_test radar_cluster_bbox_viz.py _frame_id:=retina_link _draw_text:=true _text_size:=3
 

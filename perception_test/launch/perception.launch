@@ -44,5 +44,6 @@
     <node pkg="perception_test" type="speed_estimator_node.py" name="speed_estimator" output="screen">
         <param name="in_topic" value="/perception_test/associated" />
         <param name="out_topic" value="/perception_test/output" />
+        <param name="gate/min_speed_kph" value="0.0" />
     </node>
 </launch>

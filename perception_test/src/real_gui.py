@@ -52,7 +52,7 @@ GRAPH_POINT_SIZE = 20          # 그래프 점 크기
 BBOX_LINE_THICKNESS = 2        # 박스 두께
 
 # 4. 그래프 축 범위 (단위: m) - [데이터 분석 기반 설정]
-BEV_LATERAL_LIMIT = (-70, 70)  # 그래프 가로축 (Screen X) 범위
+BEV_LATERAL_LIMIT = (-20, 20)  # 그래프 가로축 (Screen X) 범위
 BEV_FORWARD_LIMIT = (0, 120)   # 그래프 세로축 (Screen Y) 범위
 
 # 4. 토글 킬 차선
@@ -113,7 +113,7 @@ class RadarGraphCanvas(FigureCanvas):
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
         self.ax_bev = self.fig.add_subplot(111, facecolor='#202020')
-        self.fig.tight_layout()
+        self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
     @staticmethod
     def cluster_points(points_xy, max_dist, min_points):
@@ -164,11 +164,11 @@ class RadarGraphCanvas(FigureCanvas):
         self.ax_bev.set_xlabel("Lateral (X) [m]", color='gray')
         self.ax_bev.set_ylabel("Forward (Y) [m]", color='gray')
 
-        # 비율 고정 (1:1 비율로 보이게 하여 왜곡 방지)
-        self.ax_bev.set_aspect('equal', adjustable='box')
+        # 위젯 크기에 맞춰 화면을 가득 채우도록 비율 해제
+        self.ax_bev.set_aspect('auto', adjustable='box')
 
         if points is None or len(points) == 0:
-            self.fig.tight_layout()
+            self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
             self.draw_idle()
             return
 
@@ -189,7 +189,7 @@ class RadarGraphCanvas(FigureCanvas):
                 colors.append('white')
 
         if not valid_indices:
-            self.fig.tight_layout()
+            self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
             self.draw_idle()
             return
 
@@ -218,7 +218,7 @@ class RadarGraphCanvas(FigureCanvas):
                 self.ax_bev.add_patch(rect)
 
         # Qt+Matplotlib 조합에서 draw_idle이 안정적
-        self.fig.tight_layout()
+        self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
         self.draw_idle()
 
 
@@ -382,7 +382,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Motrex-SKKU Sensor Fusion GUI")
-        self.resize(1280, 950)
+        self.resize(1900, 2000)
 
         rospy.init_node('real_gui_node', anonymous=True)
         self.bridge = CvBridge()
@@ -400,6 +400,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.lane_counters = {name: 0 for name in ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]}
         self.global_to_local_ids = {}
         self.is_paused = False
+        self.extrinsic_mtime = None
+        self.extrinsic_last_loaded = None
 
         # Pause 동안 들어오는 동기 데이터 버퍼(프레임 단위). Resume 시 버퍼를 먼저 재생.
         self.pause_queue = deque(maxlen=900)  # 대략 30FPS 기준 30초
@@ -440,7 +442,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         left_layout = QtWidgets.QVBoxLayout(left_widget)
         self.viewer = ImageCanvasViewer()
         self.graph_canvas = RadarGraphCanvas(width=5, height=3)
-        left_layout.addWidget(self.viewer, stretch=2)
+        self.graph_canvas.setMinimumSize(self.viewer.minimumSize())
+        left_layout.addWidget(self.viewer, stretch=1)
         left_layout.addWidget(self.graph_canvas, stretch=1)
         layout.addWidget(left_widget, stretch=4)
 
@@ -600,6 +603,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
     # ------------------ Update Loops ------------------
     def update_loop(self):
+        self._maybe_reload_extrinsic()
         if self.is_paused:
             return
 
@@ -625,6 +629,29 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         radar_doppler = frame["radar_doppler"]
 
         # 1. Objects
+        front_lanes = {"IN1", "IN2", "IN3"}
+        front_by_lane = {}
+        for obj in self.vis_objects:
+            g_id = obj['id']
+            x1, y1, x2, y2 = obj['bbox']
+            cx, cy = (x1 + x2) // 2, y2
+
+            target_lane = None
+            for name, chk in self.chk_lanes.items():
+                if chk.isChecked():
+                    poly = self.lane_polys.get(name)
+                    if poly is not None and len(poly) > 2:
+                        if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
+                            target_lane = name
+                            break
+
+            if target_lane and target_lane in front_lanes:
+                current = front_by_lane.get(target_lane)
+                if current is None or y2 > current["y2"]:
+                    front_by_lane[target_lane] = {"id": g_id, "y2": y2}
+
+        front_ids = {v["id"] for v in front_by_lane.values()}
+
         for obj in self.vis_objects:
             g_id = obj['id']
             x1, y1, x2, y2 = obj['bbox']
@@ -647,6 +674,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
                 cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), BBOX_LINE_THICKNESS)
                 vel = obj['vel']
+                if target_lane in front_lanes and g_id not in front_ids:
+                    vel = float("nan")
                 v_str = f"{int(vel)}km/h" if np.isfinite(vel) else "--km/h"
                 line1 = f"No: {local_id} ({target_lane})"
                 line2 = f"Vel: {v_str}"
@@ -662,6 +691,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 cv2.putText(disp, line2, (x1 + 5, y1 - 5), font, scale, (255, 255, 255), thick)
 
         # 2. Radar Overlay
+        projected_count = 0
         if radar_points is not None and self.cam_K is not None:
             pts_r = radar_points.T
             pts_c = self.Extr_R @ pts_r + self.Extr_t.reshape(3, 1)
@@ -670,6 +700,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             if np.any(valid_idx):
                 pts_c = pts_c[:, valid_idx]
                 dopplers = radar_doppler[valid_idx] if radar_doppler is not None else np.zeros(pts_c.shape[1])
+                projected_count = int(pts_c.shape[1])
 
                 uvs = self.cam_K @ pts_c
                 uvs /= uvs[2, :]
@@ -690,6 +721,26 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                             color = (255, 255, 255)
 
                         cv2.circle(disp, (u, v), OVERLAY_POINT_RADIUS, color, -1)
+
+
+        speed_values = [obj["vel"] for obj in self.vis_objects if np.isfinite(obj["vel"])]
+        speed_text = "--"
+        if speed_values:
+            speed_text = f"{np.median(speed_values):.1f}km/h"
+
+        extrinsic_text = "Extrinsic: --"
+        if self.extrinsic_last_loaded is not None:
+            extrinsic_text = time.strftime("Extrinsic: %H:%M:%S", time.localtime(self.extrinsic_last_loaded))
+
+        overlay_lines = [
+            extrinsic_text,
+            f"Radar in view: {projected_count}",
+            f"Median speed: {speed_text}",
+        ]
+        for idx, line in enumerate(overlay_lines):
+            y = 30 + idx * 20
+            cv2.putText(disp, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
 
         # 3. Lane
         if self.chk_show_poly.isChecked():
@@ -735,15 +786,26 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     data = json.load(f)
                 self.Extr_R = np.array(data['R'])
                 self.Extr_t = np.array(data['t'])
+                self.extrinsic_mtime = os.path.getmtime(self.extrinsic_path)
+                self.extrinsic_last_loaded = time.time()
                 if hasattr(self, "lbl_log"):
                     self.lbl_log.setText("Extrinsic Loaded.")
             except:
                 pass
 
     def run_calibration(self):
-        calib_path = os.path.join(CURRENT_DIR, "perception_lib", "calibration_manager.py")
+        calib_path = os.path.join(CURRENT_DIR, "nodes", "calibration_node.py")
         subprocess.Popen(["python3", calib_path])
 
+    def _maybe_reload_extrinsic(self):
+        if not os.path.exists(self.extrinsic_path):
+            return
+        try:
+            mtime = os.path.getmtime(self.extrinsic_path)
+        except OSError:
+            return
+        if self.extrinsic_mtime is None or mtime > self.extrinsic_mtime:
+            self.load_extrinsic()
 
 def main():
     try:
