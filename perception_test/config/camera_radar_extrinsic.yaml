@@ -26,7 +26,7 @@ extrinsic_source:
   # 캘리브레이션 수행 결과가 "자동으로 갱신"되는 파일
   format: json
   # association_node에서 $(find perception_test) 치환해서 로드
-  path: "$(find perception_test)/src/nodes/extrinsic.json"
+  path: "$(find perception)/config/extrinsic.json"
   # extrinsic.json 포맷(고정):
   # { "R": [[...],[...],[...]], "t": [tx,ty,tz] }  (t: meters)
 
@@ -37,8 +37,8 @@ projection:
   z_min_m: 0.10
 
 association:
-  # CARLA에서 하던 것처럼 최근 N프레임 레이더를 누적해서 사용할지
-  radar_history_frames: 5
+  # 최근 N프레임 레이더를 누적해서 사용할지
+  radar_history_frames: 2
   # bbox 내부 레이더 점 기반 속도/거리 산출 필터
   min_range_m: 20.0
   min_abs_doppler_mps: 0.10

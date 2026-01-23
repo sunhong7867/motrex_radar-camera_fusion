@@ -69,15 +69,9 @@ TOPIC_ASSOCIATED = "/perception_test/associated"
 # ==============================================================================
 # Setup
 # ==============================================================================
-try:
-    import matplotlib
-    matplotlib.use('qtagg')
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-    from matplotlib.figure import Figure
-    from matplotlib.patches import Rectangle
-except ImportError:
-    print("[Error] Matplotlib backend_qtagg 로드 실패.")
-    sys.exit(1)
+# Note: Matplotlib-based radar graphs have been removed.
+# We no longer import or use matplotlib in this GUI since the
+# radar BEV graph and pause functionality have been dropped.
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
@@ -87,6 +81,7 @@ try:
     from PySide6 import QtWidgets, QtGui, QtCore
     from PySide6.QtCore import Qt
     import rospy
+    import rospkg
     import message_filters  # [동기화 핵심]
     from sensor_msgs.msg import Image, PointCloud2, CameraInfo
     from cv_bridge import CvBridge
@@ -104,122 +99,16 @@ except ImportError as e:
 # UI Classes
 # ==============================================================================
 
-class RadarGraphCanvas(FigureCanvas):
-    def __init__(self, parent=None, width=5, height=4, dpi=100):
-        self.fig = Figure(figsize=(width, height), dpi=dpi, facecolor='#101010')
-        super(RadarGraphCanvas, self).__init__(self.fig)
-        self.setParent(parent)
 
-        # 리사이즈/레이아웃 반영 안정화
-        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-
-        self.ax_bev = self.fig.add_subplot(111, facecolor='#202020')
-        self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-
-    @staticmethod
-    def cluster_points(points_xy, max_dist, min_points):
-        """간단한 거리 기반 클러스터링(DFS/BFS).
-        points_xy: (N,2)
-        return: [np.array(indices), ...]
-        """
-        n_points = points_xy.shape[0]
-        visited = np.zeros(n_points, dtype=bool)
-        clusters = []
-
-        for i in range(n_points):
-            if visited[i]:
-                continue
-            queue = [i]
-            visited[i] = True
-            cluster_indices = []
-
-            while queue:
-                idx = queue.pop()
-                cluster_indices.append(idx)
-                dists = np.linalg.norm(points_xy - points_xy[idx], axis=1)
-                neighbors = np.where(dists <= max_dist)[0]
-                for nb in neighbors:
-                    if not visited[nb]:
-                        visited[nb] = True
-                        queue.append(nb)
-
-            if len(cluster_indices) >= min_points:
-                clusters.append(np.array(cluster_indices, dtype=int))
-
-        return clusters
-
-    def update_graphs(self, points, dopplers, powers):
-        self.ax_bev.clear()
-
-        # ---------------------------------------------------------
-        # 1. BEV (Top View) - 전방을 위쪽으로 설정
-        # ---------------------------------------------------------
-        self.ax_bev.set_title("Radar Point Cloud (Top View)", color='white')
-        self.ax_bev.tick_params(colors='white')
-        self.ax_bev.grid(True, color='#404040')
-        self.ax_bev.set_facecolor('#202020')
-
-        # 분석 결과에 따라 축 설정
-        self.ax_bev.set_xlim(BEV_LATERAL_LIMIT)  # Screen X = Data X (Lateral)
-        self.ax_bev.set_ylim(BEV_FORWARD_LIMIT)  # Screen Y = Data Y (Forward)
-        self.ax_bev.set_xlabel("Lateral (X) [m]", color='gray')
-        self.ax_bev.set_ylabel("Forward (Y) [m]", color='gray')
-
-        # 위젯 크기에 맞춰 화면을 가득 채우도록 비율 해제
-        self.ax_bev.set_aspect('auto', adjustable='box')
-
-        if points is None or len(points) == 0:
-            self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-            self.draw_idle()
-            return
-
-        colors = []
-        valid_indices = []
-
-        for i in range(len(points)):
-            speed_kmh = dopplers[i] * 3.6
-            if abs(speed_kmh) < NOISE_MIN_SPEED_KMH:
-                continue
-
-            valid_indices.append(i)
-            if speed_kmh < SPEED_THRESHOLD_RED:
-                colors.append('red')
-            elif speed_kmh > SPEED_THRESHOLD_BLUE:
-                colors.append('blue')
-            else:
-                colors.append('white')
-
-        if not valid_indices:
-            self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-            self.draw_idle()
-            return
-
-        idx = valid_indices
-        pts_x = points[idx, 0]  # Data X = Lateral
-        pts_y = points[idx, 1]  # Data Y = Forward
-
-        self.ax_bev.scatter(pts_x, pts_y, c=colors, s=GRAPH_POINT_SIZE)
-
-        moving_mask = np.abs(dopplers[idx] * 3.6) >= MOVING_CLUSTER_MIN_SPEED_KMH
-        moving_points = np.column_stack((pts_x[moving_mask], pts_y[moving_mask]))
-        if len(moving_points) > 0:
-            clusters = RadarGraphCanvas.cluster_points(moving_points, CLUSTER_MAX_DIST_M, CLUSTER_MIN_POINTS)
-            for cluster in clusters:
-                cluster_pts = moving_points[cluster]
-                min_x, min_y = np.min(cluster_pts, axis=0)
-                max_x, max_y = np.max(cluster_pts, axis=0)
-                rect = Rectangle(
-                    (min_x, min_y),
-                    max_x - min_x,
-                    max_y - min_y,
-                    linewidth=2,
-                    edgecolor='lime',
-                    facecolor='none'
-                )
-                self.ax_bev.add_patch(rect)
-
-        self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-        self.draw_idle()
+# -----------------------------------------------------------------------------
+# The RadarGraphCanvas class and related clustering code have been removed.  The
+# GUI no longer displays a separate radar point cloud graph.  All overlay and
+# visualization is handled directly within the image view in update_loop().
+    
+# The old CalibrationDialog (which launched separate calibration nodes and drew a
+# BEV graph) has been removed. Calibration is now triggered directly from the
+# main GUI via the ManualCalibWindow for extrinsic calibration, and the
+# calibration nodes can be run independently if needed.
 
 
 class LaneCanvas(QtWidgets.QWidget):
@@ -386,9 +275,11 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         rospy.init_node('real_gui_node', anonymous=True)
         self.bridge = CvBridge()
+        pkg_path = rospkg.RosPack().get_path("perception_test")
         self.nodes_dir = os.path.join(CURRENT_DIR, "nodes")
-        self.extrinsic_path = os.path.join(self.nodes_dir, "extrinsic.json")
-        self.lane_json_path = os.path.join(self.nodes_dir, "lane_polys.json")
+        # extrinsic and lane polygon files are stored in the config folder
+        self.extrinsic_path = os.path.join(pkg_path, "config", "extrinsic.json")
+        self.lane_json_path = os.path.join(pkg_path, "config", "lane_polys.json")
 
         self.cv_image = None
         self.radar_points = None
@@ -401,13 +292,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.assoc_last_update_time = 0.0
         self.lane_counters = {name: 0 for name in ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]}
         self.global_to_local_ids = {}
-        self.is_paused = False
         self.extrinsic_mtime = None
         self.extrinsic_last_loaded = None
 
-        # Pause 동안 들어오는 동기 데이터 버퍼(프레임 단위). Resume 시 버퍼를 먼저 재생.
-        self.pause_queue = deque(maxlen=900)  # 대략 30FPS 기준 30초
-        self.play_from_queue = False
+        # Buffer for the latest synchronized frame
         self.latest_frame = None
 
         self.load_extrinsic()
@@ -444,10 +332,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         left_widget = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_widget)
         self.viewer = ImageCanvasViewer()
-        self.graph_canvas = RadarGraphCanvas(width=5, height=3)
-        self.graph_canvas.setMinimumSize(self.viewer.minimumSize())
         left_layout.addWidget(self.viewer, stretch=1)
-        left_layout.addWidget(self.graph_canvas, stretch=1)
         layout.addWidget(left_widget, stretch=4)
 
         panel = QtWidgets.QWidget()
@@ -457,13 +342,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         gb_calib = QtWidgets.QGroupBox("1. Calibration")
         v_c = QtWidgets.QVBoxLayout()
-        self.btn_pause = QtWidgets.QPushButton("Pause")
-        self.btn_pause.clicked.connect(self.toggle_pause)
         btn_calib = QtWidgets.QPushButton("Run Calibration")
         btn_calib.clicked.connect(self.run_calibration)
         btn_reload = QtWidgets.QPushButton("Reload JSON")
         btn_reload.clicked.connect(self.load_extrinsic)
-        v_c.addWidget(self.btn_pause)
         v_c.addWidget(btn_calib)
         v_c.addWidget(btn_reload)
         gb_calib.setLayout(v_c)
@@ -515,16 +397,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.global_to_local_ids = {}
         self.lbl_log.setText("Local IDs Reset.")
 
-    def toggle_pause(self):
-        self.is_paused = not self.is_paused
-        if self.is_paused:
-            self.btn_pause.setText("Resume")
-            self.lbl_log.setText("Paused.")
-        else:
-            # Resume 시: Pause 동안 쌓인 프레임을 먼저 소모(멈춘 지점부터 이어 재생처럼 보이게)
-            self.play_from_queue = True
-            self.btn_pause.setText("Pause")
-            self.lbl_log.setText("Resumed.")
+    # Pause/resume functionality has been removed; no toggle_pause method needed
 
     # ------------------ Callback (Synchronized) ------------------
     def cb_sync(self, img_msg, radar_msg):
@@ -579,11 +452,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             "radar_doppler": radar_doppler,
         }
 
-        # Pause 중에는 현재 화면을 덮어쓰지 않고 큐에만 저장
-        if self.is_paused:
-            self.pause_queue.append(frame)
-            return
-
+        # Always store the latest synchronized frame (pause functionality removed)
         self.latest_frame = frame
 
     def cb_info(self, msg):
@@ -634,17 +503,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
     # ------------------ Update Loops ------------------
     def update_loop(self):
         self._maybe_reload_extrinsic()
-        if self.is_paused:
-            return
-
-        # Resume 직후에는 pause_queue를 먼저 재생
-        frame = None
-        if self.play_from_queue and len(self.pause_queue) > 0:
-            frame = self.pause_queue.popleft()
-            if len(self.pause_queue) == 0:
-                self.play_from_queue = False
-        else:
-            frame = self.latest_frame
+        # Always use the latest frame. Pause/resume functionality removed.
+        frame = self.latest_frame
 
         if frame is None:
             return
@@ -805,11 +665,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         self.viewer.update_image(disp)
 
-        # 같은 frame으로 레이더 그래프도 동시에 업데이트
-        if radar_points is not None:
-            d = radar_doppler if radar_doppler is not None else np.zeros(len(radar_points))
-            p = radar_power if radar_power is not None else np.zeros(len(radar_points))
-            self.graph_canvas.update_graphs(radar_points, d, p)
+        # Graph display removed; no radar scatter update
 
     # ------------------ Misc ------------------
     def open_lane_editor(self):
@@ -845,8 +701,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 pass
 
     def run_calibration(self):
-        calib_path = os.path.join(CURRENT_DIR, "nodes", "calibration_node.py")
-        subprocess.Popen(["python3", calib_path])
+        # Launch manual calibration window (replicating SensorsCalibration manual tool)
+        dlg = ManualCalibWindow(self)
+        dlg.exec()
 
     def _maybe_reload_extrinsic(self):
         if not os.path.exists(self.extrinsic_path):
@@ -857,6 +714,248 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             return
         if self.extrinsic_mtime is None or mtime > self.extrinsic_mtime:
             self.load_extrinsic()
+
+
+################################################################################
+# ManualCalibWindow
+################################################################################
+class ManualCalibWindow(QtWidgets.QDialog):
+    """
+    A dialog that allows manual adjustment of the Radar->Camera extrinsic
+    transformation. It replicates the interactive behavior of the
+    SensorsCalibration radar2camera manual calibration tool. Users can
+    incrementally rotate and translate the extrinsic parameters via
+    keyboard controls or on-screen buttons, adjust the step sizes, and
+    save or reset the calibration result.
+
+    Keyboard bindings (same as SensorsCalibration):
+
+      - Rotation (degrees):
+          q: +x (roll)    a: -x (roll)
+          w: +y (pitch)   s: -y (pitch)
+          e: +z (yaw)     d: -z (yaw)
+
+      - Translation (meters):
+          r: +x           f: -x
+          t: +y           g: -y
+          y: +z           h: -z
+
+    Step sizes for rotation and translation can be adjusted using the
+    provided spin boxes. The current transformation is visualized by
+    projecting the radar point cloud onto the camera image.
+    """
+
+    def __init__(self, gui: 'RealWorldGUI'):
+        super().__init__(gui)
+        self.gui = gui
+        self.setWindowTitle("Manual Radar-Camera Calibration")
+        self.setModal(True)
+        self.resize(1000, 700)
+
+        # Initial extrinsic values copied from the main GUI
+        self.R_init = np.array(self.gui.Extr_R, dtype=float)
+        self.t_init = np.array(self.gui.Extr_t, dtype=float).reshape(3, 1)
+        self.R_current = self.R_init.copy()
+        self.t_current = self.t_init.copy()
+
+        # Default step sizes
+        self.deg_step = 1.0  # degrees
+        self.trans_step = 0.05  # meters
+        self.point_radius = OVERLAY_POINT_RADIUS
+
+        # Build UI
+        main_layout = QtWidgets.QHBoxLayout(self)
+
+        # Image display
+        self.img_view = ImageCanvasViewer()
+        main_layout.addWidget(self.img_view, stretch=4)
+
+        # Control panel
+        ctrl_panel = QtWidgets.QWidget()
+        ctrl_layout = QtWidgets.QVBoxLayout(ctrl_panel)
+        ctrl_panel.setFixedWidth(280)
+
+        # Step size controls
+        step_group = QtWidgets.QGroupBox("Step Sizes")
+        step_layout = QtWidgets.QFormLayout()
+        self.spin_deg = QtWidgets.QDoubleSpinBox()
+        self.spin_deg.setRange(0.1, 10.0)
+        self.spin_deg.setSingleStep(0.1)
+        self.spin_deg.setValue(self.deg_step)
+        self.spin_deg.setSuffix(" deg")
+        self.spin_deg.valueChanged.connect(self._update_deg_step)
+        step_layout.addRow("Rotation step:", self.spin_deg)
+
+        self.spin_trans = QtWidgets.QDoubleSpinBox()
+        self.spin_trans.setRange(0.01, 0.5)
+        self.spin_trans.setSingleStep(0.01)
+        self.spin_trans.setValue(self.trans_step)
+        self.spin_trans.setSuffix(" m")
+        self.spin_trans.valueChanged.connect(self._update_trans_step)
+        step_layout.addRow("Translation step:", self.spin_trans)
+        step_group.setLayout(step_layout)
+        ctrl_layout.addWidget(step_group)
+
+        # Point size slider
+        size_group = QtWidgets.QGroupBox("Point Size")
+        size_layout = QtWidgets.QHBoxLayout()
+        self.slider_point = QtWidgets.QSlider(Qt.Horizontal)
+        self.slider_point.setRange(1, 15)
+        self.slider_point.setValue(self.point_radius)
+        self.slider_point.valueChanged.connect(self._update_point_size)
+        size_layout.addWidget(QtWidgets.QLabel("1"))
+        size_layout.addWidget(self.slider_point)
+        size_layout.addWidget(QtWidgets.QLabel("15"))
+        size_group.setLayout(size_layout)
+        ctrl_layout.addWidget(size_group)
+
+        # Buttons: Reset, Save
+        btn_reset = QtWidgets.QPushButton("Reset")
+        btn_reset.clicked.connect(self._reset_extrinsic)
+        btn_save = QtWidgets.QPushButton("Save Result")
+        btn_save.clicked.connect(self._save_extrinsic)
+        ctrl_layout.addWidget(btn_reset)
+        ctrl_layout.addWidget(btn_save)
+
+        # Instructions label
+        instr = QtWidgets.QLabel(
+            "Use keyboard to adjust extrinsic:\n"
+            "Rotation: q/w/e (plus) and a/s/d (minus)\n"
+            "Translation: r/t/y (plus) and f/g/h (minus)\n"
+            "Adjust step sizes above. Press Save to write to extrinsic.json."
+        )
+        instr.setWordWrap(True)
+        ctrl_layout.addWidget(instr)
+        ctrl_layout.addStretch()
+
+        main_layout.addWidget(ctrl_panel, stretch=1)
+
+        # Timer to refresh display
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_view)
+        self.timer.start(REFRESH_RATE_MS)
+
+        # Ensure this dialog receives keyboard focus
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def _update_deg_step(self, val: float):
+        self.deg_step = float(val)
+
+    def _update_trans_step(self, val: float):
+        self.trans_step = float(val)
+
+    def _update_point_size(self, val: int):
+        self.point_radius = int(val)
+
+    def _reset_extrinsic(self):
+        self.R_current = self.R_init.copy()
+        self.t_current = self.t_init.copy()
+        self.update_view()
+
+    def _save_extrinsic(self):
+        # Save current extrinsic to JSON file and reload in main GUI
+        R = self.R_current.tolist()
+        t = self.t_current.reshape(-1).tolist()
+        data = {"R": R, "t": t}
+        try:
+            os.makedirs(os.path.dirname(self.gui.extrinsic_path), exist_ok=True)
+            with open(self.gui.extrinsic_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+            # Reload extrinsic in GUI
+            self.gui.load_extrinsic()
+            QtWidgets.QMessageBox.information(self, "Saved", "Extrinsic parameters saved and reloaded.")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Save Error", f"Failed to save extrinsic: {e}")
+
+    def keyPressEvent(self, event):
+        # Handle rotation and translation keys
+        key = event.key()
+        if key == Qt.Key_Q:
+            self._apply_rotation('x', +self.deg_step)
+        elif key == Qt.Key_A:
+            self._apply_rotation('x', -self.deg_step)
+        elif key == Qt.Key_W:
+            self._apply_rotation('y', +self.deg_step)
+        elif key == Qt.Key_S:
+            self._apply_rotation('y', -self.deg_step)
+        elif key == Qt.Key_E:
+            self._apply_rotation('z', +self.deg_step)
+        elif key == Qt.Key_D:
+            self._apply_rotation('z', -self.deg_step)
+        elif key == Qt.Key_R:
+            self._apply_translation('x', +self.trans_step)
+        elif key == Qt.Key_F:
+            self._apply_translation('x', -self.trans_step)
+        elif key == Qt.Key_T:
+            self._apply_translation('y', +self.trans_step)
+        elif key == Qt.Key_G:
+            self._apply_translation('y', -self.trans_step)
+        elif key == Qt.Key_Y:
+            self._apply_translation('z', +self.trans_step)
+        elif key == Qt.Key_H:
+            self._apply_translation('z', -self.trans_step)
+        else:
+            super().keyPressEvent(event)
+        # update view after any change
+        self.update_view()
+
+    def _apply_rotation(self, axis: str, delta_deg: float):
+        # Compute incremental rotation matrix around axis (camera frame)
+        angle_rad = np.deg2rad(delta_deg)
+        if axis == 'x':
+            R_delta = np.array([
+                [1, 0, 0],
+                [0, np.cos(angle_rad), -np.sin(angle_rad)],
+                [0, np.sin(angle_rad), np.cos(angle_rad)]
+            ])
+        elif axis == 'y':
+            R_delta = np.array([
+                [np.cos(angle_rad), 0, np.sin(angle_rad)],
+                [0, 1, 0],
+                [-np.sin(angle_rad), 0, np.cos(angle_rad)]
+            ])
+        elif axis == 'z':
+            R_delta = np.array([
+                [np.cos(angle_rad), -np.sin(angle_rad), 0],
+                [np.sin(angle_rad), np.cos(angle_rad), 0],
+                [0, 0, 1]
+            ])
+        else:
+            return
+        # Apply rotation: R_new = R_delta @ R_current, t_new = R_delta @ t_current
+        self.R_current = R_delta @ self.R_current
+        self.t_current = R_delta @ self.t_current
+
+    def _apply_translation(self, axis: str, delta: float):
+        delta_vec = np.zeros((3, 1))
+        idx = {'x': 0, 'y': 1, 'z': 2}.get(axis)
+        if idx is not None:
+            delta_vec[idx, 0] = delta
+            self.t_current = self.t_current + delta_vec
+
+    def update_view(self):
+        # Fetch latest image and radar data from main GUI
+        cv_img = self.gui.cv_image
+        radar_points = self.gui.radar_points
+        cam_K = self.gui.cam_K
+        if cv_img is None or radar_points is None or cam_K is None:
+            return
+        disp = cv_img.copy()
+        pts_r = radar_points.T  # shape (3,N)
+        pts_c = self.R_current @ pts_r + self.t_current
+        valid = pts_c[2, :] > 0.5
+        if np.any(valid):
+            pts_c = pts_c[:, valid]
+            uvs = cam_K @ pts_c
+            uvs /= uvs[2, :]
+            h, w = disp.shape[:2]
+            for i in range(uvs.shape[1]):
+                u, v = int(uvs[0, i]), int(uvs[1, i])
+                if 0 <= u < w and 0 <= v < h:
+                    cv2.circle(disp, (u, v), self.point_radius, (0, 255, 255), -1)
+        # Display overlay image
+        self.img_view.update_image(disp)
+
 
 def main():
     try:

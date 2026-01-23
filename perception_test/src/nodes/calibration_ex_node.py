@@ -16,20 +16,48 @@ ROS 파라미터:
 - ~camera_info_topic (기본: /camera/camera_info)
 - ~min_samples      (기본: 20)
 - ~detection_threshold (기본: 0.5)
+- ~min_range_m      (기본: 5.0)
+- ~min_power        (기본: 0.0)
+- ~sync_queue_size  (기본: 10)
+- ~sync_slop        (기본: 0.1)
+- ~radar_fields     (기본: [x, y, z, power])
 - ~extrinsic_path    (기본: $(find perception_test)/config/extrinsic.json)
 """
 
 import json
 import os
+import re
 from typing import List
+
+import cv2
 import numpy as np
 import rospy
 import rospkg
-import cv2
+
 from sensor_msgs.msg import CameraInfo, PointCloud2
 import sensor_msgs.point_cloud2 as pc2
 import message_filters
 from perception_test.msg import DetectionArray
+
+_FIND_RE = re.compile(r"\$\(\s*find\s+([A-Za-z0-9_]+)\s*\)")
+
+
+def resolve_ros_path(path: str) -> str:
+    if not isinstance(path, str):
+        return path
+    if "$(" not in path:
+        return path
+    rp = rospkg.RosPack()
+
+    def _sub(match):
+        pkg = match.group(1)
+        try:
+            return rp.get_path(pkg)
+        except Exception:
+            return match.group(0)
+
+    return _FIND_RE.sub(_sub, path)
+
 
 class ExtrinsicCalibrationManager:
     def __init__(self):
@@ -39,12 +67,18 @@ class ExtrinsicCalibrationManager:
         self.camera_info_topic = rospy.get_param('~camera_info_topic', '/camera/camera_info')
         self.min_samples = int(rospy.get_param('~min_samples', 20))
         self.detection_thresh = float(rospy.get_param('~detection_threshold', 0.5))
+        self.min_range_m = float(rospy.get_param('~min_range_m', 5.0))
+        self.min_power = float(rospy.get_param('~min_power', 0.0))
+        self.sync_queue = int(rospy.get_param('~sync_queue_size', 10))
+        self.sync_slop = float(rospy.get_param('~sync_slop', 0.1))
 
         # extrinsic 저장 경로: config/extrinsic.json
         default_pkg = 'perception_test'
         rp = rospkg.RosPack()
         default_path = os.path.join(rp.get_path(default_pkg), 'config', 'extrinsic.json')
-        self.save_path = rospy.get_param('~extrinsic_path', default_path)
+        self.save_path = resolve_ros_path(rospy.get_param('~extrinsic_path', default_path))
+
+        self.radar_fields = rospy.get_param('~radar_fields', ['x', 'y', 'z', 'power'])
 
         self.samples = 0
         self.obj_pts: List[np.ndarray] = []
@@ -55,7 +89,11 @@ class ExtrinsicCalibrationManager:
         # 동기화 설정
         sub_det = message_filters.Subscriber(self.detections_topic, DetectionArray)
         sub_rad = message_filters.Subscriber(self.radar_topic, PointCloud2)
-        self.ts = message_filters.ApproximateTimeSynchronizer([sub_det, sub_rad], 10, 0.1)
+        self.ts = message_filters.ApproximateTimeSynchronizer(
+            [sub_det, sub_rad],
+            self.sync_queue,
+            self.sync_slop,
+        )
         self.ts.registerCallback(self._callback)
         rospy.Subscriber(self.camera_info_topic, CameraInfo, self._info_callback, queue_size=1)
         rospy.loginfo(f"[Extrinsic] 데이터 수집 중... det={self.detections_topic}, radar={self.radar_topic}")
@@ -82,20 +120,27 @@ class ExtrinsicCalibrationManager:
         v = (bb.ymin + bb.ymax) * 0.5
         # 3D 레이더 포인트 추출
         pts = []
-        for p in pc2.read_points(rad_msg, field_names=('x','y','z','power'), skip_nans=True):
-            pts.append([p[0], p[1], p[2], p[3]])
+        field_names = [f.name for f in rad_msg.fields]
+        use_fields = [f for f in self.radar_fields if f in field_names]
+        if len(use_fields) < 3:
+            rospy.logwarn_throttle(5.0, "[Extrinsic] Radar point fields missing: %s", self.radar_fields)
+            return
+        for p in pc2.read_points(rad_msg, field_names=tuple(use_fields), skip_nans=True):
+            pts.append([float(v) for v in p])
         if not pts:
             return
         pts = np.array(pts, dtype=np.float64)
-        # power 기준 간단한 필터
-        valid = pts[:, 3] > 0
-        xyz = pts[valid, :3]
+        xyz = pts[:, :3]
+        if pts.shape[1] > 3:
+            power = pts[:, 3]
+            valid = power > self.min_power
+            xyz = xyz[valid, :]
         if xyz.shape[0] < 3:
             return
         centroid = np.mean(xyz, axis=0)
         # 너무 가까운 샘플 제외
         dist = np.linalg.norm(centroid)
-        if dist < 5.0:
+        if dist < self.min_range_m:
             return
         self.obj_pts.append(centroid)
         self.img_pts.append([u, v])
