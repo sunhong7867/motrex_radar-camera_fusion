@@ -162,7 +162,7 @@ class AssociationNode:
         self.use_abs_speed = bool(rospy.get_param("~association/use_abs_speed", True))
 
         # extrinsic
-        extr_path = rospy.get_param("~extrinsic_source/path", "$(find perception_test)/src/nodes/extrinsic.json")
+        extr_path = rospy.get_param("~extrinsic_source/path", "$(find perception_test)/config/extrinsic.json")
         self.extrinsic_path = resolve_ros_path(extr_path)
         self.extrinsic_reload_sec = float(rospy.get_param("~extrinsic_reload_sec", 1.0))
 

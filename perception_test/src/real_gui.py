@@ -56,7 +56,7 @@ BEV_LATERAL_LIMIT = (-20, 20)  # 그래프 가로축 (Screen X) 범위
 BEV_FORWARD_LIMIT = (0, 120)   # 그래프 세로축 (Screen Y) 범위
 
 # 4. 토글 킬 차선
-START_ACTIVE_LANES = ["IN1"]
+START_ACTIVE_LANES = ["IN1", "IN2", "IN3"]
 
 # 5. 토픽 이름
 TOPIC_IMAGE = "/camera/image_raw"
@@ -64,6 +64,7 @@ TOPIC_RADAR = "/point_cloud"
 TOPIC_CAMERA_INFO = "/camera/camera_info"
 TOPIC_FINAL_OUT = "/perception_test/output"
 TOPIC_TRACKS = "/perception_test/tracks"
+TOPIC_ASSOCIATED = "/perception_test/associated"
 
 # ==============================================================================
 # Setup
@@ -217,7 +218,6 @@ class RadarGraphCanvas(FigureCanvas):
                 )
                 self.ax_bev.add_patch(rect)
 
-        # Qt+Matplotlib 조합에서 draw_idle이 안정적
         self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
         self.draw_idle()
 
@@ -397,6 +397,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.Extr_R = np.eye(3)
         self.Extr_t = np.zeros((3, 1))
         self.vis_objects = []
+        self.assoc_speed_by_id = {}
+        self.assoc_last_update_time = 0.0
         self.lane_counters = {name: 0 for name in ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]}
         self.global_to_local_ids = {}
         self.is_paused = False
@@ -424,6 +426,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         rospy.Subscriber(TOPIC_CAMERA_INFO, CameraInfo, self.cb_info, queue_size=1)
         rospy.Subscriber(TOPIC_FINAL_OUT, AssociationArray, self.cb_final_result, queue_size=1)
+        rospy.Subscriber(TOPIC_ASSOCIATED, AssociationArray, self.cb_association_result, queue_size=1)
         rospy.Subscriber(TOPIC_TRACKS, DetectionArray, self.cb_tracker_result, queue_size=1)
 
         # 타이머는 하나만 사용(카메라/레이더 그래프 갱신을 동일 tick으로 맞춤)
@@ -533,22 +536,36 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         # 2) 레이더
         try:
-            target_fields = ("x", "y", "z", "power", "doppler")
             field_names = [f.name for f in radar_msg.fields]
-            if "power" not in field_names and "intensity" in field_names:
-                target_fields = ("x", "y", "z", "intensity", "doppler")
+            if not {"x", "y", "z"}.issubset(field_names):
+                return
 
-            g = pc2.read_points(radar_msg, field_names=target_fields, skip_nans=True)
+            doppler_candidates = ("doppler", "doppler_mps", "velocity", "vel", "radial_velocity")
+            power_candidates = ("power", "intensity", "rcs")
+
+            doppler_field = next((f for f in doppler_candidates if f in field_names), None)
+            power_field = next((f for f in power_candidates if f in field_names), None)
+
+            target_fields = ["x", "y", "z"]
+            if power_field:
+                target_fields.append(power_field)
+            if doppler_field:
+                target_fields.append(doppler_field)
+
+            g = pc2.read_points(radar_msg, field_names=tuple(target_fields), skip_nans=True)
             self.radar_points_all = np.array(list(g))
 
             if self.radar_points_all.shape[0] > 0:
                 radar_points = self.radar_points_all[:, :3]
-                if self.radar_points_all.shape[1] >= 5:
-                    radar_power = self.radar_points_all[:, 3]
-                    radar_doppler = self.radar_points_all[:, 4]
-                else:
-                    radar_power = np.zeros(len(radar_points))
-                    radar_doppler = np.zeros(len(radar_points))
+                col_idx = 3
+                radar_power = None
+                radar_doppler = None
+
+                if power_field:
+                    radar_power = self.radar_points_all[:, col_idx]
+                    col_idx += 1
+                if doppler_field:
+                    radar_doppler = self.radar_points_all[:, col_idx]
             else:
                 radar_points, radar_power, radar_doppler = None, None, None
         except:
@@ -576,13 +593,26 @@ class RealWorldGUI(QtWidgets.QMainWindow):
     def cb_final_result(self, msg):
         objects = []
         for obj in msg.objects:
+            speed_kph = obj.speed_kph
+            if (not np.isfinite(speed_kph)) and (time.time() - self.assoc_last_update_time <= 0.3):
+                cached_speed = self.assoc_speed_by_id.get(obj.id)
+                if cached_speed is not None and np.isfinite(cached_speed):
+                    speed_kph = cached_speed
             objects.append({
                 'id': obj.id,
                 'bbox': [int(obj.bbox.xmin), int(obj.bbox.ymin), int(obj.bbox.xmax), int(obj.bbox.ymax)],
-                'vel': obj.speed_kph
+                'vel': speed_kph
             })
         self.vis_objects = objects
         self.last_update_time = time.time()
+
+    def cb_association_result(self, msg):
+        assoc_speeds = {}
+        for obj in msg.objects:
+            if np.isfinite(obj.speed_kph):
+                assoc_speeds[obj.id] = obj.speed_kph
+        self.assoc_speed_by_id = assoc_speeds
+        self.assoc_last_update_time = time.time()
 
     def cb_tracker_result(self, msg):
         if time.time() - self.last_update_time > 0.3:
@@ -629,26 +659,33 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         radar_doppler = frame["radar_doppler"]
 
         # 1. Objects
+        active_lane_polys = {}
+        for name, chk in self.chk_lanes.items():
+            if not chk.isChecked():
+                continue
+            poly = self.lane_polys.get(name)
+            if poly is not None and len(poly) > 2:
+                active_lane_polys[name] = poly
+        has_lane_filter = bool(active_lane_polys)
+
         front_lanes = {"IN1", "IN2", "IN3"}
         front_by_lane = {}
-        for obj in self.vis_objects:
-            g_id = obj['id']
-            x1, y1, x2, y2 = obj['bbox']
-            cx, cy = (x1 + x2) // 2, y2
+        if has_lane_filter:
+            for obj in self.vis_objects:
+                g_id = obj['id']
+                x1, y1, x2, y2 = obj['bbox']
+                cx, cy = (x1 + x2) // 2, y2
 
-            target_lane = None
-            for name, chk in self.chk_lanes.items():
-                if chk.isChecked():
-                    poly = self.lane_polys.get(name)
-                    if poly is not None and len(poly) > 2:
-                        if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
-                            target_lane = name
-                            break
+                target_lane = None
+                for name, poly in active_lane_polys.items():
+                    if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
+                        target_lane = name
+                        break
 
-            if target_lane and target_lane in front_lanes:
-                current = front_by_lane.get(target_lane)
-                if current is None or y2 > current["y2"]:
-                    front_by_lane[target_lane] = {"id": g_id, "y2": y2}
+                if target_lane and target_lane in front_lanes:
+                    current = front_by_lane.get(target_lane)
+                    if current is None or y2 > current["y2"]:
+                        front_by_lane[target_lane] = {"id": g_id, "y2": y2}
 
         front_ids = {v["id"] for v in front_by_lane.values()}
 
@@ -658,13 +695,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             cx, cy = (x1 + x2) // 2, y2
 
             target_lane = None
-            for name, chk in self.chk_lanes.items():
-                if chk.isChecked():
-                    poly = self.lane_polys.get(name)
-                    if poly is not None and len(poly) > 2:
-                        if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
-                            target_lane = name
-                            break
+            if has_lane_filter:
+                for name, poly in active_lane_polys.items():
+                    if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
+                        target_lane = name
+                        break
+
+                if target_lane is None:
+                    continue
 
             if target_lane:
                 if g_id not in self.global_to_local_ids:
@@ -672,23 +710,27 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     self.global_to_local_ids[g_id] = self.lane_counters[target_lane]
                 local_id = self.global_to_local_ids[g_id]
 
-                cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), BBOX_LINE_THICKNESS)
-                vel = obj['vel']
-                if target_lane in front_lanes and g_id not in front_ids:
-                    vel = float("nan")
-                v_str = f"{int(vel)}km/h" if np.isfinite(vel) else "--km/h"
-                line1 = f"No: {local_id} ({target_lane})"
-                line2 = f"Vel: {v_str}"
+                label_prefix = f"No: {local_id} ({target_lane})"
+            else:
+                label_prefix = f"ID: {g_id}"
 
-                font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-                (w1, h1), _ = cv2.getTextSize(line1, font, scale, thick)
-                (w2, h2), _ = cv2.getTextSize(line2, font, scale, thick)
-                max_w = max(w1, w2)
-                total_h = h1 + h2 + 8
-                bg_top = y1 - total_h - 12
-                cv2.rectangle(disp, (x1, bg_top), (x1 + max_w + 10, y1), (0, 0, 0), -1)
-                cv2.putText(disp, line1, (x1 + 5, y1 - h2 - 10), font, scale, (255, 255, 255), thick)
-                cv2.putText(disp, line2, (x1 + 5, y1 - 5), font, scale, (255, 255, 255), thick)
+            cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), BBOX_LINE_THICKNESS)
+            vel = obj['vel']
+            if target_lane in front_lanes and g_id not in front_ids:
+                vel = float("nan")
+            v_str = f"{int(vel)}km/h" if np.isfinite(vel) else "--km/h"
+            line1 = label_prefix
+            line2 = f"Vel: {v_str}"
+
+            font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+            (w1, h1), _ = cv2.getTextSize(line1, font, scale, thick)
+            (w2, h2), _ = cv2.getTextSize(line2, font, scale, thick)
+            max_w = max(w1, w2)
+            total_h = h1 + h2 + 8
+            bg_top = y1 - total_h - 12
+            cv2.rectangle(disp, (x1, bg_top), (x1 + max_w + 10, y1), (0, 0, 0), -1)
+            cv2.putText(disp, line1, (x1 + 5, y1 - h2 - 10), font, scale, (255, 255, 255), thick)
+            cv2.putText(disp, line2, (x1 + 5, y1 - 5), font, scale, (255, 255, 255), thick)
 
         # 2. Radar Overlay
         projected_count = 0
@@ -699,7 +741,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
             if np.any(valid_idx):
                 pts_c = pts_c[:, valid_idx]
-                dopplers = radar_doppler[valid_idx] if radar_doppler is not None else np.zeros(pts_c.shape[1])
+                has_doppler = radar_doppler is not None
+                dopplers = radar_doppler[valid_idx] if has_doppler else np.zeros(pts_c.shape[1])
                 projected_count = int(pts_c.shape[1])
 
                 uvs = self.cam_K @ pts_c
@@ -708,15 +751,23 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
                 for i in range(uvs.shape[1]):
                     u, v = int(uvs[0, i]), int(uvs[1, i])
-                    if 0 <= u < w and 0 <= v < h:
-                        speed_kmh = dopplers[i] * 3.6
-                        if abs(speed_kmh) < NOISE_MIN_SPEED_KMH:
-                            continue
+                    
+                    # 점 148개 중 앞쪽 5개만 좌표를 출력해서 위치 확인
+                    if i < 5: 
+                        print(f"[DEBUG] Point {i} -> u: {u}, v: {v} (Screen Size: {w}x{h})")
 
-                        if speed_kmh < SPEED_THRESHOLD_RED:
-                            color = (0, 0, 255)
-                        elif speed_kmh > SPEED_THRESHOLD_BLUE:
-                            color = (255, 0, 0)
+                    if 0 <= u < w and 0 <= v < h:
+                        if has_doppler:
+                            speed_kmh = dopplers[i] * 3.6
+                            if abs(speed_kmh) < NOISE_MIN_SPEED_KMH:
+                                continue
+
+                            if speed_kmh < SPEED_THRESHOLD_RED:
+                                color = (0, 0, 255)
+                            elif speed_kmh > SPEED_THRESHOLD_BLUE:
+                                color = (255, 0, 0)
+                            else:
+                                color = (255, 255, 255)
                         else:
                             color = (255, 255, 255)
 
