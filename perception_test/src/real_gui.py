@@ -342,13 +342,37 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         gb_calib = QtWidgets.QGroupBox("1. Calibration")
         v_c = QtWidgets.QVBoxLayout()
-        btn_calib = QtWidgets.QPushButton("Run Calibration")
+        
+        # 1. 내부 위젯들을 무조건 위로 밀착시킴 (버튼 사이 벌어짐 방지)
+        v_c.setAlignment(QtCore.Qt.AlignTop) 
+        v_c.setSpacing(5)
+
+        btn_intri = QtWidgets.QPushButton("Run Intrinsic (Offline images)")
+        btn_intri.clicked.connect(self.run_intrinsic_calibration)
+        btn_calib = QtWidgets.QPushButton("Run Extrinsic (Manual)")
         btn_calib.clicked.connect(self.run_calibration)
         btn_reload = QtWidgets.QPushButton("Reload JSON")
         btn_reload.clicked.connect(self.load_extrinsic)
+        
+        self.pbar_intrinsic = QtWidgets.QProgressBar()
+        self.pbar_intrinsic.setRange(0, 0)
+        self.pbar_intrinsic.setVisible(False)
+
+        self.txt_intrinsic_log = QtWidgets.QPlainTextEdit()
+        self.txt_intrinsic_log.setReadOnly(True)
+        self.txt_intrinsic_log.setMaximumHeight(160)
+
+        v_c.addWidget(btn_intri)
         v_c.addWidget(btn_calib)
         v_c.addWidget(btn_reload)
+        v_c.addWidget(self.pbar_intrinsic)
+        v_c.addWidget(self.txt_intrinsic_log)
+
         gb_calib.setLayout(v_c)
+        
+        # 2. 그룹박스가 세로로 늘어나지 못하게 제한 (그룹박스 하단 빈공간 제거)
+        gb_calib.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
+        
         vbox.addWidget(gb_calib)
 
         gb_lane = QtWidgets.QGroupBox("2. Lane Editor")
@@ -704,6 +728,125 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         # Launch manual calibration window (replicating SensorsCalibration manual tool)
         dlg = ManualCalibWindow(self)
         dlg.exec()
+
+    def run_intrinsic_calibration(self):
+        """
+        GUI에서 intrinsic 캘리브레이션(오프라인 이미지) 실행.
+        perception_test/image 폴더의 calib_01.jpg ~ 를 사용한다고 가정.
+        """
+        try:
+            rp = rospkg.RosPack()
+            pkg_path = rp.get_path("perception_test")
+            image_dir = os.path.join(pkg_path, "image")  # <- 너가 말한 경로
+            out_yaml = os.path.join(pkg_path, "config", "camera_intrinsic.yaml")
+
+            if not os.path.isdir(image_dir):
+                self.lbl_log.setText(f"[Intrinsic] image dir not found: {image_dir}")
+                return
+
+            # jpg가 있는지 간단 체크
+            import glob
+            imgs = sorted(glob.glob(os.path.join(image_dir, "*.jpg")))
+            if len(imgs) == 0:
+                self.lbl_log.setText(f"[Intrinsic] No .jpg in {image_dir}")
+                return
+
+            # 이미 실행 중이면 중복 실행 방지
+            if hasattr(self, "intrinsic_proc") and self.intrinsic_proc is not None:
+                if self.intrinsic_proc.state() != QtCore.QProcess.NotRunning:
+                    self.lbl_log.setText("[Intrinsic] already running...")
+                    return
+
+            self.txt_intrinsic_log.clear()
+            self.pbar_intrinsic.setVisible(True)
+            self.pbar_intrinsic.setRange(0, 0)  # 돌아가는 중 표시
+            self.lbl_log.setText("[Intrinsic] Running... (GUI에서 로그 확인)")
+
+            # QProcess로 rosrun 실행 (터미널 안 봐도 stdout을 GUI로 가져올 수 있음)
+            self.intrinsic_proc = QtCore.QProcess(self)
+            self.intrinsic_proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+
+            # 중요: rosrun은 ROS 환경이 잡힌 상태에서 GUI가 실행된 경우 정상 동작
+            ws = os.path.expanduser("~/motrex/catkin_ws")
+            setup_bash = os.path.join(ws, "devel", "setup.bash")
+
+            cmd = "bash"
+
+            ros_cmd = (
+                f"source {setup_bash} && "
+                f"rosrun perception_test calibration_in_node.py "
+                f"_image_dir:={image_dir} "
+                f"_output_path:={out_yaml} "
+                f"_board/width:=10 _board/height:=7 _board/square_size:=0.025 "
+                f"_min_samples:=20 _max_selected:=45 _grid_size_mm:=50 "
+                f"_save_selected:=true _save_undistort:=true"
+            )
+
+            args = ["-lc", ros_cmd]
+
+            self.intrinsic_proc.readyReadStandardOutput.connect(self._on_intrinsic_stdout)
+            self.intrinsic_proc.finished.connect(self._on_intrinsic_finished)
+
+            self.intrinsic_proc.start(cmd, args)
+
+        except Exception as e:
+            self.lbl_log.setText(f"[Intrinsic] start error: {e}")
+            traceback.print_exc()
+
+    def _on_intrinsic_stdout(self):
+        """
+        calibration_in_node.py가 찍는 로그를 GUI에 표시.
+        (Select image / Calibration done 같은 문구를 그대로 보여줌)
+        """
+        if not hasattr(self, "intrinsic_proc") or self.intrinsic_proc is None:
+            return
+        data = bytes(self.intrinsic_proc.readAllStandardOutput()).decode("utf-8", errors="ignore")
+        if not data:
+            return
+        self.txt_intrinsic_log.appendPlainText(data.rstrip())
+
+        # 진행률을 대략적으로라도 보이게: "Select image:" 카운트 기반
+        # (완전 정확할 필요 없고, “진행 중” 체감용)
+        if "Select image:" in data or "Select image" in data:
+            # 로그 전체에서 선택 개수 대략 계산
+            text = self.txt_intrinsic_log.toPlainText()
+            selected = text.count("Select image")
+            self.pbar_intrinsic.setRange(0, 45)
+            self.pbar_intrinsic.setValue(min(selected, 45))
+
+    def _on_intrinsic_finished(self, exit_code, exit_status):
+        """
+        종료 시 YAML 읽어서 K/D 요약을 lbl_log에 표시
+        """
+        try:
+            self.pbar_intrinsic.setVisible(False)
+
+            rp = rospkg.RosPack()
+            pkg_path = rp.get_path("perception_test")
+            out_yaml = os.path.join(pkg_path, "config", "camera_intrinsic.yaml")
+
+            if exit_code == 0 and os.path.exists(out_yaml):
+                # YAML에서 K/D 읽어 요약
+                with open(out_yaml, "r", encoding="utf-8") as f:
+                    y = yaml.safe_load(f) or {}
+                ci = (y.get("camera_info") or {})
+                K = ci.get("K", [])
+                D = ci.get("D", [])
+                # fx, fy, cx, cy 요약
+                fx = K[0] if len(K) >= 9 else None
+                fy = K[4] if len(K) >= 9 else None
+                cx = K[2] if len(K) >= 9 else None
+                cy = K[5] if len(K) >= 9 else None
+
+                self.lbl_log.setText(f"[Intrinsic] DONE ✅ fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f} | D={D}")
+                self.txt_intrinsic_log.appendPlainText("\n[Intrinsic] DONE. camera_intrinsic.yaml updated.\n")
+            else:
+                self.lbl_log.setText(f"[Intrinsic] FAILED (exit={exit_code}). See log box.")
+                self.txt_intrinsic_log.appendPlainText(f"\n[Intrinsic] FAILED exit_code={exit_code}\n")
+
+        except Exception as e:
+            self.lbl_log.setText(f"[Intrinsic] finish error: {e}")
+            traceback.print_exc()
 
     def _maybe_reload_extrinsic(self):
         if not os.path.exists(self.extrinsic_path):

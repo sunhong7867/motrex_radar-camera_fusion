@@ -26,7 +26,13 @@ rosparam set use_sim_time true
 rosbag play --clock my_test_data.bag
 
 
+
 rosrun plotjuggler plotjuggler
+
+
+chmod +x src/nodes/*.py
+
+
 
 chmod +x radar_metrics_node.py
 rosrun perception_test radar_metrics_node.py
