@@ -883,409 +883,400 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         if self.extrinsic_mtime is None or mtime > self.extrinsic_mtime:
             self.load_extrinsic()
 
-
-################################################################################
-# ManualCalibWindow
-################################################################################
+# ==============================================================================
+# ManualCalibWindow (Camera-Frame Control: Intuitive Mode)
+# ==============================================================================
 class ManualCalibWindow(QtWidgets.QDialog):
     """
-    A dialog that allows manual adjustment of the Radar->Camera extrinsic
-    transformation. It replicates the interactive behavior of the
-    SensorsCalibration radar2camera manual calibration tool. Users can
-    incrementally rotate and translate the extrinsic parameters via
-    keyboard controls or on-screen buttons, adjust the step sizes, and
-    save or reset the calibration result.
-
-    Keyboard bindings (same as SensorsCalibration):
-
-      - Rotation (degrees):
-          q: +x (roll)    a: -x (roll)
-          w: +y (pitch)   s: -y (pitch)
-          e: +z (yaw)     d: -z (yaw)
-
-      - Translation (meters):
-          r: +x           f: -x
-          t: +y           g: -y
-          y: +z           h: -z
-
-    Step sizes for rotation and translation can be adjusted using the
-    provided spin boxes. The current transformation is visualized by
-    projecting the radar point cloud onto the camera image.
+    Manual Calibration with 'Screen-Space' Controls.
+    - Controls apply rotation relative to the CAMERA VIEW (Screen), not the Radar body.
+    - Solves the issue where 'Yaw' causes vertical movement due to axis misalignment.
     """
 
     def __init__(self, gui: 'RealWorldGUI'):
         super().__init__(gui)
         self.gui = gui
-        self.setWindowTitle("Manual Radar-Camera Calibration")
+        self.setWindowTitle("Manual Calibration (Intuitive Screen-Space Control)")
         self.setModal(True)
-        self.resize(1000, 700)
+        self.resize(1700, 1000)
 
-        # Initial extrinsic values copied from the main GUI
-        self.R_init = np.array(self.gui.Extr_R, dtype=float)
-        self.t_init = np.array(self.gui.Extr_t, dtype=float).reshape(3, 1)
-        self.R_current = self.R_init.copy()
-        self.t_current = self.t_init.copy()
+        # -------------------------------------------------------------
+        # 1. Initialize State
+        # -------------------------------------------------------------
+        self.T_init = np.eye(4, dtype=np.float64)
+        self.T_init[:3, :3] = np.array(self.gui.Extr_R, dtype=np.float64)
+        self.T_init[:3, 3] = np.array(self.gui.Extr_t, dtype=np.float64).flatten()
+        self.T_current = self.T_init.copy()
 
-        # Default step sizes
-        self.deg_step = 1.0  # degrees
-        self.trans_step = 0.05  # meters
+        # Step Sizes
+        self.deg_step = 0.5
+        self.trans_step = 0.05 # 5cm 단위로 정밀하게
         self.zoom_step = 0.1
         self.point_radius = OVERLAY_POINT_RADIUS
         self.radar_zoom = 1.0
-        self.rot_delta_deg = np.zeros(3, dtype=float)
-        self.trans_delta_m = np.zeros(3, dtype=float)
+        
+        # Accumulators (For display only)
+        self.acc_rot = np.zeros(3, dtype=float)
+        self.acc_trans = np.zeros(3, dtype=float)
+        
+        # BEV Settings
         self.lane_points = []
         self.lane_pick_active = False
         self.homography = None
-        self.bev_size = (500, 700)
+        self.px_per_meter = 10.0
+        self.bev_size = (500, 1000)
+        
+        # Config Path
+        try:
+            rp = rospkg.RosPack()
+            self.config_dir = os.path.join(rp.get_path("perception_test"), "config")
+        except:
+            self.config_dir = os.path.dirname(self.gui.extrinsic_path)
+        os.makedirs(self.config_dir, exist_ok=True)
+        self.homography_path = os.path.join(self.config_dir, "center_camera-homography.json")
 
-        # Build UI
+        # ================= UI Layout =================
         main_layout = QtWidgets.QHBoxLayout(self)
-
-        # Image display
+        
+        # Left Viewers
+        left_cont = QtWidgets.QWidget()
+        left_layout = QtWidgets.QHBoxLayout(left_cont)
+        self.bev_view = ImageCanvasViewer()
         self.img_view = ImageCanvasViewer()
         self.img_view.set_click_callback(self._on_image_click)
-        main_layout.addWidget(self.img_view, stretch=4)
+        left_layout.addWidget(self.bev_view, stretch=4)
+        left_layout.addWidget(self.img_view, stretch=5)
+        main_layout.addWidget(left_cont, stretch=5)
 
-        # BEV display
-        self.bev_view = ImageCanvasViewer()
-        self.bev_view.setMinimumSize(360, 360)
-        main_layout.addWidget(self.bev_view, stretch=3)
-
-        # Control panel
+        # Right Controls
         ctrl_panel = QtWidgets.QWidget()
-        ctrl_layout = QtWidgets.QVBoxLayout(ctrl_panel)
-        ctrl_panel.setFixedWidth(280)
+        ctrl_panel.setFixedWidth(420)
+        vbox = QtWidgets.QVBoxLayout(ctrl_panel)
 
-        # Step size controls
-        step_group = QtWidgets.QGroupBox("Step Sizes")
-        step_layout = QtWidgets.QFormLayout()
-        self.spin_deg = QtWidgets.QDoubleSpinBox()
-        self.spin_deg.setRange(0.1, 10.0)
-        self.spin_deg.setSingleStep(0.1)
-        self.spin_deg.setValue(self.deg_step)
-        self.spin_deg.setSuffix(" deg")
-        self.spin_deg.valueChanged.connect(self._update_deg_step)
-        step_layout.addRow("Rotation step:", self.spin_deg)
+        # (A) Visuals
+        gb_vis = QtWidgets.QGroupBox("1. Visual Aids")
+        f_vis = QtWidgets.QFormLayout()
+        self.chk_axis = QtWidgets.QCheckBox("Show Axes"); self.chk_axis.setChecked(True)
+        self.chk_grid = QtWidgets.QCheckBox("Show Grid"); self.chk_grid.setChecked(True)
+        self.chk_axis.toggled.connect(self.update_view)
+        self.chk_grid.toggled.connect(self.update_view)
+        f_vis.addRow(self.chk_axis, self.chk_grid)
+        gb_vis.setLayout(f_vis)
+        vbox.addWidget(gb_vis)
 
-        self.spin_trans = QtWidgets.QDoubleSpinBox()
-        self.spin_trans.setRange(0.01, 0.5)
-        self.spin_trans.setSingleStep(0.01)
-        self.spin_trans.setValue(self.trans_step)
-        self.spin_trans.setSuffix(" m")
-        self.spin_trans.valueChanged.connect(self._update_trans_step)
-        step_layout.addRow("Translation step:", self.spin_trans)
-        self.spin_zoom = QtWidgets.QDoubleSpinBox()
-        self.spin_zoom.setRange(0.0001, 1.0)
-        self.spin_zoom.setSingleStep(0.01)
-        self.spin_zoom.setValue(self.zoom_step)
-        self.spin_zoom.setDecimals(4)
-        self.spin_zoom.setSuffix(" x")
-        self.spin_zoom.valueChanged.connect(self._update_zoom_step)
-        step_layout.addRow("Zoom step:", self.spin_zoom)
-        step_group.setLayout(step_layout)
-        ctrl_layout.addWidget(step_group)
+        # (B) Steps
+        gb_step = QtWidgets.QGroupBox("2. Step Sizes")
+        f_step = QtWidgets.QFormLayout()
+        self.s_deg = QtWidgets.QDoubleSpinBox(); self.s_deg.setRange(0.1, 10.0); self.s_deg.setValue(self.deg_step)
+        self.s_deg.valueChanged.connect(lambda v: setattr(self, 'deg_step', v))
+        self.s_trans = QtWidgets.QDoubleSpinBox(); self.s_trans.setRange(0.01, 1.0); self.s_trans.setValue(self.trans_step)
+        self.s_trans.valueChanged.connect(lambda v: setattr(self, 'trans_step', v))
+        self.s_zoom = QtWidgets.QDoubleSpinBox(); self.s_zoom.setRange(0.1, 5.0); self.s_zoom.setValue(1.0)
+        self.s_zoom.valueChanged.connect(lambda v: setattr(self, 'zoom_step', v))
+        f_step.addRow("Rot (°):", self.s_deg)
+        f_step.addRow("Move (m):", self.s_trans)
+        f_step.addRow("Zoom Step:", self.s_zoom)
+        gb_step.setLayout(f_step)
+        vbox.addWidget(gb_step)
 
-        # Point size slider
-        size_group = QtWidgets.QGroupBox("Point Size")
-        size_layout = QtWidgets.QHBoxLayout()
-        self.slider_point = QtWidgets.QSlider(Qt.Horizontal)
-        self.slider_point.setRange(1, 15)
-        self.slider_point.setValue(self.point_radius)
-        self.slider_point.valueChanged.connect(self._update_point_size)
-        size_layout.addWidget(QtWidgets.QLabel("1"))
-        size_layout.addWidget(self.slider_point)
-        size_layout.addWidget(QtWidgets.QLabel("15"))
-        size_group.setLayout(size_layout)
-        ctrl_layout.addWidget(size_group)
+        # (C) BEV
+        gb_bev = QtWidgets.QGroupBox("3. BEV Setup")
+        h_bev = QtWidgets.QHBoxLayout()
+        self.btn_pick = QtWidgets.QPushButton("Pick 4 Pts"); self.btn_pick.setCheckable(True)
+        self.btn_pick.clicked.connect(self._toggle_lane_pick)
+        btn_clr = QtWidgets.QPushButton("Clear"); btn_clr.clicked.connect(self._reset_lane_points)
+        h_bev.addWidget(self.btn_pick); h_bev.addWidget(btn_clr)
+        self.lbl_bev = QtWidgets.QLabel("Not Loaded")
+        self.lbl_bev.setStyleSheet("color: #0000FF; font-weight: bold;")
+        v_bev = QtWidgets.QVBoxLayout(); v_bev.addWidget(self.lbl_bev); v_bev.addLayout(h_bev)
+        gb_bev.setLayout(v_bev)
+        vbox.addWidget(gb_bev)
 
-        lane_group = QtWidgets.QGroupBox("Lane Homography")
-        lane_layout = QtWidgets.QVBoxLayout()
-        self.lbl_lane = QtWidgets.QLabel("차선 포인트: 0/4 (왼쪽 2개, 오른쪽 2개)")
-        self.lbl_lane.setWordWrap(True)
-        lane_layout.addWidget(self.lbl_lane)
-        btn_pick_lane = QtWidgets.QPushButton("Pick 4 Lane Points")
-        btn_pick_lane.clicked.connect(self._toggle_lane_pick)
-        btn_clear_lane = QtWidgets.QPushButton("Reset Lane Points")
-        btn_clear_lane.clicked.connect(self._reset_lane_points)
-        lane_layout.addWidget(btn_pick_lane)
-        lane_layout.addWidget(btn_clear_lane)
-        lane_group.setLayout(lane_layout)
-        ctrl_layout.addWidget(lane_group)
+        # (D) Changes
+        gb_delta = QtWidgets.QGroupBox("4. Changes (Screen Relative)")
+        g_delta = QtWidgets.QGridLayout()
+        self.l_rot = [QtWidgets.QLabel("0.0°") for _ in range(3)]
+        self.l_trans = [QtWidgets.QLabel("0.00m") for _ in range(3)]
+        self.l_zoom = QtWidgets.QLabel("1.00 x")
+        
+        red = "color: #FF0000; font-weight: bold;"
+        rows = ["Tilt (Up/Dn)", "Pan (L/R)", "Roll (CW/CCW)"]
+        for i in range(3):
+            lb = QtWidgets.QLabel(rows[i]); lb.setStyleSheet(red)
+            self.l_rot[i].setStyleSheet(red); self.l_trans[i].setStyleSheet(red)
+            g_delta.addWidget(lb, i, 0)
+            g_delta.addWidget(self.l_rot[i], i, 1)
+            g_delta.addWidget(self.l_trans[i], i, 2)
+        
+        lz = QtWidgets.QLabel("Zoom:"); lz.setStyleSheet(red); self.l_zoom.setStyleSheet(red)
+        g_delta.addWidget(lz, 3, 0); g_delta.addWidget(self.l_zoom, 3, 1)
+        gb_delta.setLayout(g_delta)
+        vbox.addWidget(gb_delta)
 
-        # Delta status (shown above the key instructions)
-        self.lbl_delta = QtWidgets.QLabel()
-        self.lbl_delta.setWordWrap(True)
-        ctrl_layout.addWidget(self.lbl_delta)
+        # (E) Actions
+        h_act = QtWidgets.QHBoxLayout()
+        btn_rst = QtWidgets.QPushButton("Reset"); btn_rst.clicked.connect(self._reset_T)
+        btn_sv = QtWidgets.QPushButton("Save"); btn_sv.setStyleSheet("background-color:#007700; color:white; font-weight:bold")
+        btn_sv.clicked.connect(self._save_extrinsic)
+        h_act.addWidget(btn_rst); h_act.addWidget(btn_sv)
+        vbox.addLayout(h_act)
 
-        # Buttons: Reset, Save
-        btn_reset = QtWidgets.QPushButton("Reset")
-        btn_reset.clicked.connect(self._reset_extrinsic)
-        btn_save = QtWidgets.QPushButton("Save Result")
-        btn_save.clicked.connect(self._save_extrinsic)
-        ctrl_layout.addWidget(btn_reset)
-        ctrl_layout.addWidget(btn_save)
-
-        # Instructions label
-        instr = QtWidgets.QLabel(
-            "Use keyboard to adjust extrinsic (camera frame):\n"
-            "Rotation: \nq/a = ±roll (x)\nw/s = ±pitch (y)\ne/d = ±yaw (z)\n"
-            "Translation: \nr/f = ±x\nt/g = ±y\ny/h = ±z\n"
-            "Zoom: z/x: \nzoom out/in\n"
-            "Adjust step sizes above. Press Save to write to extrinsic.json."
+        # (F) Guide
+        gb_key = QtWidgets.QGroupBox("Control Guide (Look at Screen)")
+        l_k = QtWidgets.QLabel(
+            "⬆⬇ Pitch (Tilt): [W] / [S]\n"
+            "⬅➡ Yaw (Pan):  [A] / [D]\n"
+            "🔄 Roll:       [Q] / [E]\n"
+            "Move: [R]/[F](X), [T]/[G](Y), [Y]/[H](Z)"
         )
-        instr.setWordWrap(True)
-        ctrl_layout.addWidget(instr)
-        ctrl_layout.addStretch()
+        l_k.setStyleSheet("color: #333333; font-weight: bold;")
+        vk = QtWidgets.QVBoxLayout(); vk.addWidget(l_k)
+        gb_key.setLayout(vk)
+        vbox.addWidget(gb_key)
+        vbox.addStretch()
 
-        main_layout.addWidget(ctrl_panel, stretch=1)
+        main_layout.addWidget(ctrl_panel)
 
-        # Timer to refresh display
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_view)
-        self.timer.start(REFRESH_RATE_MS)
-
-        # Ensure this dialog receives keyboard focus
+        self.timer.start(33)
+        self._load_homography_json(silent=True)
         self.setFocusPolicy(Qt.StrongFocus)
-        self._update_delta_label()
 
-    def _update_deg_step(self, val: float):
-        self.deg_step = float(val)
-
-    def _update_trans_step(self, val: float):
-        self.trans_step = float(val)
-
-    def _update_zoom_step(self, val: float):
-        self.zoom_step = float(val)
-
-    def _update_point_size(self, val: int):
-        self.point_radius = int(val)
-
-    def _toggle_lane_pick(self):
-        self.lane_pick_active = not self.lane_pick_active
-        if self.lane_pick_active:
-            self.lbl_lane.setText("차선 포인트: 0/4 (왼쪽 2개, 오른쪽 2개)")
-            self.lane_points = []
-            self.homography = None
+    # ------------------------------------------------
+    # Logic: Camera-Frame Rotation (Pre-Multiplication)
+    # ------------------------------------------------
+    def keyPressEvent(self, event):
+        k = event.key()
+        
+        # Rotation (Screen Based)
+        # W/S: Rotate around Camera X (Right) -> Tilt Up/Down
+        if k == Qt.Key_W: self._rotate_camera_frame(0, 1)  # Pitch Up
+        elif k == Qt.Key_S: self._rotate_camera_frame(0, -1) # Pitch Down
+        
+        # A/D: Rotate around Camera Y (Down) -> Pan Left/Right
+        elif k == Qt.Key_A: self._rotate_camera_frame(1, 1)  # Yaw Left
+        elif k == Qt.Key_D: self._rotate_camera_frame(1, -1) # Yaw Right
+        
+        # Q/E: Rotate around Camera Z (Forward) -> Roll
+        elif k == Qt.Key_Q: self._rotate_camera_frame(2, 1)  # Roll CCW
+        elif k == Qt.Key_E: self._rotate_camera_frame(2, -1) # Roll CW
+        
+        # Translation (Still in Camera Frame directions)
+        elif k == Qt.Key_R: self._translate_camera_frame(0, 1) # Right
+        elif k == Qt.Key_F: self._translate_camera_frame(0, -1) # Left
+        elif k == Qt.Key_T: self._translate_camera_frame(1, 1) # Down
+        elif k == Qt.Key_G: self._translate_camera_frame(1, -1) # Up
+        elif k == Qt.Key_Y: self._translate_camera_frame(2, 1) # Forward
+        elif k == Qt.Key_H: self._translate_camera_frame(2, -1) # Backward
+        
+        # Zoom
+        elif k == Qt.Key_Z: 
+            self.radar_zoom = max(0.1, self.radar_zoom - self.zoom_step)
+            self.l_zoom.setText(f"{self.radar_zoom:.2f} x")
+        elif k == Qt.Key_X: 
+            self.radar_zoom += self.zoom_step
+            self.l_zoom.setText(f"{self.radar_zoom:.2f} x")
+        
         self.update_view()
 
-    def _reset_lane_points(self):
-        self.lane_points = []
-        self.homography = None
-        self.lane_pick_active = False
-        self.lbl_lane.setText("차선 포인트: 0/4 (왼쪽 2개, 오른쪽 2개)")
-        self.update_view()
+    def _rotate_camera_frame(self, axis, sign):
+        """
+        Apply rotation in CAMERA FRAME (Pre-multiplication).
+        T_new = R_delta @ T_current
+        """
+        angle = sign * np.deg2rad(self.deg_step)
+        c, s = np.cos(angle), np.sin(angle)
+        
+        R_delta = np.eye(4)
+        if axis == 0: # X (Pitch)
+            R_delta[:3, :3] = np.array([[1,0,0],[0,c,-s],[0,s,c]])
+        elif axis == 1: # Y (Yaw)
+            R_delta[:3, :3] = np.array([[c,0,s],[0,1,0],[-s,0,c]])
+        elif axis == 2: # Z (Roll)
+            R_delta[:3, :3] = np.array([[c,-s,0],[s,c,0],[0,0,1]])
+            
+        # Apply to LEFT side (Global/Camera frame)
+        self.T_current = R_delta @ self.T_current
+        
+        self.acc_rot[axis] += (sign * self.deg_step)
+        self._update_delta_ui()
 
-    def _on_image_click(self, x: int, y: int):
-        if not self.lane_pick_active:
-            return
-        if len(self.lane_points) >= 4:
-            return
-        self.lane_points.append((x, y))
-        self.lbl_lane.setText(f"차선 포인트: {len(self.lane_points)}/4")
-        if len(self.lane_points) == 4:
-            self._compute_homography()
-            self.lane_pick_active = False
-        self.update_view()
+    def _translate_camera_frame(self, axis, sign):
+        """
+        Apply translation in CAMERA FRAME.
+        """
+        T_delta = np.eye(4)
+        T_delta[axis, 3] = sign * self.trans_step
+        
+        # Apply to LEFT side
+        self.T_current = T_delta @ self.T_current
+        
+        self.acc_trans[axis] += (sign * self.trans_step)
+        self._update_delta_ui()
 
-    def _compute_homography(self):
-        pts = np.array(self.lane_points, dtype=np.float32)
-        idx = np.argsort(pts[:, 0])
-        left = pts[idx[:2]]
-        right = pts[idx[2:]]
-        left = left[np.argsort(left[:, 1])]
-        right = right[np.argsort(right[:, 1])]
-        src = np.array([left[1], left[0], right[0], right[1]], dtype=np.float32)
-        dst_w, dst_h = self.bev_size
-        margin = 40.0
-        dst = np.array(
-            [
-                [margin, dst_h - margin],
-                [margin, margin],
-                [dst_w - margin, margin],
-                [dst_w - margin, dst_h - margin],
-            ],
-            dtype=np.float32,
-        )
-        self.homography = cv2.getPerspectiveTransform(src, dst)
-        self.lbl_lane.setText("차선 포인트: 4/4 (호모그래피 계산 완료)")
+    def _update_delta_ui(self):
+        for i in range(3):
+            self.l_rot[i].setText(f"{self.acc_rot[i]:+.1f}°")
+            self.l_trans[i].setText(f"{self.acc_trans[i]:+.2f}m")
 
-    def _reset_extrinsic(self):
-        self.R_current = self.R_init.copy()
-        self.t_current = self.t_init.copy()
-        self.rot_delta_deg[:] = 0.0
-        self.trans_delta_m[:] = 0.0
+    def _reset_T(self):
+        self.T_current = self.T_init.copy()
+        self.acc_rot[:] = 0; self.acc_trans[:] = 0
         self.radar_zoom = 1.0
-        self._update_delta_label()
+        self._update_delta_ui()
         self.update_view()
 
     def _save_extrinsic(self):
-        # Save current extrinsic to JSON file and reload in main GUI
-        R = self.R_current.tolist()
-        t = self.t_current.reshape(-1).tolist()
-        data = {"R": R, "t": t}
-        try:
-            os.makedirs(os.path.dirname(self.gui.extrinsic_path), exist_ok=True)
-            with open(self.gui.extrinsic_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4)
-            # Reload extrinsic in GUI
-            self.gui.load_extrinsic()
-            QtWidgets.QMessageBox.information(self, "Saved", "Extrinsic parameters saved and reloaded.")
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "Save Error", f"Failed to save extrinsic: {e}")
+        R = self.T_current[:3, :3]; t = self.T_current[:3, 3].reshape(3, 1)
+        data = {"R": R.tolist(), "t": t.flatten().tolist()}
+        with open(self.gui.extrinsic_path, 'w') as f: json.dump(data, f, indent=4)
+        self.gui.load_extrinsic()
+        QtWidgets.QMessageBox.information(self, "Saved", "Extrinsic Updated!")
 
-    def keyPressEvent(self, event):
-        # Handle rotation and translation keys
-        key = event.key()
-        if key == Qt.Key_Q:
-            self._apply_rotation('x', +self.deg_step)
-        elif key == Qt.Key_A:
-            self._apply_rotation('x', -self.deg_step)
-        elif key == Qt.Key_W:
-            self._apply_rotation('y', +self.deg_step)
-        elif key == Qt.Key_S:
-            self._apply_rotation('y', -self.deg_step)
-        elif key == Qt.Key_E:
-            self._apply_rotation('z', +self.deg_step)
-        elif key == Qt.Key_D:
-            self._apply_rotation('z', -self.deg_step)
-        elif key == Qt.Key_R:
-            self._apply_translation('x', +self.trans_step)
-        elif key == Qt.Key_F:
-            self._apply_translation('x', -self.trans_step)
-        elif key == Qt.Key_T:
-            self._apply_translation('y', +self.trans_step)
-        elif key == Qt.Key_G:
-            self._apply_translation('y', -self.trans_step)
-        elif key == Qt.Key_Y:
-            self._apply_translation('z', +self.trans_step)
-        elif key == Qt.Key_H:
-            self._apply_translation('z', -self.trans_step)
-        elif key == Qt.Key_Z:
-            self._nudge_radar_zoom(-self.zoom_step)
-        elif key == Qt.Key_X:
-            self._nudge_radar_zoom(self.zoom_step)
-        else:
-            super().keyPressEvent(event)
-        # update view after any change
-        self.update_view()
-
-    def _apply_rotation(self, axis: str, delta_deg: float):
-        # Compute incremental rotation matrix around axis (camera frame)
-        angle_rad = np.deg2rad(delta_deg)
-        if axis == 'x':
-            R_delta = np.array([
-                [1, 0, 0],
-                [0, np.cos(angle_rad), -np.sin(angle_rad)],
-                [0, np.sin(angle_rad), np.cos(angle_rad)]
-            ])
-        elif axis == 'y':
-            R_delta = np.array([
-                [np.cos(angle_rad), 0, np.sin(angle_rad)],
-                [0, 1, 0],
-                [-np.sin(angle_rad), 0, np.cos(angle_rad)]
-            ])
-        elif axis == 'z':
-            R_delta = np.array([
-                [np.cos(angle_rad), -np.sin(angle_rad), 0],
-                [np.sin(angle_rad), np.cos(angle_rad), 0],
-                [0, 0, 1]
-            ])
-        else:
-            return
-        # Apply rotation: R_new = R_delta @ R_current, t_new = R_delta @ t_current
-        self.R_current = R_delta @ self.R_current
-        self.t_current = R_delta @ self.t_current
-        idx = {'x': 0, 'y': 1, 'z': 2}.get(axis)
-        if idx is not None:
-            self.rot_delta_deg[idx] += float(delta_deg)
-        self._update_delta_label()
-
-    def _apply_translation(self, axis: str, delta: float):
-        delta_vec = np.zeros((3, 1))
-        idx = {'x': 0, 'y': 1, 'z': 2}.get(axis)
-        if idx is not None:
-            delta_vec[idx, 0] = delta
-            self.t_current = self.t_current + delta_vec
-            self.trans_delta_m[idx] += float(delta)
-        self._update_delta_label()
-
-    def _nudge_radar_zoom(self, delta: float):
-        self.radar_zoom = float(np.clip(self.radar_zoom + delta, 0.0001, 5.0))
-        self._update_delta_label()
-
-    def _update_delta_label(self):
-        self.lbl_delta.setText(
-            "Current Delta\n"
-            f"- Rotation(°): Roll {self.rot_delta_deg[0]:+.2f}, "
-            f"Pitch {self.rot_delta_deg[1]:+.2f}, Yaw {self.rot_delta_deg[2]:+.2f}\n"
-            f"- Translation(m): X {self.trans_delta_m[0]:+.2f}, "
-            f"Y {self.trans_delta_m[1]:+.2f}, Z {self.trans_delta_m[2]:+.2f}\n"
-            f"- Radar Zoom: {self.radar_zoom:.4f}x"
-        )
-
+    # ------------------------------------------------
+    # View & Projection
+    # ------------------------------------------------
     def update_view(self):
-        # Fetch latest image and radar data from main GUI
         cv_img = self.gui.cv_image
-        radar_points = self.gui.radar_points
-        cam_K = self.gui.cam_K
-        radar_doppler = getattr(self.gui, "radar_doppler", None)
-        if cv_img is None:
-            return
+        if cv_img is None: return
         disp = cv_img.copy()
-        if radar_points is not None and cam_K is not None:
-            pts_r = radar_points.T  # shape (3,N)
-            pts_c = self.R_current @ pts_r + self.t_current
-            valid = pts_c[2, :] > 0.5
-            if np.any(valid):
-                pts_c = pts_c[:, valid]
-                has_doppler = radar_doppler is not None
-                dopplers = radar_doppler[valid] if has_doppler else None
-                uvs = cam_K @ pts_c
-                uvs /= uvs[2, :]
-                h, w = disp.shape[:2]
-                cx = w / 2.0
-                cy = h / 2.0
-                for i in range(uvs.shape[1]):
-                    u = (uvs[0, i] - cx) * self.radar_zoom + cx
-                    v = (uvs[1, i] - cy) * self.radar_zoom + cy
-                    u, v = int(u), int(v)
-                    if 0 <= u < w and 0 <= v < h:
-                        if has_doppler:
-                            speed_kmh = dopplers[i] * 3.6
-                            if abs(speed_kmh) < NOISE_MIN_SPEED_KMH:
-                                continue
-                            if abs(speed_kmh) <= 0.5:
-                                color = (0, 255, 0)
-                            elif speed_kmh < SPEED_THRESHOLD_RED:
-                                color = (0, 0, 255)
-                            elif speed_kmh > SPEED_THRESHOLD_BLUE:
-                                color = (255, 0, 0)
-                            else:
-                                color = (255, 255, 255)
-                        else:
-                            color = (255, 255, 255)
-                        cv2.circle(disp, (u, v), self.point_radius, color, -1)
-        for idx, (x, y) in enumerate(self.lane_points):
-            cv2.circle(disp, (int(x), int(y)), 6, (0, 165, 255), -1)
-            cv2.putText(
-                disp,
-                str(idx + 1),
-                (int(x) + 8, int(y) - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 165, 255),
-                2,
-            )
+        h, w = disp.shape[:2]
+        K = self.gui.cam_K
+        cx, cy = (K[0,2], K[1,2]) if K is not None else (w/2, h/2)
 
+        # 1. BEV
         if self.homography is not None:
             bev = cv2.warpPerspective(disp, self.homography, self.bev_size)
         else:
             bev = np.zeros((self.bev_size[1], self.bev_size[0], 3), dtype=np.uint8)
-        self.bev_view.update_image(bev)
-        
-        # Display overlay image
+        self._draw_bev_overlays(bev)
+
+        # 2. Grid on Camera
+        if self.chk_grid.isChecked() and K is not None:
+            self._draw_ground_grid(disp, K, cx, cy)
+
+        # 3. Points
+        if self.gui.radar_points is not None and K is not None:
+            pts_r = self.gui.radar_points.T
+            # T_current maps Radar -> Camera directly now
+            pts_c = (self.T_current @ np.vstack((pts_r, np.ones((1, pts_r.shape[1])))))[:3, :]
+            
+            valid = pts_c[2,:] > 0.5
+            if np.any(valid):
+                uvs = K @ pts_c[:, valid]
+                uvs /= uvs[2, :]
+                u = (uvs[0,:] - cx) * self.radar_zoom + cx
+                v = (uvs[1,:] - cy) * self.radar_zoom + cy
+                
+                for i in range(len(u)):
+                    ux, vx = int(u[i]), int(v[i])
+                    if 0<=ux<w and 0<=vx<h: cv2.circle(disp, (ux, vx), self.point_radius, (0, 255, 0), -1)
+                
+                # Draw on BEV (Un-zoomed)
+                if self.homography is not None:
+                    uvs_src = np.array([uvs[0,:], uvs[1,:]]).T.reshape(-1, 1, 2)
+                    uvs_dst = cv2.perspectiveTransform(uvs_src, self.homography)
+                    for pt in uvs_dst:
+                        bx, by = int(pt[0][0]), int(pt[0][1])
+                        if 0<=bx<self.bev_size[0] and 0<=by<self.bev_size[1]:
+                            cv2.circle(bev, (bx, by), 4, (0, 255, 0), -1)
+
+        # 4. Axis
+        if self.chk_axis.isChecked() and K is not None:
+            self._draw_radar_axes(disp, K, cx, cy)
+
+        # 5. Lane Points
+        for idx, (x, y) in enumerate(self.lane_points):
+            cv2.circle(disp, (int(x), int(y)), 6, (0, 165, 255), -1)
+            cv2.putText(disp, str(idx+1), (int(x)+5, int(y)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,165,255), 2)
+
         self.img_view.update_image(disp)
+        self.bev_view.update_image(bev)
+
+    def _draw_bev_overlays(self, bev):
+        h, w = bev.shape[:2]; cx = w//2; px = int(self.px_per_meter)
+        # Grid
+        for i in range(0, h, px*10):
+            cv2.line(bev, (0, h-i), (w, h-i), (50,50,50), 1)
+            if i>0: cv2.putText(bev, f"{i//px}m", (5, h-i-5), 0, 0.5, (100,100,100), 1)
+        # Lane (Blue)
+        lx = int(cx - 1.75*px); rx = int(cx + 1.75*px)
+        cv2.line(bev, (lx, 0), (lx, h), (255,0,0), 2)
+        cv2.line(bev, (rx, 0), (rx, h), (255,0,0), 2)
+        cv2.line(bev, (cx, 0), (cx, h), (80,80,80), 1)
+
+    def _draw_ground_grid(self, img, K, cx, cy):
+        xs = np.linspace(-10, 10, 5); ys = np.linspace(0, 40, 5); rh = -1.0
+        lines = []
+        for x in xs: lines.append([[x, 0, rh], [x, 40, rh]])
+        for y in ys: lines.append([[-10, y, rh], [10, y, rh]])
+        for ln in lines:
+            pts = (self.T_current @ np.vstack((np.array(ln).T, np.ones((1,2)))))[:3,:]
+            if pts[2,0]<0.5 or pts[2,1]<0.5: continue
+            uvs = K @ pts; uvs /= uvs[2,:]
+            u1=(uvs[0,0]-cx)*self.radar_zoom+cx; v1=(uvs[1,0]-cy)*self.radar_zoom+cy
+            u2=(uvs[0,1]-cx)*self.radar_zoom+cx; v2=(uvs[1,1]-cy)*self.radar_zoom+cy
+            if -2000<u1<4000: cv2.line(img, (int(u1),int(v1)), (int(u2),int(v2)), (200,200,0), 1)
+
+    def _draw_radar_axes(self, img, K, cx, cy):
+        pts = np.array([[0,0,0],[2,0,0],[0,2,0],[0,0,2]], dtype=float).T
+        pts_c = (self.T_current @ np.vstack((pts, np.ones((1,4)))))[:3,:]
+        uvs = K @ pts_c; uvs /= uvs[2,:]
+        def px(i): return (int((uvs[0,i]-cx)*self.radar_zoom+cx), int((uvs[1,i]-cy)*self.radar_zoom+cy))
+        o=px(0); x=px(1); y=px(2); z=px(3)
+        h,w=img.shape[:2]
+        if not (0<=o[0]<w and 0<=o[1]<h): return
+        cv2.arrowedLine(img, o, x, (0,0,255), 3, 0.1); cv2.putText(img, "X", x, 0, 0.6, (0,0,255), 2)
+        cv2.arrowedLine(img, o, y, (0,255,0), 3, 0.1); cv2.putText(img, "Y", y, 0, 0.6, (0,255,0), 2)
+        cv2.arrowedLine(img, o, z, (255,0,0), 3, 0.1); cv2.putText(img, "Z", z, 0, 0.6, (255,0,0), 2)
+
+    # BEV Setup (Same as before)
+    def _toggle_lane_pick(self):
+        self.lane_pick_active = self.btn_pick.isChecked()
+        if self.lane_pick_active: self.lane_points = []; self.lbl_bev.setText("Pick 4 points (Bot->Top)")
+        else: self.lbl_bev.setText("Canceled")
+    def _reset_lane_points(self): self.lane_points = []; self.homography = None; self.lbl_bev.setText("Cleared")
+    def _on_image_click(self, x, y):
+        if not self.lane_pick_active: return
+        self.lane_points.append((x, y))
+        if len(self.lane_points) == 4: self._compute_homography(); self.lane_pick_active = False; self.btn_pick.setChecked(False)
+    def _compute_homography(self):
+        pts = np.array(self.lane_points, dtype=np.float32)
+        idx = np.argsort(pts[:, 1])[::-1]; b = pts[idx[:2]]; t = pts[idx[2:]]
+        b = b[np.argsort(b[:, 0])]; t = t[np.argsort(t[:, 0])]
+        src = np.array([b[0], b[1], t[1], t[0]], dtype=np.float32)
+        bw, bh = self.bev_size; sc = self.px_per_meter; cx = bw/2.0; by = bh-50.0
+        dst = np.array([[cx-1.75*sc, by], [cx+1.75*sc, by], [cx+1.75*sc, by-15.0*sc], [cx-1.75*sc, by-15.0*sc]], dtype=np.float32)
+        self.homography = cv2.getPerspectiveTransform(src, dst)
+        self.lbl_bev.setText("Status: Clean BEV Set")
+        self._save_homography_json(src, dst)
+    def _save_homography_json(self, s, d): 
+        d = {"center_camera-homography": {"param": {"src_quad": [{"x":float(p[0]),"y":float(p[1])} for p in s], "dst_quad_pixels": [{"x":float(p[0]),"y":float(p[1])} for p in d]}}}
+        with open(self.homography_path, 'w') as f: json.dump(d, f, indent=4)
+    def _load_homography_json(self, silent=False):
+        if not os.path.exists(self.homography_path): return
+        try:
+            with open(self.homography_path, 'r') as f: d = json.load(f)
+            p = d[list(d.keys())[0]]["param"]
+            s = np.array([[x["x"], x["y"]] for x in p["src_quad"]], dtype=np.float32)
+            if "dst_quad_pixels" in p:
+                ds = np.array([[x["x"], x["y"]] for x in p["dst_quad_pixels"]], dtype=np.float32)
+                self.homography = cv2.getPerspectiveTransform(s, ds)
+                self.lbl_bev.setText("Status: Config Loaded")
+        except: pass
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def main():

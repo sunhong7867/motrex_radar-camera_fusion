@@ -31,8 +31,8 @@ extrinsic_source:
   # { "R": [[...],[...],[...]], "t": [tx,ty,tz] }  (t: meters)
 
 projection:
-  # 왜곡계수를 투영에 반영할지 (CameraInfo에 D가 있고, 코드가 지원하면 true)
-  use_distortion: false
+  # 왜곡계수를 투영에 반영할지
+  use_distortion: true
   # 카메라 앞쪽 점만 사용 (z가 너무 작거나 음수면 제외)
   z_min_m: 0.10
 
