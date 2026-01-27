@@ -5,7 +5,6 @@
 real_gui.py (Data-Driven Axis Fix)
 
 [데이터 분석 결과 반영]
-- log.txt 분석 결과: X축(-42~24m)이 좌우, Y축(11~97m)이 전방임이 확인됨.
 - message_filters로 영상-레이더 시간 동기화 적용.
 
 [추가 수정(수동 캘리브레이션 UX 개선)]
@@ -232,6 +231,9 @@ class ImageCanvasViewer(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.pixmap = None
+        self._image_size = None
+        self._scaled_rect = None
+        self._click_callback = None
         self.zoom = 1.0
         self.setMinimumSize(640, 360)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
@@ -244,7 +246,11 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         q_img = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
         self.pixmap = QtGui.QPixmap.fromImage(q_img)
+        self._image_size = (w, h)
         self.update()
+
+    def set_click_callback(self, callback):
+        self._click_callback = callback
 
     def set_zoom(self, zoom: float):
         self.zoom = float(np.clip(zoom, 0.00001, 5.0))
@@ -263,10 +269,22 @@ class ImageCanvasViewer(QtWidgets.QWidget):
             x = (self.width() - scaled.width()) // 2
             y = (self.height() - scaled.height()) // 2
             painter.drawPixmap(x, y, scaled)
+            self._scaled_rect = QtCore.QRect(x, y, scaled.width(), scaled.height())
         else:
             painter.setPen(QtCore.Qt.white)
             painter.drawText(self.rect(), Qt.AlignCenter, "Waiting for Camera Stream...")
 
+    def mousePressEvent(self, event):
+        if not self._click_callback or not self._scaled_rect or not self._image_size:
+            return
+        pos = event.position().toPoint()
+        if not self._scaled_rect.contains(pos):
+            return
+        scale_x = self._image_size[0] / self._scaled_rect.width()
+        scale_y = self._image_size[1] / self._scaled_rect.height()
+        img_x = (pos.x() - self._scaled_rect.x()) * scale_x
+        img_y = (pos.y() - self._scaled_rect.y()) * scale_y
+        self._click_callback(int(img_x), int(img_y))
 
 # ==============================================================================
 # 메인 GUI Class (동기화 적용)
@@ -540,6 +558,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         # 다른 기능(차선 편집 등)에서 현재 프레임 참조가 필요할 수 있어 저장
         self.cv_image = frame["cv_image"]
         self.radar_points = frame["radar_points"]
+        self.radar_doppler = frame["radar_doppler"]
 
         disp = frame["cv_image"].copy()
         radar_points = frame["radar_points"]
@@ -915,13 +934,23 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.radar_zoom = 1.0
         self.rot_delta_deg = np.zeros(3, dtype=float)
         self.trans_delta_m = np.zeros(3, dtype=float)
+        self.lane_points = []
+        self.lane_pick_active = False
+        self.homography = None
+        self.bev_size = (500, 700)
 
         # Build UI
         main_layout = QtWidgets.QHBoxLayout(self)
 
         # Image display
         self.img_view = ImageCanvasViewer()
+        self.img_view.set_click_callback(self._on_image_click)
         main_layout.addWidget(self.img_view, stretch=4)
+
+        # BEV display
+        self.bev_view = ImageCanvasViewer()
+        self.bev_view.setMinimumSize(360, 360)
+        main_layout.addWidget(self.bev_view, stretch=3)
 
         # Control panel
         ctrl_panel = QtWidgets.QWidget()
@@ -970,6 +999,20 @@ class ManualCalibWindow(QtWidgets.QDialog):
         size_group.setLayout(size_layout)
         ctrl_layout.addWidget(size_group)
 
+        lane_group = QtWidgets.QGroupBox("Lane Homography")
+        lane_layout = QtWidgets.QVBoxLayout()
+        self.lbl_lane = QtWidgets.QLabel("차선 포인트: 0/4 (왼쪽 2개, 오른쪽 2개)")
+        self.lbl_lane.setWordWrap(True)
+        lane_layout.addWidget(self.lbl_lane)
+        btn_pick_lane = QtWidgets.QPushButton("Pick 4 Lane Points")
+        btn_pick_lane.clicked.connect(self._toggle_lane_pick)
+        btn_clear_lane = QtWidgets.QPushButton("Reset Lane Points")
+        btn_clear_lane.clicked.connect(self._reset_lane_points)
+        lane_layout.addWidget(btn_pick_lane)
+        lane_layout.addWidget(btn_clear_lane)
+        lane_group.setLayout(lane_layout)
+        ctrl_layout.addWidget(lane_group)
+
         # Delta status (shown above the key instructions)
         self.lbl_delta = QtWidgets.QLabel()
         self.lbl_delta.setWordWrap(True)
@@ -1017,6 +1060,55 @@ class ManualCalibWindow(QtWidgets.QDialog):
 
     def _update_point_size(self, val: int):
         self.point_radius = int(val)
+
+    def _toggle_lane_pick(self):
+        self.lane_pick_active = not self.lane_pick_active
+        if self.lane_pick_active:
+            self.lbl_lane.setText("차선 포인트: 0/4 (왼쪽 2개, 오른쪽 2개)")
+            self.lane_points = []
+            self.homography = None
+        self.update_view()
+
+    def _reset_lane_points(self):
+        self.lane_points = []
+        self.homography = None
+        self.lane_pick_active = False
+        self.lbl_lane.setText("차선 포인트: 0/4 (왼쪽 2개, 오른쪽 2개)")
+        self.update_view()
+
+    def _on_image_click(self, x: int, y: int):
+        if not self.lane_pick_active:
+            return
+        if len(self.lane_points) >= 4:
+            return
+        self.lane_points.append((x, y))
+        self.lbl_lane.setText(f"차선 포인트: {len(self.lane_points)}/4")
+        if len(self.lane_points) == 4:
+            self._compute_homography()
+            self.lane_pick_active = False
+        self.update_view()
+
+    def _compute_homography(self):
+        pts = np.array(self.lane_points, dtype=np.float32)
+        idx = np.argsort(pts[:, 0])
+        left = pts[idx[:2]]
+        right = pts[idx[2:]]
+        left = left[np.argsort(left[:, 1])]
+        right = right[np.argsort(right[:, 1])]
+        src = np.array([left[1], left[0], right[0], right[1]], dtype=np.float32)
+        dst_w, dst_h = self.bev_size
+        margin = 40.0
+        dst = np.array(
+            [
+                [margin, dst_h - margin],
+                [margin, margin],
+                [dst_w - margin, margin],
+                [dst_w - margin, dst_h - margin],
+            ],
+            dtype=np.float32,
+        )
+        self.homography = cv2.getPerspectiveTransform(src, dst)
+        self.lbl_lane.setText("차선 포인트: 4/4 (호모그래피 계산 완료)")
 
     def _reset_extrinsic(self):
         self.R_current = self.R_init.copy()
@@ -1137,6 +1229,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
         cv_img = self.gui.cv_image
         radar_points = self.gui.radar_points
         cam_K = self.gui.cam_K
+        radar_doppler = getattr(self.gui, "radar_doppler", None)
         if cv_img is None:
             return
         disp = cv_img.copy()
@@ -1146,6 +1239,8 @@ class ManualCalibWindow(QtWidgets.QDialog):
             valid = pts_c[2, :] > 0.5
             if np.any(valid):
                 pts_c = pts_c[:, valid]
+                has_doppler = radar_doppler is not None
+                dopplers = radar_doppler[valid] if has_doppler else None
                 uvs = cam_K @ pts_c
                 uvs /= uvs[2, :]
                 h, w = disp.shape[:2]
@@ -1156,7 +1251,39 @@ class ManualCalibWindow(QtWidgets.QDialog):
                     v = (uvs[1, i] - cy) * self.radar_zoom + cy
                     u, v = int(u), int(v)
                     if 0 <= u < w and 0 <= v < h:
-                        cv2.circle(disp, (u, v), self.point_radius, (0, 0, 255), -1)
+                        if has_doppler:
+                            speed_kmh = dopplers[i] * 3.6
+                            if abs(speed_kmh) < NOISE_MIN_SPEED_KMH:
+                                continue
+                            if abs(speed_kmh) <= 0.5:
+                                color = (0, 255, 0)
+                            elif speed_kmh < SPEED_THRESHOLD_RED:
+                                color = (0, 0, 255)
+                            elif speed_kmh > SPEED_THRESHOLD_BLUE:
+                                color = (255, 0, 0)
+                            else:
+                                color = (255, 255, 255)
+                        else:
+                            color = (255, 255, 255)
+                        cv2.circle(disp, (u, v), self.point_radius, color, -1)
+        for idx, (x, y) in enumerate(self.lane_points):
+            cv2.circle(disp, (int(x), int(y)), 6, (0, 165, 255), -1)
+            cv2.putText(
+                disp,
+                str(idx + 1),
+                (int(x) + 8, int(y) - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 165, 255),
+                2,
+            )
+
+        if self.homography is not None:
+            bev = cv2.warpPerspective(disp, self.homography, self.bev_size)
+        else:
+            bev = np.zeros((self.bev_size[1], self.bev_size[0], 3), dtype=np.uint8)
+        self.bev_view.update_image(bev)
+        
         # Display overlay image
         self.img_view.update_image(disp)
 
