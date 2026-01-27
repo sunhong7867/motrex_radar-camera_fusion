@@ -6,19 +6,12 @@ real_gui.py (Data-Driven Axis Fix)
 
 [데이터 분석 결과 반영]
 - log.txt 분석 결과: X축(-42~24m)이 좌우, Y축(11~97m)이 전방임이 확인됨.
-- 수정 사항:
-  1. BEV 그래프 매핑을 scatter(X, Y)로 설정하여 좌우/전방을 올바르게 표시.
-  2. 축 범위를 데이터 분포에 맞춰 좌우(-50~50), 전방(0~100)으로 최적화.
-  3. message_filters로 영상-레이더 시간 동기화 적용.
+- message_filters로 영상-레이더 시간 동기화 적용.
 
-[추가 수정(이번 이슈 해결)]
-- Pause 시 QTimer만 멈추는 대신, 콜백에서 들어오는 동기 프레임을 pause_queue에 쌓고
-  Resume 시 큐를 먼저 소모하며 재생 -> “화면만 멈춤”이 아니라 “데이터도 멈춘 것처럼” 동작
-- 그래프가 리사이즈 때만 보이거나 반영이 불안정하던 문제:
-  * cluster_points 함수 스코프 문제 제거(클래스 내부 staticmethod로 구현)
-  * draw()/flush_events 대신 draw_idle + tight_layout로 안정화
-- 카메라/레이더 그래프 갱신 tick 일치:
-  * timer_graph 제거, update_loop 한 번의 tick에서 화면+그래프를 같은 프레임으로 업데이트
+[추가 수정(수동 캘리브레이션 UX 개선)]
+- 레이더 포인트 오버레이에 줌(축소/확대) 기능 추가 및 줌 스텝 조절 UI 제공.
+- 수동 캘리브레이션 창에서 회전/이동/줌 누적 변화량을 표시하여 조정량을 즉시 확인 가능.
+- 레이더 오버레이 색상 규칙을 보완하여 접근/이탈/저속 포인트를 쉽게 구분.
 """
 
 import sys
@@ -239,6 +232,7 @@ class ImageCanvasViewer(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.pixmap = None
+        self.zoom = 1.0
         self.setMinimumSize(640, 360)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.setStyleSheet("background-color: #101010;")
@@ -252,10 +246,20 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         self.pixmap = QtGui.QPixmap.fromImage(q_img)
         self.update()
 
+    def set_zoom(self, zoom: float):
+        self.zoom = float(np.clip(zoom, 0.00001, 5.0))
+        self.update()
+
+    def nudge_zoom(self, delta: float):
+        self.set_zoom(self.zoom + delta)
+
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         if self.pixmap:
-            scaled = self.pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            target_w = int(self.width() * self.zoom)
+            target_h = int(self.height() * self.zoom)
+            target_size = QtCore.QSize(max(1, target_w), max(1, target_h))
+            scaled = self.pixmap.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             x = (self.width() - scaled.width()) // 2
             y = (self.height() - scaled.height()) // 2
             painter.drawPixmap(x, y, scaled)
@@ -646,7 +650,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                             if abs(speed_kmh) < NOISE_MIN_SPEED_KMH:
                                 continue
 
-                            if speed_kmh < SPEED_THRESHOLD_RED:
+                            if abs(speed_kmh) <= 0.5:
+                                color = (0, 255, 0)
+                            elif speed_kmh < SPEED_THRESHOLD_RED:
                                 color = (0, 0, 255)
                             elif speed_kmh > SPEED_THRESHOLD_BLUE:
                                 color = (255, 0, 0)
@@ -904,7 +910,11 @@ class ManualCalibWindow(QtWidgets.QDialog):
         # Default step sizes
         self.deg_step = 1.0  # degrees
         self.trans_step = 0.05  # meters
+        self.zoom_step = 0.1
         self.point_radius = OVERLAY_POINT_RADIUS
+        self.radar_zoom = 1.0
+        self.rot_delta_deg = np.zeros(3, dtype=float)
+        self.trans_delta_m = np.zeros(3, dtype=float)
 
         # Build UI
         main_layout = QtWidgets.QHBoxLayout(self)
@@ -936,6 +946,14 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.spin_trans.setSuffix(" m")
         self.spin_trans.valueChanged.connect(self._update_trans_step)
         step_layout.addRow("Translation step:", self.spin_trans)
+        self.spin_zoom = QtWidgets.QDoubleSpinBox()
+        self.spin_zoom.setRange(0.0001, 1.0)
+        self.spin_zoom.setSingleStep(0.01)
+        self.spin_zoom.setValue(self.zoom_step)
+        self.spin_zoom.setDecimals(4)
+        self.spin_zoom.setSuffix(" x")
+        self.spin_zoom.valueChanged.connect(self._update_zoom_step)
+        step_layout.addRow("Zoom step:", self.spin_zoom)
         step_group.setLayout(step_layout)
         ctrl_layout.addWidget(step_group)
 
@@ -952,6 +970,11 @@ class ManualCalibWindow(QtWidgets.QDialog):
         size_group.setLayout(size_layout)
         ctrl_layout.addWidget(size_group)
 
+        # Delta status (shown above the key instructions)
+        self.lbl_delta = QtWidgets.QLabel()
+        self.lbl_delta.setWordWrap(True)
+        ctrl_layout.addWidget(self.lbl_delta)
+
         # Buttons: Reset, Save
         btn_reset = QtWidgets.QPushButton("Reset")
         btn_reset.clicked.connect(self._reset_extrinsic)
@@ -962,9 +985,10 @@ class ManualCalibWindow(QtWidgets.QDialog):
 
         # Instructions label
         instr = QtWidgets.QLabel(
-            "Use keyboard to adjust extrinsic:\n"
-            "Rotation: q/w/e (plus) and a/s/d (minus)\n"
-            "Translation: r/t/y (plus) and f/g/h (minus)\n"
+            "Use keyboard to adjust extrinsic (camera frame):\n"
+            "Rotation: \nq/a = ±roll (x)\nw/s = ±pitch (y)\ne/d = ±yaw (z)\n"
+            "Translation: \nr/f = ±x\nt/g = ±y\ny/h = ±z\n"
+            "Zoom: z/x: \nzoom out/in\n"
             "Adjust step sizes above. Press Save to write to extrinsic.json."
         )
         instr.setWordWrap(True)
@@ -980,6 +1004,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
 
         # Ensure this dialog receives keyboard focus
         self.setFocusPolicy(Qt.StrongFocus)
+        self._update_delta_label()
 
     def _update_deg_step(self, val: float):
         self.deg_step = float(val)
@@ -987,12 +1012,19 @@ class ManualCalibWindow(QtWidgets.QDialog):
     def _update_trans_step(self, val: float):
         self.trans_step = float(val)
 
+    def _update_zoom_step(self, val: float):
+        self.zoom_step = float(val)
+
     def _update_point_size(self, val: int):
         self.point_radius = int(val)
 
     def _reset_extrinsic(self):
         self.R_current = self.R_init.copy()
         self.t_current = self.t_init.copy()
+        self.rot_delta_deg[:] = 0.0
+        self.trans_delta_m[:] = 0.0
+        self.radar_zoom = 1.0
+        self._update_delta_label()
         self.update_view()
 
     def _save_extrinsic(self):
@@ -1037,6 +1069,10 @@ class ManualCalibWindow(QtWidgets.QDialog):
             self._apply_translation('z', +self.trans_step)
         elif key == Qt.Key_H:
             self._apply_translation('z', -self.trans_step)
+        elif key == Qt.Key_Z:
+            self._nudge_radar_zoom(-self.zoom_step)
+        elif key == Qt.Key_X:
+            self._nudge_radar_zoom(self.zoom_step)
         else:
             super().keyPressEvent(event)
         # update view after any change
@@ -1068,6 +1104,10 @@ class ManualCalibWindow(QtWidgets.QDialog):
         # Apply rotation: R_new = R_delta @ R_current, t_new = R_delta @ t_current
         self.R_current = R_delta @ self.R_current
         self.t_current = R_delta @ self.t_current
+        idx = {'x': 0, 'y': 1, 'z': 2}.get(axis)
+        if idx is not None:
+            self.rot_delta_deg[idx] += float(delta_deg)
+        self._update_delta_label()
 
     def _apply_translation(self, axis: str, delta: float):
         delta_vec = np.zeros((3, 1))
@@ -1075,27 +1115,48 @@ class ManualCalibWindow(QtWidgets.QDialog):
         if idx is not None:
             delta_vec[idx, 0] = delta
             self.t_current = self.t_current + delta_vec
+            self.trans_delta_m[idx] += float(delta)
+        self._update_delta_label()
+
+    def _nudge_radar_zoom(self, delta: float):
+        self.radar_zoom = float(np.clip(self.radar_zoom + delta, 0.0001, 5.0))
+        self._update_delta_label()
+
+    def _update_delta_label(self):
+        self.lbl_delta.setText(
+            "Current Delta\n"
+            f"- Rotation(°): Roll {self.rot_delta_deg[0]:+.2f}, "
+            f"Pitch {self.rot_delta_deg[1]:+.2f}, Yaw {self.rot_delta_deg[2]:+.2f}\n"
+            f"- Translation(m): X {self.trans_delta_m[0]:+.2f}, "
+            f"Y {self.trans_delta_m[1]:+.2f}, Z {self.trans_delta_m[2]:+.2f}\n"
+            f"- Radar Zoom: {self.radar_zoom:.4f}x"
+        )
 
     def update_view(self):
         # Fetch latest image and radar data from main GUI
         cv_img = self.gui.cv_image
         radar_points = self.gui.radar_points
         cam_K = self.gui.cam_K
-        if cv_img is None or radar_points is None or cam_K is None:
+        if cv_img is None:
             return
         disp = cv_img.copy()
-        pts_r = radar_points.T  # shape (3,N)
-        pts_c = self.R_current @ pts_r + self.t_current
-        valid = pts_c[2, :] > 0.5
-        if np.any(valid):
-            pts_c = pts_c[:, valid]
-            uvs = cam_K @ pts_c
-            uvs /= uvs[2, :]
-            h, w = disp.shape[:2]
-            for i in range(uvs.shape[1]):
-                u, v = int(uvs[0, i]), int(uvs[1, i])
-                if 0 <= u < w and 0 <= v < h:
-                    cv2.circle(disp, (u, v), self.point_radius, (0, 255, 255), -1)
+        if radar_points is not None and cam_K is not None:
+            pts_r = radar_points.T  # shape (3,N)
+            pts_c = self.R_current @ pts_r + self.t_current
+            valid = pts_c[2, :] > 0.5
+            if np.any(valid):
+                pts_c = pts_c[:, valid]
+                uvs = cam_K @ pts_c
+                uvs /= uvs[2, :]
+                h, w = disp.shape[:2]
+                cx = w / 2.0
+                cy = h / 2.0
+                for i in range(uvs.shape[1]):
+                    u = (uvs[0, i] - cx) * self.radar_zoom + cx
+                    v = (uvs[1, i] - cy) * self.radar_zoom + cy
+                    u, v = int(u), int(v)
+                    if 0 <= u < w and 0 <= v < h:
+                        cv2.circle(disp, (u, v), self.point_radius, (0, 0, 255), -1)
         # Display overlay image
         self.img_view.update_image(disp)
 
