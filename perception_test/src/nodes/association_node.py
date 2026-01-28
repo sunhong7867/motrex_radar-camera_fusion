@@ -16,7 +16,8 @@ association_node.py
 - ~bbox_topic (perception_test/DetectionArray)
 
 출력:
-- ~associated_topic (perception_test/AssociationArray)
+- ~associated_topic (perception_test/AssociationArray)extr_path = rospy.get_param("~extrinsic_source/path", "$(find perception_test)/config/extrinsic.json")
+
 - (옵션) ~debug/marker_topic (visualization_msgs/MarkerArray)
 """
 
@@ -162,7 +163,10 @@ class AssociationNode:
         self.use_abs_speed = bool(rospy.get_param("~association/use_abs_speed", True))
 
         # extrinsic
-        extr_path = rospy.get_param("~extrinsic_source/path", "$(find perception_test)/config/extrinsic.json")
+        extr_path = rospy.get_param("~extrinsic_path", None)
+        if not extr_path:
+            extr_path = rospy.get_param("~extrinsic_source/path", "$(find perception_test)/config/extrinsic.json")
+
         self.extrinsic_path = resolve_ros_path(extr_path)
         self.extrinsic_reload_sec = float(rospy.get_param("~extrinsic_reload_sec", 1.0))
 

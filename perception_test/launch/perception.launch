@@ -38,7 +38,7 @@
         <param name="radar/pointcloud_topic" value="/point_cloud" />
         <param name="bbox_topic" value="/perception_test/tracks" />
         <param name="associated_topic" value="/perception_test/associated" />
-        <param name="extrinsic_source/path" value="$(find perception_test)/config/extrinsic.json" />
+        <param name="extrinsic_path" value="$(find perception_test)/config/extrinsic.json" />
     </node>
 
     <node pkg="perception_test" type="speed_estimator_node.py" name="speed_estimator" output="screen">

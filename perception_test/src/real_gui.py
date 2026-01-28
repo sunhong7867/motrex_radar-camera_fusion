@@ -2,22 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-real_gui.py (Data-Driven Axis Fix)
+real_gui.py (Rviz-Style Calibration Tool Integrated)
 
-[데이터 분석 결과 반영]
-- message_filters로 영상-레이더 시간 동기화 적용.
-
-[추가 수정(수동 캘리브레이션 UX 개선)]
-- 레이더 포인트 오버레이에 줌(축소/확대) 기능 추가 및 줌 스텝 조절 UI 제공.
-- 수동 캘리브레이션 창에서 회전/이동/줌 누적 변화량을 표시하여 조정량을 즉시 확인 가능.
-- 레이더 오버레이 색상 규칙을 보완하여 접근/이탈/저속 포인트를 쉽게 구분.
+[기능 요약]
+1. Main GUI: 카메라/레이더 퓨전 결과 확인, 차선 편집, 캘리브레이션 툴 실행
+2. Manual Calibration: 
+   - 점(Point) 대신 클러스터링된 박스(BBox) 표시
+   - 속도별 색상 구분 (빨강:접근, 파랑:이탈)
+   - 좌표축(Axis) 및 지면 격자(Grid) 표시
+   - 직관적인 화면 기준(Screen-Space) 조작
 """
 
 import sys
 import os
 import json
 import time
-import subprocess
 import traceback
 import numpy as np
 import cv2
@@ -27,30 +26,23 @@ from collections import deque
 # [PARAMETER SETTINGS] 사용자 설정
 # ==============================================================================
 
-# 1. 시스템 및 타이밍
-REFRESH_RATE_MS = 33           # GUI 갱신 주기 (33ms = 30FPS)
+REFRESH_RATE_MS = 33           # 30 FPS
 
-# 2. 레이더 필터링
-SPEED_THRESHOLD_RED = -0.5       # 접근 기준 (이보다 낮으면 빨강/접근)
-SPEED_THRESHOLD_BLUE = 0.5       # 이탈 기준 (이보다 높으면 파랑/이탈)
-NOISE_MIN_SPEED_KMH = 0.2      # 최소 속도 필터 (정지 물체 노이즈 제거용)
-MOVING_CLUSTER_MIN_SPEED_KMH = 0  # 클러스터 박스 표시용 최소 이동 속도
-CLUSTER_MAX_DIST_M = 2.0       # 클러스터 이웃 거리 (m)
-CLUSTER_MIN_POINTS = 4         # 클러스터 최소 포인트 수
+# Radar Coloring & Filtering
+SPEED_THRESHOLD_RED = -0.5     # m/s (이보다 작으면 접근/빨강)
+SPEED_THRESHOLD_BLUE = 0.5     # m/s (이보다 크면 이탈/파랑)
+NOISE_MIN_SPEED_KMH = 1.0      # 정지 물체(노이즈) 필터링 기준 (km/h)
 
-# 3. 시각화 크기
-OVERLAY_POINT_RADIUS = 6       # 영상 위 점 크기
-GRAPH_POINT_SIZE = 20          # 그래프 점 크기
-BBOX_LINE_THICKNESS = 2        # 박스 두께
+# Clustering Parameters (Rviz 스타일)
+CLUSTER_MAX_DIST = 2.5         # 점 사이 거리 (m)
+CLUSTER_MIN_PTS = 3            # 최소 점 개수
 
-# 4. 그래프 축 범위 (단위: m) - [데이터 분석 기반 설정]
-BEV_LATERAL_LIMIT = (-20, 20)  # 그래프 가로축 (Screen X) 범위
-BEV_FORWARD_LIMIT = (0, 120)   # 그래프 세로축 (Screen Y) 범위
+# Visualization
+OVERLAY_POINT_RADIUS = 4
+BBOX_LINE_THICKNESS = 2
+AXIS_LENGTH = 3.0              # 좌표축 화살표 길이 (m)
 
-# 4. 토글 킬 차선
-START_ACTIVE_LANES = ["IN1", "IN2", "IN3"]
-
-# 5. 토픽 이름
+# Topics
 TOPIC_IMAGE = "/camera/image_raw"
 TOPIC_RADAR = "/point_cloud"
 TOPIC_CAMERA_INFO = "/camera/camera_info"
@@ -58,13 +50,11 @@ TOPIC_FINAL_OUT = "/perception_test/output"
 TOPIC_TRACKS = "/perception_test/tracks"
 TOPIC_ASSOCIATED = "/perception_test/associated"
 
-# ==============================================================================
-# Setup
-# ==============================================================================
-# Note: Matplotlib-based radar graphs have been removed.
-# We no longer import or use matplotlib in this GUI since the
-# radar BEV graph and pause functionality have been dropped.
+START_ACTIVE_LANES = ["IN1", "IN2", "IN3"]
 
+# ==============================================================================
+# Setup & Imports
+# ==============================================================================
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.append(CURRENT_DIR)
@@ -74,7 +64,7 @@ try:
     from PySide6.QtCore import Qt
     import rospy
     import rospkg
-    import message_filters  # [동기화 핵심]
+    import message_filters
     from sensor_msgs.msg import Image, PointCloud2, CameraInfo
     from cv_bridge import CvBridge
     import sensor_msgs.point_cloud2 as pc2
@@ -83,25 +73,106 @@ try:
     from perception_lib import perception_utils
     from perception_lib import lane_utils
 except ImportError as e:
-    print(f"\n[GUI Error] 라이브러리 로드 실패: {e}")
+    print(f"\n[GUI Error] 필수 라이브러리 로드 실패: {e}")
     sys.exit(1)
+
+
+# ==============================================================================
+# Helper Functions (Clustering & Math)
+# ==============================================================================
+def cluster_radar_points(points_xyz, points_vel, max_dist=2.0, min_pts=3):
+    """
+    간단한 유클리드 거리 기반 클러스터링 (BFS)
+    points_xyz: (N, 3) array
+    points_vel: (N, ) array (Doppler)
+    return: list of dict {'center':(x,y,z), 'min':..., 'max':..., 'vel':..., 'pts':...}
+    """
+    n = points_xyz.shape[0]
+    if n == 0:
+        return []
+
+    # XY 평면 거리만 사용하여 클러스터링 (Z는 무시)
+    pts_xy = points_xyz[:, :2]
+    
+    visited = np.zeros(n, dtype=bool)
+    clusters = []
+
+    for i in range(n):
+        if visited[i]:
+            continue
+
+        # BFS
+        queue = [i]
+        visited[i] = True
+        cluster_indices = []
+
+        while queue:
+            idx = queue.pop()
+            cluster_indices.append(idx)
+
+            # 현재 점과 다른 모든 점 사이의 거리 계산 (Vectorized)
+            # 실제로는 KD-Tree가 빠르지만, 점 개수가 수백 개 수준이면 브루트포스도 충분함
+            dists = np.linalg.norm(pts_xy - pts_xy[idx], axis=1)
+            neighbors = np.where((dists <= max_dist) & (~visited))[0]
+
+            for nb in neighbors:
+                visited[nb] = True
+                queue.append(nb)
+
+        if len(cluster_indices) >= min_pts:
+            indices = np.array(cluster_indices)
+            c_pts = points_xyz[indices]
+            c_vels = points_vel[indices]
+            
+            # BBox Info extraction
+            min_xyz = np.min(c_pts, axis=0)
+            max_xyz = np.max(c_pts, axis=0)
+            center = (min_xyz + max_xyz) / 2.0
+            mean_vel = np.mean(c_vels)
+
+            clusters.append({
+                'center': center,
+                'min': min_xyz,
+                'max': max_xyz,
+                'vel': mean_vel,
+                'indices': indices
+            })
+
+    return clusters
+
+def project_points(K, R, t, points_3d):
+    """
+    3D Points (N,3) -> 2D Pixels (N,2) projection
+    """
+    if points_3d.shape[0] == 0:
+        return np.zeros((0, 2)), np.zeros(0, dtype=bool)
+
+    # T: Radar -> Camera
+    # P_cam = R * P_rad + t
+    pts_h = np.hstack((points_3d, np.ones((points_3d.shape[0], 1)))) # (N, 4)
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t.flatten()
+    
+    pts_cam = (T @ pts_h.T).T # (N, 4)
+    
+    # Valid check (Z > 0.5m)
+    valid = pts_cam[:, 2] > 0.5
+    
+    uvs = np.zeros((points_3d.shape[0], 2))
+    
+    if np.any(valid):
+        p_valid = pts_cam[valid, :3].T # (3, N_valid)
+        uv_homo = K @ p_valid
+        uv_homo /= uv_homo[2, :] # Normalize by Z
+        uvs[valid] = uv_homo[:2, :].T
+
+    return uvs, valid
 
 
 # ==============================================================================
 # UI Classes
 # ==============================================================================
-
-
-# -----------------------------------------------------------------------------
-# The RadarGraphCanvas class and related clustering code have been removed.  The
-# GUI no longer displays a separate radar point cloud graph.  All overlay and
-# visualization is handled directly within the image view in update_loop().
-    
-# The old CalibrationDialog (which launched separate calibration nodes and drew a
-# BEV graph) has been removed. Calibration is now triggered directly from the
-# main GUI via the ManualCalibWindow for extrinsic calibration, and the
-# calibration nodes can be run independently if needed.
-
 
 class LaneCanvas(QtWidgets.QWidget):
     def __init__(self, bg_img, lane_polys, parent=None):
@@ -256,9 +327,6 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         self.zoom = float(np.clip(zoom, 0.00001, 5.0))
         self.update()
 
-    def nudge_zoom(self, delta: float):
-        self.set_zoom(self.zoom + delta)
-
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         if self.pixmap:
@@ -286,8 +354,513 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         img_y = (pos.y() - self._scaled_rect.y()) * scale_y
         self._click_callback(int(img_x), int(img_y))
 
+
 # ==============================================================================
-# 메인 GUI Class (동기화 적용)
+# ManualCalibWindow (Rviz-Style Visuals) - [핵심 수정 부분]
+# ==============================================================================
+class ManualCalibWindow(QtWidgets.QDialog):
+    """
+    Rviz 스타일의 시각화 도구를 포함한 수동 캘리브레이션 창.
+    - Axis Gizmo: 레이더 원점과 축 방향 표시
+    - BBox: 차량 클러스터링 및 속도별 색상(접근:빨강, 이탈:파랑) 표시
+    - Grid: 지면(Z=0) 격자 표시로 Pitch/Roll 확인 용이
+    - Screen-Space Controls: 직관적인 조작 (W/A/S/D)
+    """
+    def __init__(self, gui: 'RealWorldGUI'):
+        super().__init__(gui)
+        self.gui = gui
+        self.setWindowTitle("Manual Calibration (Rviz Style Visuals)")
+        self.setModal(True)
+        self.resize(1700, 1000)
+
+        # 1. State Init
+        self.T_init = np.eye(4, dtype=np.float64)
+        self.T_init[:3, :3] = np.array(self.gui.Extr_R, dtype=np.float64)
+        self.T_init[:3, 3] = np.array(self.gui.Extr_t, dtype=np.float64).flatten()
+        self.T_current = self.T_init.copy()
+
+        # Settings
+        self.deg_step = 0.5
+        self.trans_step = 0.1
+        self.radar_zoom = 1.0
+        self.is_fine_mode = False
+
+        # Accumulators (Display purpose)
+        self.acc_rot = np.zeros(3)   # Pitch, Yaw, Roll
+        self.acc_trans = np.zeros(3) # X, Y, Z
+
+        # BEV
+        self.lane_points = []; self.homography = None
+        self.px_per_meter = 10.0; self.bev_size = (500, 1000)
+        
+        # Config Path
+        try:
+            rp = rospkg.RosPack()
+            self.config_dir = os.path.join(rp.get_path("perception_test"), "config")
+        except:
+            self.config_dir = os.path.dirname(self.gui.extrinsic_path)
+        os.makedirs(self.config_dir, exist_ok=True)
+        self.homography_path = os.path.join(self.config_dir, "center_camera-homography.json")
+
+        # ================= UI Layout =================
+        main_layout = QtWidgets.QHBoxLayout(self)
+        
+        # Left Container (Views)
+        left_cont = QtWidgets.QWidget()
+        left_layout = QtWidgets.QHBoxLayout(left_cont); left_layout.setContentsMargins(0,0,0,0)
+        self.bev_view = ImageCanvasViewer()
+        self.img_view = ImageCanvasViewer()
+        self.img_view.set_click_callback(self._on_image_click)
+        left_layout.addWidget(self.bev_view, stretch=4)
+        left_layout.addWidget(self.img_view, stretch=5)
+        main_layout.addWidget(left_cont, stretch=5)
+
+        # Right Container (Controls)
+        ctrl_panel = QtWidgets.QWidget(); ctrl_panel.setFixedWidth(420)
+        vbox = QtWidgets.QVBoxLayout(ctrl_panel)
+
+        # (A) Visualization Options
+        gb_vis = QtWidgets.QGroupBox("1. Visual Aids (Like Rviz)")
+        f_vis = QtWidgets.QFormLayout()
+        self.chk_axis = QtWidgets.QCheckBox("Show Radar Axis (RGB)"); self.chk_axis.setChecked(True)
+        self.chk_grid = QtWidgets.QCheckBox("Show Ground Grid (10m)"); self.chk_grid.setChecked(True)
+        self.chk_bbox = QtWidgets.QCheckBox("Show Moving Vehicles (Box)"); self.chk_bbox.setChecked(True)
+        self.chk_raw = QtWidgets.QCheckBox("Show Raw Points"); self.chk_raw.setChecked(True)
+        
+        self.chk_hide_static = QtWidgets.QCheckBox(f"Hide Static (|v| < {NOISE_MIN_SPEED_KMH:.1f} km/h)")
+        self.chk_hide_static.setChecked(False)
+
+        self.chk_axis.toggled.connect(self.update_view)
+        self.chk_grid.toggled.connect(self.update_view)
+        self.chk_bbox.toggled.connect(self.update_view)
+        self.chk_raw.toggled.connect(self.update_view)
+        
+        self.chk_hide_static.toggled.connect(self.update_view)
+        f_vis.addRow(self.chk_axis, self.chk_grid)
+        f_vis.addRow(self.chk_bbox, self.chk_raw)
+        f_vis.addRow(self.chk_hide_static)
+        gb_vis.setLayout(f_vis); vbox.addWidget(gb_vis)
+
+        # (B) Control Values
+        gb_step = QtWidgets.QGroupBox("2. Adjustments")
+        f_step = QtWidgets.QFormLayout()
+        self.s_deg = QtWidgets.QDoubleSpinBox(); self.s_deg.setRange(0.01, 10.0); self.s_deg.setValue(self.deg_step)
+        self.s_deg.valueChanged.connect(lambda v: setattr(self, 'deg_step', v))
+        self.s_trans = QtWidgets.QDoubleSpinBox(); self.s_trans.setRange(0.001, 1.0); self.s_trans.setValue(self.trans_step)
+        self.s_trans.valueChanged.connect(lambda v: setattr(self, 'trans_step', v))
+        self.s_zoom = QtWidgets.QDoubleSpinBox(); self.s_zoom.setRange(0.1, 5.0); self.s_zoom.setValue(1.0)
+        self.s_zoom.valueChanged.connect(lambda v: setattr(self, 'radar_zoom', v)) # Directly bind
+        
+        f_step.addRow("Rot Step(°):", self.s_deg)
+        f_step.addRow("Move Step(m):", self.s_trans)
+        f_step.addRow("Zoom:", self.s_zoom)
+        gb_step.setLayout(f_step); vbox.addWidget(gb_step)
+
+        # (C) Status Display
+        gb_stat = QtWidgets.QGroupBox("3. State")
+        g_stat = QtWidgets.QGridLayout()
+        
+        self.lbl_mode = QtWidgets.QLabel("Mode: Normal")
+        self.lbl_mode.setStyleSheet("color: blue; font-weight: bold;")
+        g_stat.addWidget(self.lbl_mode, 0, 0, 1, 2)
+        
+        # Values (Red)
+        red_style = "color: #FF0000; font-weight: bold;"
+        rows = ["Rot X (deg)", "Rot Y (deg)", "Rot Z (deg)", "Trans X (m)", "Trans Y (m)", "Trans Z (m)"]
+        self.v_labels = [QtWidgets.QLabel("0.00") for _ in range(6)]
+        
+        for i, name in enumerate(rows):
+            l = QtWidgets.QLabel(name + ":"); l.setStyleSheet(red_style)
+            self.v_labels[i].setStyleSheet(red_style)
+            g_stat.addWidget(l, i+1, 0)
+            g_stat.addWidget(self.v_labels[i], i+1, 1)
+            
+        gb_stat.setLayout(g_stat); vbox.addWidget(gb_stat)
+
+        # (D) Actions
+        h_act = QtWidgets.QHBoxLayout()
+        btn_rst = QtWidgets.QPushButton("Reset"); btn_rst.clicked.connect(self._reset_T)
+        btn_sv = QtWidgets.QPushButton("Save"); btn_sv.setStyleSheet("background-color:#007700; color:white; font-weight:bold")
+        btn_sv.clicked.connect(self._save_extrinsic)
+        h_act.addWidget(btn_rst); h_act.addWidget(btn_sv)
+        vbox.addLayout(h_act)
+        # (E) Guide
+        l_guide = QtWidgets.QLabel(
+            "⌨️  Extrinsic Control (User Mapping)\n"
+            "  Rot(+):  q(+x)  w(+y)  e(+z)\n"
+            "  Rot(-):  a(-x)  s(-y)  d(-z)\n"
+            "  Trans(+): r(+x)  t(+y)  y(+z)\n"
+            "  Trans(-): f(-x)  g(-y)  h(-z)\n\n"
+            "🔍 Zoom: [Z] Out / [X] In\n"
+            "⚡ Fine: Hold [Shift]"
+        )
+        l_guide.setStyleSheet("color: #333333;")
+        vbox.addWidget(l_guide)
+        
+        vbox.addStretch()
+        main_layout.addWidget(ctrl_panel)
+
+        self.timer = QtCore.QTimer(); self.timer.timeout.connect(self.update_view); self.timer.start(50)
+        self._load_homography_json(silent=True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    # ------------------------------------------------
+    # Controls (Screen Relative)
+    # ------------------------------------------------
+    def keyPressEvent(self, event):
+        k = event.key()
+        mod = event.modifiers()
+        self.is_fine_mode = (mod & Qt.ShiftModifier)
+        deg = 0.05 if self.is_fine_mode else self.deg_step
+        trans = 0.01 if self.is_fine_mode else self.trans_step
+        self.lbl_mode.setText("Mode: FINE (Precise)" if self.is_fine_mode else "Mode: Normal")
+
+        # ------------------------------------------------
+        # Keyboard mapping (User table)
+        # Rotation (degree):
+        #   +X: Q, -X: A
+        #   +Y: W, -Y: S
+        #   +Z: E, -Z: D
+        # Translation (meter):
+        #   +X: R, -X: F
+        #   +Y: T, -Y: G
+        #   +Z: Y, -Z: H
+        # ------------------------------------------------
+
+        # Rotation
+        if k == Qt.Key_Q: self._rot(0, +1, deg)
+        elif k == Qt.Key_A: self._rot(0, -1, deg)
+        elif k == Qt.Key_W: self._rot(1, +1, deg)
+        elif k == Qt.Key_S: self._rot(1, -1, deg)
+        elif k == Qt.Key_E: self._rot(2, +1, deg)
+        elif k == Qt.Key_D: self._rot(2, -1, deg)
+
+        # Translation
+        elif k == Qt.Key_R: self._mov(0, +1, trans)
+        elif k == Qt.Key_F: self._mov(0, -1, trans)
+        elif k == Qt.Key_T: self._mov(1, +1, trans)
+        elif k == Qt.Key_G: self._mov(1, -1, trans)
+        elif k == Qt.Key_Y: self._mov(2, +1, trans)
+        elif k == Qt.Key_H: self._mov(2, -1, trans)
+
+        # Zoom
+        elif k == Qt.Key_Z: self.radar_zoom = max(0.1, self.radar_zoom - 0.1)
+        elif k == Qt.Key_X: self.radar_zoom += 0.1
+
+        self.s_zoom.setValue(self.radar_zoom)
+        self._update_stat_ui()
+        self.update_view()
+        
+    def keyReleaseEvent(self, event):
+        mod = event.modifiers()
+        self.is_fine_mode = (mod & Qt.ShiftModifier)
+        self.lbl_mode.setText("Mode: FINE (Precise)" if self.is_fine_mode else "Mode: Normal")
+    def _rot(self, axis, sign, step):
+        """Rotate ONLY the rotation matrix R in T_current (Radar->Camera)."""
+        angle = sign * np.deg2rad(step)
+        c, s = np.cos(angle), np.sin(angle)
+
+        if axis == 0:
+            dR = np.array([[1, 0, 0],
+                           [0, c, -s],
+                           [0, s,  c]], dtype=np.float64)
+        elif axis == 1:
+            dR = np.array([[ c, 0, s],
+                           [ 0, 1, 0],
+                           [-s, 0, c]], dtype=np.float64)
+        else:
+            dR = np.array([[c, -s, 0],
+                           [s,  c, 0],
+                           [0,  0, 1]], dtype=np.float64)
+
+        # Keep translation t fixed; update rotation only.
+        self.T_current[:3, :3] = self.T_current[:3, :3] @ dR
+        self.acc_rot[axis] += (sign * step)
+    def _mov(self, axis, sign, step):
+        """Translate in radar-axis units (x,y,z) and convert to camera translation t."""
+        d = np.zeros(3, dtype=np.float64)
+        d[axis] = sign * step
+
+        # If T maps radar->camera: p_cam = R p_radar + t,
+        # then a delta in radar frame corresponds to dt = R * d in camera frame.
+        dt = self.T_current[:3, :3] @ d
+        self.T_current[:3, 3] = self.T_current[:3, 3] + dt
+        self.acc_trans[axis] += (sign * step)
+
+    def _update_stat_ui(self):
+        vals = [
+            f"{self.acc_rot[0]:+.2f}°", f"{self.acc_rot[1]:+.2f}°", f"{self.acc_rot[2]:+.2f}°",
+            f"{self.acc_trans[0]:+.2f}m", f"{self.acc_trans[1]:+.2f}m", f"{self.acc_trans[2]:+.2f}m"
+        ]
+        for i, v in enumerate(vals): self.v_labels[i].setText(v)
+
+    def _reset_T(self):
+        self.T_current = self.T_init.copy(); self.acc_rot[:]=0; self.acc_trans[:]=0; self.radar_zoom=1.0
+        self.s_zoom.setValue(1.0)
+        self._update_stat_ui(); self.update_view()
+
+    def _save_extrinsic(self):
+        R = self.T_current[:3, :3]; t = self.T_current[:3, 3].reshape(3, 1)
+        data = {"R": R.tolist(), "t": t.flatten().tolist()}
+        with open(self.gui.extrinsic_path, 'w') as f: json.dump(data, f, indent=4)
+        self.gui.load_extrinsic()
+        QtWidgets.QMessageBox.information(self, "Saved", "Extrinsic Updated!")
+
+    # ------------------------------------------------
+    # Visualization (Gizmo, Box, Grid)
+    # ------------------------------------------------
+    def update_view(self):
+        cv_img = self.gui.cv_image
+        if cv_img is None: return
+        disp = cv_img.copy()
+        h, w = disp.shape[:2]
+        K = self.gui.cam_K
+        cx, cy = (K[0,2], K[1,2]) if K is not None else (w/2, h/2)
+        
+        # Center for Zoom (Optical Center)
+        cx_opt, cy_opt = (K[0,2], K[1,2]) if K is not None else (w/2, h/2)
+
+        # 1. BEV
+        if self.homography is not None:
+            bev = cv2.warpPerspective(disp, self.homography, self.bev_size)
+        else:
+            bev = np.zeros((self.bev_size[1], self.bev_size[0], 3), dtype=np.uint8)
+        self._draw_bev_overlays(bev)
+        
+        # 2. Draw Helpers
+        if K is not None:
+            if self.chk_grid.isChecked(): self._draw_grid(disp, K, cx_opt, cy_opt)
+            if self.chk_axis.isChecked(): self._draw_axis(disp, K, cx_opt, cy_opt)
+
+        # 3. Radar Processing
+        if self.gui.radar_points is not None and K is not None:
+            pts_r = self.gui.radar_points # N x 3
+            dopplers = self.gui.radar_doppler
+            
+            # --- CLUSTERING (Raw Radar Frame) ---
+            # Clustering in raw frame is safer as it's physically grounded
+            clusters = cluster_radar_points(pts_r, dopplers, CLUSTER_MAX_DIST, CLUSTER_MIN_PTS)
+            
+            # Draw BBox
+            if self.chk_bbox.isChecked():
+                for c in clusters:
+                    self._draw_bbox_3d(disp, c, K, cx_opt, cy_opt)
+
+            # Draw Raw Points
+            if self.chk_raw.isChecked():
+                self._draw_raw_points(disp, pts_r, dopplers, K, cx_opt, cy_opt, w, h)
+                
+            # BEV Points (Transform only valid ones)
+            # (Simplification: Just draw raw points on BEV for reference)
+            # Use current T to project to camera, then homography
+            pass 
+
+        # 4. Lane Picker
+        for idx, (x, y) in enumerate(self.lane_points):
+            cv2.circle(disp, (int(x), int(y)), 6, (0, 165, 255), -1)
+            cv2.putText(disp, str(idx+1), (int(x)+5, int(y)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,165,255), 2)
+
+        self.img_view.update_image(disp)
+        self.bev_view.update_image(bev)
+
+    def _draw_raw_points(self, img, pts_r, dopplers, K, cx, cy, w, h):
+        # Transform all points: T * P_r
+        pts_r_h = np.hstack((pts_r, np.ones((pts_r.shape[0], 1))))
+        pts_c = (self.T_current @ pts_r_h.T).T # (N, 4)
+        
+        valid = pts_c[:, 2] > 0.5
+        if not np.any(valid): return
+        
+        pts_c = pts_c[valid, :3]
+        dops = dopplers[valid] if dopplers is not None else np.zeros(np.sum(valid))
+        
+        uvs = K @ pts_c.T
+        uvs /= uvs[2, :]
+        
+        for i in range(uvs.shape[1]):
+            u = (uvs[0, i] - cx) * self.radar_zoom + cx
+            v = (uvs[1, i] - cy) * self.radar_zoom + cy
+            
+            # Color by Doppler
+            vel = dops[i] # m/s
+            if abs(vel) < 0.2: color = (180, 180, 180) # Static/Noise
+            elif vel < SPEED_THRESHOLD_RED: color = (0, 0, 255) # Approach
+            elif vel > SPEED_THRESHOLD_BLUE: color = (255, 0, 0) # Recede
+            else: color = (0, 255, 0) # Slow moving
+            
+            if 0<=u<w and 0<=v<h:
+                cv2.circle(img, (int(u), int(v)), 2, color, -1)
+
+    def _draw_bbox_3d(self, img, cluster, K, cx, cy):
+        # Cluster info is in Radar Frame. Need to transform min/max to Camera Frame
+        # Construct 8 corners in Radar Frame
+        min_p = cluster['min']
+        max_p = cluster['max']
+        
+        # Simple Axis Aligned BBox in Radar Frame
+        corners = np.array([
+            [min_p[0], min_p[1], min_p[2]],
+            [max_p[0], min_p[1], min_p[2]],
+            [max_p[0], max_p[1], min_p[2]],
+            [min_p[0], max_p[1], min_p[2]],
+            [min_p[0], min_p[1], max_p[2]],
+            [max_p[0], min_p[1], max_p[2]],
+            [max_p[0], max_p[1], max_p[2]],
+            [min_p[0], max_p[1], max_p[2]]
+        ])
+        
+        # Transform to Camera
+        corners_h = np.hstack((corners, np.ones((8, 1))))
+        corners_c = (self.T_current @ corners_h.T).T # (8, 4)
+        
+        if np.any(corners_c[:, 2] < 0.5): return # Behind camera
+        
+        # Project
+        uvs = K @ corners_c[:, :3].T
+        uvs /= uvs[2, :]
+        
+        px = []
+        for i in range(8):
+            u = (uvs[0, i] - cx) * self.radar_zoom + cx
+            v = (uvs[1, i] - cy) * self.radar_zoom + cy
+            px.append((int(u), int(v)))
+            
+        # Determine Color
+        vel = cluster['vel']
+        if self.chk_hide_static.isChecked() and abs(vel * 3.6) < NOISE_MIN_SPEED_KMH: return  # Hide static clusters (optional)
+        
+        color = (0, 0, 255) if vel < SPEED_THRESHOLD_RED else (255, 0, 0) # Red/Blue
+        if SPEED_THRESHOLD_RED <= vel <= SPEED_THRESHOLD_BLUE: color = (0, 255, 0)
+
+        # Draw Lines (Wireframe)
+        edges = [
+            (0,1), (1,2), (2,3), (3,0), # Bottom
+            (4,5), (5,6), (6,7), (7,4), # Top
+            (0,4), (1,5), (2,6), (3,7)  # Sides
+        ]
+        
+        # Check FOV
+        h, w = img.shape[:2]
+        in_fov = False
+        for u, v in px:
+            if 0<=u<w and 0<=v<h: in_fov = True; break
+        if not in_fov: return
+
+        for s, e in edges:
+            cv2.line(img, px[s], px[e], color, 2)
+            
+        # Label
+        top_center = px[4]
+        cv2.putText(img, f"{vel*3.6:.0f}km/h", top_center, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    def _draw_axis(self, img, K, cx, cy):
+        # Draw Axis at Radar Origin (0,0,0)
+        origin = np.array([0, 0, 0, 1])
+        # Radar Frame (Project): X=Right, Y=Forward, Z=Up
+        x_axis = np.array([AXIS_LENGTH, 0, 0, 1])
+        y_axis = np.array([0, AXIS_LENGTH, 0, 1])
+        z_axis = np.array([0, 0, AXIS_LENGTH, 1])
+        
+        pts = np.vstack([origin, x_axis, y_axis, z_axis])
+        pts_c = (self.T_current @ pts.T).T
+        
+        if pts_c[0, 2] < 0.5: return
+        
+        uvs = K @ pts_c[:, :3].T
+        uvs /= uvs[2, :]
+        
+        px = []
+        for i in range(4):
+            u = (uvs[0, i] - cx)*self.radar_zoom + cx
+            v = (uvs[1, i] - cy)*self.radar_zoom + cy
+            px.append((int(u), int(v)))
+            
+        o = px[0]
+        cv2.arrowedLine(img, o, px[1], (0, 0, 255), 3) # Red X
+        cv2.arrowedLine(img, o, px[2], (0, 255, 0), 3) # Green Y
+        cv2.arrowedLine(img, o, px[3], (255, 0, 0), 3) # Blue Z
+        cv2.putText(img, "RADAR", o, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    def _draw_grid(self, img, K, cx, cy):
+        # Draw Ground Grid (Z = -1.5m roughly in Radar Frame)
+        # Project Radar Frame: X=Right, Y=Forward, Z=Up
+        z_h = -1.5
+
+        xs = np.linspace(-20, 20, 9)   # left(-) to right(+)
+        ys = np.linspace(0, 100, 11)   # near(0) to far(100m forward)
+
+        # Lines along Forward (Y)
+        for x in xs:
+            p1 = np.array([x, 0, z_h, 1])
+            p2 = np.array([x, 100, z_h, 1])
+            self._draw_line_3d(img, p1, p2, K, cx, cy, (100, 100, 0))
+
+        # Lines along Right (X)
+        for y in ys:
+            p1 = np.array([-20, y, z_h, 1])
+            p2 = np.array([20, y, z_h, 1])
+            self._draw_line_3d(img, p1, p2, K, cx, cy, (100, 100, 0))
+
+    def _draw_line_3d(self, img, p1, p2, K, cx, cy, color):
+        pts = np.vstack([p1, p2])
+        pts_c = (self.T_current @ pts.T).T
+        if pts_c[0, 2] < 0.5 or pts_c[1, 2] < 0.5: return
+        
+        uvs = K @ pts_c[:, :3].T
+        uvs /= uvs[2, :]
+        u1 = (uvs[0, 0]-cx)*self.radar_zoom + cx; v1 = (uvs[1, 0]-cy)*self.radar_zoom + cy
+        u2 = (uvs[0, 1]-cx)*self.radar_zoom + cx; v2 = (uvs[1, 1]-cy)*self.radar_zoom + cy
+        try:
+            cv2.line(img, (int(u1), int(v1)), (int(u2), int(v2)), color, 1)
+        except: pass
+
+    def _draw_bev_overlays(self, bev):
+        h, w = bev.shape[:2]; cx = w//2; px = int(self.px_per_meter)
+        for i in range(0, h, px*10):
+            cv2.line(bev, (0, h-i), (w, h-i), (50,50,50), 1)
+            if i>0: cv2.putText(bev, f"{i//px}m", (5, h-i-5), 0, 0.5, (100,100,100), 1)
+        lx = int(cx - 1.75*px); rx = int(cx + 1.75*px)
+        cv2.line(bev, (lx, 0), (lx, h), (255,0,0), 2)
+        cv2.line(bev, (rx, 0), (rx, h), (255,0,0), 2)
+        cv2.line(bev, (cx, 0), (cx, h), (80,80,80), 1)
+
+    # BEV Setup
+    def _toggle_lane_pick(self):
+        self.lane_pick_active = self.btn_pick.isChecked()
+        if self.lane_pick_active: self.lane_points = []; self.lbl_bev.setText("Pick 4 points (Bot->Top)")
+        else: self.lbl_bev.setText("Canceled")
+    def _reset_lane_points(self): self.lane_points = []; self.homography = None; self.lbl_bev.setText("Cleared")
+    def _on_image_click(self, x, y):
+        if not self.lane_pick_active: return
+        self.lane_points.append((x, y))
+        if len(self.lane_points) == 4: self._compute_homography(); self.lane_pick_active = False; self.btn_pick.setChecked(False)
+    def _compute_homography(self):
+        pts = np.array(self.lane_points, dtype=np.float32)
+        idx = np.argsort(pts[:, 1])[::-1]; b = pts[idx[:2]]; t = pts[idx[2:]]
+        b = b[np.argsort(b[:, 0])]; t = t[np.argsort(t[:, 0])]
+        src = np.array([b[0], b[1], t[1], t[0]], dtype=np.float32)
+        bw, bh = self.bev_size; sc = self.px_per_meter; cx = bw/2.0; by = bh-50.0
+        dst = np.array([[cx-1.75*sc, by], [cx+1.75*sc, by], [cx+1.75*sc, by-15.0*sc], [cx-1.75*sc, by-15.0*sc]], dtype=np.float32)
+        self.homography = cv2.getPerspectiveTransform(src, dst)
+        self.lbl_bev.setText("Status: Clean BEV Set")
+        self._save_homography_json(src, dst)
+    def _save_homography_json(self, s, d): 
+        d = {"center_camera-homography": {"param": {"src_quad": [{"x":float(p[0]),"y":float(p[1])} for p in s], "dst_quad_pixels": [{"x":float(p[0]),"y":float(p[1])} for p in d]}}}
+        with open(self.homography_path, 'w') as f: json.dump(d, f, indent=4)
+    def _load_homography_json(self, silent=False):
+        if not os.path.exists(self.homography_path): return
+        try:
+            with open(self.homography_path, 'r') as f: d = json.load(f)
+            p = d[list(d.keys())[0]]["param"]
+            s = np.array([[x["x"], x["y"]] for x in p["src_quad"]], dtype=np.float32)
+            if "dst_quad_pixels" in p:
+                ds = np.array([[x["x"], x["y"]] for x in p["dst_quad_pixels"]], dtype=np.float32)
+                self.homography = cv2.getPerspectiveTransform(s, ds)
+                self.lbl_bev.setText("Status: Config Loaded")
+        except: pass
+
+
+# ==============================================================================
+# Main GUI
 # ==============================================================================
 class RealWorldGUI(QtWidgets.QMainWindow):
     def __init__(self):
@@ -305,6 +878,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         self.cv_image = None
         self.radar_points = None
+        self.radar_doppler = None
         self.cam_K = None
         self.lane_polys = {}
         self.Extr_R = np.eye(3)
@@ -364,8 +938,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         gb_calib = QtWidgets.QGroupBox("1. Calibration")
         v_c = QtWidgets.QVBoxLayout()
-        
-        # 1. 내부 위젯들을 무조건 위로 밀착시킴 (버튼 사이 벌어짐 방지)
         v_c.setAlignment(QtCore.Qt.AlignTop) 
         v_c.setSpacing(5)
 
@@ -391,8 +963,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v_c.addWidget(self.txt_intrinsic_log)
 
         gb_calib.setLayout(v_c)
-        
-        # 2. 그룹박스가 세로로 늘어나지 못하게 제한 (그룹박스 하단 빈공간 제거)
         gb_calib.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
         
         vbox.addWidget(gb_calib)
@@ -442,8 +1012,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.lane_counters = {name: 0 for name in self.lane_counters.keys()}
         self.global_to_local_ids = {}
         self.lbl_log.setText("Local IDs Reset.")
-
-    # Pause/resume functionality has been removed; no toggle_pause method needed
 
     # ------------------ Callback (Synchronized) ------------------
     def cb_sync(self, img_msg, radar_msg):
@@ -659,10 +1227,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 for i in range(uvs.shape[1]):
                     u, v = int(uvs[0, i]), int(uvs[1, i])
                     
-                    # 점 148개 중 앞쪽 5개만 좌표를 출력해서 위치 확인
-                    if i < 5: 
-                        print(f"[DEBUG] Point {i} -> u: {u}, v: {v} (Screen Size: {w}x{h})")
-
                     if 0 <= u < w and 0 <= v < h:
                         if has_doppler:
                             speed_kmh = dopplers[i] * 3.6
@@ -714,8 +1278,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         self.viewer.update_image(disp)
 
-        # Graph display removed; no radar scatter update
-
     # ------------------ Misc ------------------
     def open_lane_editor(self):
         if self.cv_image is None:
@@ -757,26 +1319,23 @@ class RealWorldGUI(QtWidgets.QMainWindow):
     def run_intrinsic_calibration(self):
         """
         GUI에서 intrinsic 캘리브레이션(오프라인 이미지) 실행.
-        perception_test/image 폴더의 calib_01.jpg ~ 를 사용한다고 가정.
         """
         try:
             rp = rospkg.RosPack()
             pkg_path = rp.get_path("perception_test")
-            image_dir = os.path.join(pkg_path, "image")  # <- 너가 말한 경로
+            image_dir = os.path.join(pkg_path, "image")
             out_yaml = os.path.join(pkg_path, "config", "camera_intrinsic.yaml")
 
             if not os.path.isdir(image_dir):
                 self.lbl_log.setText(f"[Intrinsic] image dir not found: {image_dir}")
                 return
 
-            # jpg가 있는지 간단 체크
             import glob
             imgs = sorted(glob.glob(os.path.join(image_dir, "*.jpg")))
             if len(imgs) == 0:
                 self.lbl_log.setText(f"[Intrinsic] No .jpg in {image_dir}")
                 return
 
-            # 이미 실행 중이면 중복 실행 방지
             if hasattr(self, "intrinsic_proc") and self.intrinsic_proc is not None:
                 if self.intrinsic_proc.state() != QtCore.QProcess.NotRunning:
                     self.lbl_log.setText("[Intrinsic] already running...")
@@ -787,11 +1346,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             self.pbar_intrinsic.setRange(0, 0)  # 돌아가는 중 표시
             self.lbl_log.setText("[Intrinsic] Running... (GUI에서 로그 확인)")
 
-            # QProcess로 rosrun 실행 (터미널 안 봐도 stdout을 GUI로 가져올 수 있음)
             self.intrinsic_proc = QtCore.QProcess(self)
             self.intrinsic_proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
 
-            # 중요: rosrun은 ROS 환경이 잡힌 상태에서 GUI가 실행된 경우 정상 동작
             ws = os.path.expanduser("~/motrex/catkin_ws")
             setup_bash = os.path.join(ws, "devel", "setup.bash")
 
@@ -819,10 +1376,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             traceback.print_exc()
 
     def _on_intrinsic_stdout(self):
-        """
-        calibration_in_node.py가 찍는 로그를 GUI에 표시.
-        (Select image / Calibration done 같은 문구를 그대로 보여줌)
-        """
         if not hasattr(self, "intrinsic_proc") or self.intrinsic_proc is None:
             return
         data = bytes(self.intrinsic_proc.readAllStandardOutput()).decode("utf-8", errors="ignore")
@@ -830,19 +1383,13 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             return
         self.txt_intrinsic_log.appendPlainText(data.rstrip())
 
-        # 진행률을 대략적으로라도 보이게: "Select image:" 카운트 기반
-        # (완전 정확할 필요 없고, “진행 중” 체감용)
         if "Select image:" in data or "Select image" in data:
-            # 로그 전체에서 선택 개수 대략 계산
             text = self.txt_intrinsic_log.toPlainText()
             selected = text.count("Select image")
             self.pbar_intrinsic.setRange(0, 45)
             self.pbar_intrinsic.setValue(min(selected, 45))
 
     def _on_intrinsic_finished(self, exit_code, exit_status):
-        """
-        종료 시 YAML 읽어서 K/D 요약을 lbl_log에 표시
-        """
         try:
             self.pbar_intrinsic.setVisible(False)
 
@@ -851,13 +1398,12 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             out_yaml = os.path.join(pkg_path, "config", "camera_intrinsic.yaml")
 
             if exit_code == 0 and os.path.exists(out_yaml):
-                # YAML에서 K/D 읽어 요약
+                import yaml
                 with open(out_yaml, "r", encoding="utf-8") as f:
                     y = yaml.safe_load(f) or {}
                 ci = (y.get("camera_info") or {})
                 K = ci.get("K", [])
                 D = ci.get("D", [])
-                # fx, fy, cx, cy 요약
                 fx = K[0] if len(K) >= 9 else None
                 fy = K[4] if len(K) >= 9 else None
                 cx = K[2] if len(K) >= 9 else None
@@ -882,401 +1428,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             return
         if self.extrinsic_mtime is None or mtime > self.extrinsic_mtime:
             self.load_extrinsic()
-
-# ==============================================================================
-# ManualCalibWindow (Camera-Frame Control: Intuitive Mode)
-# ==============================================================================
-class ManualCalibWindow(QtWidgets.QDialog):
-    """
-    Manual Calibration with 'Screen-Space' Controls.
-    - Controls apply rotation relative to the CAMERA VIEW (Screen), not the Radar body.
-    - Solves the issue where 'Yaw' causes vertical movement due to axis misalignment.
-    """
-
-    def __init__(self, gui: 'RealWorldGUI'):
-        super().__init__(gui)
-        self.gui = gui
-        self.setWindowTitle("Manual Calibration (Intuitive Screen-Space Control)")
-        self.setModal(True)
-        self.resize(1700, 1000)
-
-        # -------------------------------------------------------------
-        # 1. Initialize State
-        # -------------------------------------------------------------
-        self.T_init = np.eye(4, dtype=np.float64)
-        self.T_init[:3, :3] = np.array(self.gui.Extr_R, dtype=np.float64)
-        self.T_init[:3, 3] = np.array(self.gui.Extr_t, dtype=np.float64).flatten()
-        self.T_current = self.T_init.copy()
-
-        # Step Sizes
-        self.deg_step = 0.5
-        self.trans_step = 0.05 # 5cm 단위로 정밀하게
-        self.zoom_step = 0.1
-        self.point_radius = OVERLAY_POINT_RADIUS
-        self.radar_zoom = 1.0
-        
-        # Accumulators (For display only)
-        self.acc_rot = np.zeros(3, dtype=float)
-        self.acc_trans = np.zeros(3, dtype=float)
-        
-        # BEV Settings
-        self.lane_points = []
-        self.lane_pick_active = False
-        self.homography = None
-        self.px_per_meter = 10.0
-        self.bev_size = (500, 1000)
-        
-        # Config Path
-        try:
-            rp = rospkg.RosPack()
-            self.config_dir = os.path.join(rp.get_path("perception_test"), "config")
-        except:
-            self.config_dir = os.path.dirname(self.gui.extrinsic_path)
-        os.makedirs(self.config_dir, exist_ok=True)
-        self.homography_path = os.path.join(self.config_dir, "center_camera-homography.json")
-
-        # ================= UI Layout =================
-        main_layout = QtWidgets.QHBoxLayout(self)
-        
-        # Left Viewers
-        left_cont = QtWidgets.QWidget()
-        left_layout = QtWidgets.QHBoxLayout(left_cont)
-        self.bev_view = ImageCanvasViewer()
-        self.img_view = ImageCanvasViewer()
-        self.img_view.set_click_callback(self._on_image_click)
-        left_layout.addWidget(self.bev_view, stretch=4)
-        left_layout.addWidget(self.img_view, stretch=5)
-        main_layout.addWidget(left_cont, stretch=5)
-
-        # Right Controls
-        ctrl_panel = QtWidgets.QWidget()
-        ctrl_panel.setFixedWidth(420)
-        vbox = QtWidgets.QVBoxLayout(ctrl_panel)
-
-        # (A) Visuals
-        gb_vis = QtWidgets.QGroupBox("1. Visual Aids")
-        f_vis = QtWidgets.QFormLayout()
-        self.chk_axis = QtWidgets.QCheckBox("Show Axes"); self.chk_axis.setChecked(True)
-        self.chk_grid = QtWidgets.QCheckBox("Show Grid"); self.chk_grid.setChecked(True)
-        self.chk_axis.toggled.connect(self.update_view)
-        self.chk_grid.toggled.connect(self.update_view)
-        f_vis.addRow(self.chk_axis, self.chk_grid)
-        gb_vis.setLayout(f_vis)
-        vbox.addWidget(gb_vis)
-
-        # (B) Steps
-        gb_step = QtWidgets.QGroupBox("2. Step Sizes")
-        f_step = QtWidgets.QFormLayout()
-        self.s_deg = QtWidgets.QDoubleSpinBox(); self.s_deg.setRange(0.1, 10.0); self.s_deg.setValue(self.deg_step)
-        self.s_deg.valueChanged.connect(lambda v: setattr(self, 'deg_step', v))
-        self.s_trans = QtWidgets.QDoubleSpinBox(); self.s_trans.setRange(0.01, 1.0); self.s_trans.setValue(self.trans_step)
-        self.s_trans.valueChanged.connect(lambda v: setattr(self, 'trans_step', v))
-        self.s_zoom = QtWidgets.QDoubleSpinBox(); self.s_zoom.setRange(0.1, 5.0); self.s_zoom.setValue(1.0)
-        self.s_zoom.valueChanged.connect(lambda v: setattr(self, 'zoom_step', v))
-        f_step.addRow("Rot (°):", self.s_deg)
-        f_step.addRow("Move (m):", self.s_trans)
-        f_step.addRow("Zoom Step:", self.s_zoom)
-        gb_step.setLayout(f_step)
-        vbox.addWidget(gb_step)
-
-        # (C) BEV
-        gb_bev = QtWidgets.QGroupBox("3. BEV Setup")
-        h_bev = QtWidgets.QHBoxLayout()
-        self.btn_pick = QtWidgets.QPushButton("Pick 4 Pts"); self.btn_pick.setCheckable(True)
-        self.btn_pick.clicked.connect(self._toggle_lane_pick)
-        btn_clr = QtWidgets.QPushButton("Clear"); btn_clr.clicked.connect(self._reset_lane_points)
-        h_bev.addWidget(self.btn_pick); h_bev.addWidget(btn_clr)
-        self.lbl_bev = QtWidgets.QLabel("Not Loaded")
-        self.lbl_bev.setStyleSheet("color: #0000FF; font-weight: bold;")
-        v_bev = QtWidgets.QVBoxLayout(); v_bev.addWidget(self.lbl_bev); v_bev.addLayout(h_bev)
-        gb_bev.setLayout(v_bev)
-        vbox.addWidget(gb_bev)
-
-        # (D) Changes
-        gb_delta = QtWidgets.QGroupBox("4. Changes (Screen Relative)")
-        g_delta = QtWidgets.QGridLayout()
-        self.l_rot = [QtWidgets.QLabel("0.0°") for _ in range(3)]
-        self.l_trans = [QtWidgets.QLabel("0.00m") for _ in range(3)]
-        self.l_zoom = QtWidgets.QLabel("1.00 x")
-        
-        red = "color: #FF0000; font-weight: bold;"
-        rows = ["Tilt (Up/Dn)", "Pan (L/R)", "Roll (CW/CCW)"]
-        for i in range(3):
-            lb = QtWidgets.QLabel(rows[i]); lb.setStyleSheet(red)
-            self.l_rot[i].setStyleSheet(red); self.l_trans[i].setStyleSheet(red)
-            g_delta.addWidget(lb, i, 0)
-            g_delta.addWidget(self.l_rot[i], i, 1)
-            g_delta.addWidget(self.l_trans[i], i, 2)
-        
-        lz = QtWidgets.QLabel("Zoom:"); lz.setStyleSheet(red); self.l_zoom.setStyleSheet(red)
-        g_delta.addWidget(lz, 3, 0); g_delta.addWidget(self.l_zoom, 3, 1)
-        gb_delta.setLayout(g_delta)
-        vbox.addWidget(gb_delta)
-
-        # (E) Actions
-        h_act = QtWidgets.QHBoxLayout()
-        btn_rst = QtWidgets.QPushButton("Reset"); btn_rst.clicked.connect(self._reset_T)
-        btn_sv = QtWidgets.QPushButton("Save"); btn_sv.setStyleSheet("background-color:#007700; color:white; font-weight:bold")
-        btn_sv.clicked.connect(self._save_extrinsic)
-        h_act.addWidget(btn_rst); h_act.addWidget(btn_sv)
-        vbox.addLayout(h_act)
-
-        # (F) Guide
-        gb_key = QtWidgets.QGroupBox("Control Guide (Look at Screen)")
-        l_k = QtWidgets.QLabel(
-            "⬆⬇ Pitch (Tilt): [W] / [S]\n"
-            "⬅➡ Yaw (Pan):  [A] / [D]\n"
-            "🔄 Roll:       [Q] / [E]\n"
-            "Move: [R]/[F](X), [T]/[G](Y), [Y]/[H](Z)"
-        )
-        l_k.setStyleSheet("color: #333333; font-weight: bold;")
-        vk = QtWidgets.QVBoxLayout(); vk.addWidget(l_k)
-        gb_key.setLayout(vk)
-        vbox.addWidget(gb_key)
-        vbox.addStretch()
-
-        main_layout.addWidget(ctrl_panel)
-
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update_view)
-        self.timer.start(33)
-        self._load_homography_json(silent=True)
-        self.setFocusPolicy(Qt.StrongFocus)
-
-    # ------------------------------------------------
-    # Logic: Camera-Frame Rotation (Pre-Multiplication)
-    # ------------------------------------------------
-    def keyPressEvent(self, event):
-        k = event.key()
-        
-        # Rotation (Screen Based)
-        # W/S: Rotate around Camera X (Right) -> Tilt Up/Down
-        if k == Qt.Key_W: self._rotate_camera_frame(0, 1)  # Pitch Up
-        elif k == Qt.Key_S: self._rotate_camera_frame(0, -1) # Pitch Down
-        
-        # A/D: Rotate around Camera Y (Down) -> Pan Left/Right
-        elif k == Qt.Key_A: self._rotate_camera_frame(1, 1)  # Yaw Left
-        elif k == Qt.Key_D: self._rotate_camera_frame(1, -1) # Yaw Right
-        
-        # Q/E: Rotate around Camera Z (Forward) -> Roll
-        elif k == Qt.Key_Q: self._rotate_camera_frame(2, 1)  # Roll CCW
-        elif k == Qt.Key_E: self._rotate_camera_frame(2, -1) # Roll CW
-        
-        # Translation (Still in Camera Frame directions)
-        elif k == Qt.Key_R: self._translate_camera_frame(0, 1) # Right
-        elif k == Qt.Key_F: self._translate_camera_frame(0, -1) # Left
-        elif k == Qt.Key_T: self._translate_camera_frame(1, 1) # Down
-        elif k == Qt.Key_G: self._translate_camera_frame(1, -1) # Up
-        elif k == Qt.Key_Y: self._translate_camera_frame(2, 1) # Forward
-        elif k == Qt.Key_H: self._translate_camera_frame(2, -1) # Backward
-        
-        # Zoom
-        elif k == Qt.Key_Z: 
-            self.radar_zoom = max(0.1, self.radar_zoom - self.zoom_step)
-            self.l_zoom.setText(f"{self.radar_zoom:.2f} x")
-        elif k == Qt.Key_X: 
-            self.radar_zoom += self.zoom_step
-            self.l_zoom.setText(f"{self.radar_zoom:.2f} x")
-        
-        self.update_view()
-
-    def _rotate_camera_frame(self, axis, sign):
-        """
-        Apply rotation in CAMERA FRAME (Pre-multiplication).
-        T_new = R_delta @ T_current
-        """
-        angle = sign * np.deg2rad(self.deg_step)
-        c, s = np.cos(angle), np.sin(angle)
-        
-        R_delta = np.eye(4)
-        if axis == 0: # X (Pitch)
-            R_delta[:3, :3] = np.array([[1,0,0],[0,c,-s],[0,s,c]])
-        elif axis == 1: # Y (Yaw)
-            R_delta[:3, :3] = np.array([[c,0,s],[0,1,0],[-s,0,c]])
-        elif axis == 2: # Z (Roll)
-            R_delta[:3, :3] = np.array([[c,-s,0],[s,c,0],[0,0,1]])
-            
-        # Apply to LEFT side (Global/Camera frame)
-        self.T_current = R_delta @ self.T_current
-        
-        self.acc_rot[axis] += (sign * self.deg_step)
-        self._update_delta_ui()
-
-    def _translate_camera_frame(self, axis, sign):
-        """
-        Apply translation in CAMERA FRAME.
-        """
-        T_delta = np.eye(4)
-        T_delta[axis, 3] = sign * self.trans_step
-        
-        # Apply to LEFT side
-        self.T_current = T_delta @ self.T_current
-        
-        self.acc_trans[axis] += (sign * self.trans_step)
-        self._update_delta_ui()
-
-    def _update_delta_ui(self):
-        for i in range(3):
-            self.l_rot[i].setText(f"{self.acc_rot[i]:+.1f}°")
-            self.l_trans[i].setText(f"{self.acc_trans[i]:+.2f}m")
-
-    def _reset_T(self):
-        self.T_current = self.T_init.copy()
-        self.acc_rot[:] = 0; self.acc_trans[:] = 0
-        self.radar_zoom = 1.0
-        self._update_delta_ui()
-        self.update_view()
-
-    def _save_extrinsic(self):
-        R = self.T_current[:3, :3]; t = self.T_current[:3, 3].reshape(3, 1)
-        data = {"R": R.tolist(), "t": t.flatten().tolist()}
-        with open(self.gui.extrinsic_path, 'w') as f: json.dump(data, f, indent=4)
-        self.gui.load_extrinsic()
-        QtWidgets.QMessageBox.information(self, "Saved", "Extrinsic Updated!")
-
-    # ------------------------------------------------
-    # View & Projection
-    # ------------------------------------------------
-    def update_view(self):
-        cv_img = self.gui.cv_image
-        if cv_img is None: return
-        disp = cv_img.copy()
-        h, w = disp.shape[:2]
-        K = self.gui.cam_K
-        cx, cy = (K[0,2], K[1,2]) if K is not None else (w/2, h/2)
-
-        # 1. BEV
-        if self.homography is not None:
-            bev = cv2.warpPerspective(disp, self.homography, self.bev_size)
-        else:
-            bev = np.zeros((self.bev_size[1], self.bev_size[0], 3), dtype=np.uint8)
-        self._draw_bev_overlays(bev)
-
-        # 2. Grid on Camera
-        if self.chk_grid.isChecked() and K is not None:
-            self._draw_ground_grid(disp, K, cx, cy)
-
-        # 3. Points
-        if self.gui.radar_points is not None and K is not None:
-            pts_r = self.gui.radar_points.T
-            # T_current maps Radar -> Camera directly now
-            pts_c = (self.T_current @ np.vstack((pts_r, np.ones((1, pts_r.shape[1])))))[:3, :]
-            
-            valid = pts_c[2,:] > 0.5
-            if np.any(valid):
-                uvs = K @ pts_c[:, valid]
-                uvs /= uvs[2, :]
-                u = (uvs[0,:] - cx) * self.radar_zoom + cx
-                v = (uvs[1,:] - cy) * self.radar_zoom + cy
-                
-                for i in range(len(u)):
-                    ux, vx = int(u[i]), int(v[i])
-                    if 0<=ux<w and 0<=vx<h: cv2.circle(disp, (ux, vx), self.point_radius, (0, 255, 0), -1)
-                
-                # Draw on BEV (Un-zoomed)
-                if self.homography is not None:
-                    uvs_src = np.array([uvs[0,:], uvs[1,:]]).T.reshape(-1, 1, 2)
-                    uvs_dst = cv2.perspectiveTransform(uvs_src, self.homography)
-                    for pt in uvs_dst:
-                        bx, by = int(pt[0][0]), int(pt[0][1])
-                        if 0<=bx<self.bev_size[0] and 0<=by<self.bev_size[1]:
-                            cv2.circle(bev, (bx, by), 4, (0, 255, 0), -1)
-
-        # 4. Axis
-        if self.chk_axis.isChecked() and K is not None:
-            self._draw_radar_axes(disp, K, cx, cy)
-
-        # 5. Lane Points
-        for idx, (x, y) in enumerate(self.lane_points):
-            cv2.circle(disp, (int(x), int(y)), 6, (0, 165, 255), -1)
-            cv2.putText(disp, str(idx+1), (int(x)+5, int(y)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,165,255), 2)
-
-        self.img_view.update_image(disp)
-        self.bev_view.update_image(bev)
-
-    def _draw_bev_overlays(self, bev):
-        h, w = bev.shape[:2]; cx = w//2; px = int(self.px_per_meter)
-        # Grid
-        for i in range(0, h, px*10):
-            cv2.line(bev, (0, h-i), (w, h-i), (50,50,50), 1)
-            if i>0: cv2.putText(bev, f"{i//px}m", (5, h-i-5), 0, 0.5, (100,100,100), 1)
-        # Lane (Blue)
-        lx = int(cx - 1.75*px); rx = int(cx + 1.75*px)
-        cv2.line(bev, (lx, 0), (lx, h), (255,0,0), 2)
-        cv2.line(bev, (rx, 0), (rx, h), (255,0,0), 2)
-        cv2.line(bev, (cx, 0), (cx, h), (80,80,80), 1)
-
-    def _draw_ground_grid(self, img, K, cx, cy):
-        xs = np.linspace(-10, 10, 5); ys = np.linspace(0, 40, 5); rh = -1.0
-        lines = []
-        for x in xs: lines.append([[x, 0, rh], [x, 40, rh]])
-        for y in ys: lines.append([[-10, y, rh], [10, y, rh]])
-        for ln in lines:
-            pts = (self.T_current @ np.vstack((np.array(ln).T, np.ones((1,2)))))[:3,:]
-            if pts[2,0]<0.5 or pts[2,1]<0.5: continue
-            uvs = K @ pts; uvs /= uvs[2,:]
-            u1=(uvs[0,0]-cx)*self.radar_zoom+cx; v1=(uvs[1,0]-cy)*self.radar_zoom+cy
-            u2=(uvs[0,1]-cx)*self.radar_zoom+cx; v2=(uvs[1,1]-cy)*self.radar_zoom+cy
-            if -2000<u1<4000: cv2.line(img, (int(u1),int(v1)), (int(u2),int(v2)), (200,200,0), 1)
-
-    def _draw_radar_axes(self, img, K, cx, cy):
-        pts = np.array([[0,0,0],[2,0,0],[0,2,0],[0,0,2]], dtype=float).T
-        pts_c = (self.T_current @ np.vstack((pts, np.ones((1,4)))))[:3,:]
-        uvs = K @ pts_c; uvs /= uvs[2,:]
-        def px(i): return (int((uvs[0,i]-cx)*self.radar_zoom+cx), int((uvs[1,i]-cy)*self.radar_zoom+cy))
-        o=px(0); x=px(1); y=px(2); z=px(3)
-        h,w=img.shape[:2]
-        if not (0<=o[0]<w and 0<=o[1]<h): return
-        cv2.arrowedLine(img, o, x, (0,0,255), 3, 0.1); cv2.putText(img, "X", x, 0, 0.6, (0,0,255), 2)
-        cv2.arrowedLine(img, o, y, (0,255,0), 3, 0.1); cv2.putText(img, "Y", y, 0, 0.6, (0,255,0), 2)
-        cv2.arrowedLine(img, o, z, (255,0,0), 3, 0.1); cv2.putText(img, "Z", z, 0, 0.6, (255,0,0), 2)
-
-    # BEV Setup (Same as before)
-    def _toggle_lane_pick(self):
-        self.lane_pick_active = self.btn_pick.isChecked()
-        if self.lane_pick_active: self.lane_points = []; self.lbl_bev.setText("Pick 4 points (Bot->Top)")
-        else: self.lbl_bev.setText("Canceled")
-    def _reset_lane_points(self): self.lane_points = []; self.homography = None; self.lbl_bev.setText("Cleared")
-    def _on_image_click(self, x, y):
-        if not self.lane_pick_active: return
-        self.lane_points.append((x, y))
-        if len(self.lane_points) == 4: self._compute_homography(); self.lane_pick_active = False; self.btn_pick.setChecked(False)
-    def _compute_homography(self):
-        pts = np.array(self.lane_points, dtype=np.float32)
-        idx = np.argsort(pts[:, 1])[::-1]; b = pts[idx[:2]]; t = pts[idx[2:]]
-        b = b[np.argsort(b[:, 0])]; t = t[np.argsort(t[:, 0])]
-        src = np.array([b[0], b[1], t[1], t[0]], dtype=np.float32)
-        bw, bh = self.bev_size; sc = self.px_per_meter; cx = bw/2.0; by = bh-50.0
-        dst = np.array([[cx-1.75*sc, by], [cx+1.75*sc, by], [cx+1.75*sc, by-15.0*sc], [cx-1.75*sc, by-15.0*sc]], dtype=np.float32)
-        self.homography = cv2.getPerspectiveTransform(src, dst)
-        self.lbl_bev.setText("Status: Clean BEV Set")
-        self._save_homography_json(src, dst)
-    def _save_homography_json(self, s, d): 
-        d = {"center_camera-homography": {"param": {"src_quad": [{"x":float(p[0]),"y":float(p[1])} for p in s], "dst_quad_pixels": [{"x":float(p[0]),"y":float(p[1])} for p in d]}}}
-        with open(self.homography_path, 'w') as f: json.dump(d, f, indent=4)
-    def _load_homography_json(self, silent=False):
-        if not os.path.exists(self.homography_path): return
-        try:
-            with open(self.homography_path, 'r') as f: d = json.load(f)
-            p = d[list(d.keys())[0]]["param"]
-            s = np.array([[x["x"], x["y"]] for x in p["src_quad"]], dtype=np.float32)
-            if "dst_quad_pixels" in p:
-                ds = np.array([[x["x"], x["y"]] for x in p["dst_quad_pixels"]], dtype=np.float32)
-                self.homography = cv2.getPerspectiveTransform(s, ds)
-                self.lbl_bev.setText("Status: Config Loaded")
-        except: pass
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def main():
