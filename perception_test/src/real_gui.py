@@ -31,11 +31,15 @@ REFRESH_RATE_MS = 33           # 30 FPS
 # Radar Coloring & Filtering
 SPEED_THRESHOLD_RED = -0.5     # m/s (이보다 작으면 접근/빨강)
 SPEED_THRESHOLD_BLUE = 0.5     # m/s (이보다 크면 이탈/파랑)
-NOISE_MIN_SPEED_KMH = 1.0      # 정지 물체(노이즈) 필터링 기준 (km/h)
+NOISE_MIN_SPEED_KMH = 5.0      # 정지/저속(노이즈) 필터 기준 (km/h) — 권장 5km/h
 
 # Clustering Parameters (Rviz 스타일)
 CLUSTER_MAX_DIST = 2.5         # 점 사이 거리 (m)
 CLUSTER_MIN_PTS = 3            # 최소 점 개수
+
+CLUSTER_VEL_GATE_MPS = 2.0     # 클러스터 내 속도 일관성 게이트 (m/s)
+BBOX2D_MIN_AREA_PX2 = 250      # 2D bbox 최소 면적 (너무 작은 박스 제거)
+BBOX2D_MARGIN_PX = 6           # 2D bbox 여유 픽셀
 
 # Visualization
 OVERLAY_POINT_RADIUS = 4
@@ -80,7 +84,22 @@ except ImportError as e:
 # ==============================================================================
 # Helper Functions (Clustering & Math)
 # ==============================================================================
-def cluster_radar_points(points_xyz, points_vel, max_dist=2.0, min_pts=3):
+
+def _robust_mean_velocity(vs: np.ndarray, trim_ratio: float = 0.2) -> float:
+    """클러스터 속도 요약: 상/하위 trim_ratio 제거 후 평균(노이즈 완화)."""
+    if vs is None or len(vs) == 0:
+        return 0.0
+    vs = np.asarray(vs, dtype=np.float64)
+    if vs.size < 5:
+        return float(np.mean(vs))
+    vs_sorted = np.sort(vs)
+    k = int(np.floor(vs_sorted.size * trim_ratio))
+    if k*2 >= vs_sorted.size:
+        return float(np.mean(vs_sorted))
+    vs_trim = vs_sorted[k: vs_sorted.size - k]
+    return float(np.mean(vs_trim))
+
+def cluster_radar_points(points_xyz, points_vel, max_dist=2.0, min_pts=3, vel_gate_mps=None):
     """
     간단한 유클리드 거리 기반 클러스터링 (BFS)
     points_xyz: (N, 3) array
@@ -93,7 +112,12 @@ def cluster_radar_points(points_xyz, points_vel, max_dist=2.0, min_pts=3):
 
     # XY 평면 거리만 사용하여 클러스터링 (Z는 무시)
     pts_xy = points_xyz[:, :2]
-    
+
+    if points_vel is None:
+        points_vel = np.zeros(n, dtype=np.float64)
+    if vel_gate_mps is None:
+        vel_gate_mps = CLUSTER_VEL_GATE_MPS
+
     visited = np.zeros(n, dtype=bool)
     clusters = []
 
@@ -113,7 +137,8 @@ def cluster_radar_points(points_xyz, points_vel, max_dist=2.0, min_pts=3):
             # 현재 점과 다른 모든 점 사이의 거리 계산 (Vectorized)
             # 실제로는 KD-Tree가 빠르지만, 점 개수가 수백 개 수준이면 브루트포스도 충분함
             dists = np.linalg.norm(pts_xy - pts_xy[idx], axis=1)
-            neighbors = np.where((dists <= max_dist) & (~visited))[0]
+            vel_d = np.abs(points_vel - points_vel[idx])
+            neighbors = np.where((dists <= max_dist) & (vel_d <= vel_gate_mps) & (~visited))[0]
 
             for nb in neighbors:
                 visited[nb] = True
@@ -128,7 +153,7 @@ def cluster_radar_points(points_xyz, points_vel, max_dist=2.0, min_pts=3):
             min_xyz = np.min(c_pts, axis=0)
             max_xyz = np.max(c_pts, axis=0)
             center = (min_xyz + max_xyz) / 2.0
-            mean_vel = np.mean(c_vels)
+            mean_vel = _robust_mean_velocity(c_vels)
 
             clusters.append({
                 'center': center,
@@ -168,6 +193,85 @@ def project_points(K, R, t, points_3d):
         uvs[valid] = uv_homo[:2, :].T
 
     return uvs, valid
+
+# ==============================================================================
+# Speed Estimation Helpers
+# ==============================================================================
+
+def cluster_1d_by_gap(values: np.ndarray, max_gap: float):
+    '''
+    1D 클러스터링: 정렬 후 인접 값 차이가 max_gap 이하인 구간을 같은 클러스터로 묶음.
+    values: (N,) float
+    return: list of index arrays (original indices)
+    '''
+    if values is None:
+        return []
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return []
+    order = np.argsort(values)
+    clusters = []
+    start = 0
+    for i in range(1, order.size):
+        if (values[order[i]] - values[order[i-1]]) > max_gap:
+            clusters.append(order[start:i])
+            start = i
+    clusters.append(order[start:order.size])
+    return clusters
+
+def select_best_forward_cluster(forward_vals: np.ndarray, dopplers: np.ndarray, max_gap_m: float = 2.0):
+    '''
+    bbox 내부 포인트 중 forward축(기본 y)으로 1D clustering 후, '가장 그럴듯한 차량' 클러스터 선택.
+    - 우선순위: 포인트 개수 많은 클러스터
+    - 동률이면: forward 중앙값이 더 작은(더 가까운) 클러스터
+    return: selected doppler array (m/s)
+    '''
+    if forward_vals is None or dopplers is None:
+        return np.asarray([], dtype=np.float64)
+    forward_vals = np.asarray(forward_vals, dtype=np.float64)
+    dopplers = np.asarray(dopplers, dtype=np.float64)
+    if forward_vals.size == 0:
+        return np.asarray([], dtype=np.float64)
+
+    clusters = cluster_1d_by_gap(forward_vals, max_gap=max_gap_m)
+    if not clusters:
+        return np.asarray([], dtype=np.float64)
+
+    best = None
+    best_score = None
+    for c in clusters:
+        c = np.asarray(c, dtype=int)
+        if c.size == 0:
+            continue
+        cnt = int(c.size)
+        med_f = float(np.median(forward_vals[c]))
+        score = (cnt, -med_f)
+        if best is None or score > best_score:
+            best = c
+            best_score = score
+
+    if best is None:
+        return np.asarray([], dtype=np.float64)
+    return dopplers[best]
+
+class ScalarKalman:
+    '''속도(스칼라)만 필터링하는 간단한 칼만 필터.'''
+    def __init__(self, x0=0.0, P0=25.0, Q=2.0, R=9.0):
+        self.x = float(x0)
+        self.P = float(P0)
+        self.Q = float(Q)
+        self.R = float(R)
+
+    def predict(self):
+        self.P = self.P + self.Q
+        return self.x
+
+    def update(self, z: float):
+        z = float(z)
+        K = self.P / (self.P + self.R)
+        self.x = self.x + K * (z - self.x)
+        self.P = (1.0 - K) * self.P
+        return self.x
 
 
 # ==============================================================================
@@ -430,6 +534,12 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.chk_hide_static = QtWidgets.QCheckBox(f"Hide Static (|v| < {NOISE_MIN_SPEED_KMH:.1f} km/h)")
         self.chk_hide_static.setChecked(False)
 
+        # speed threshold (km/h) for hiding static/slow points/clusters
+        self.min_speed_kmh = float(NOISE_MIN_SPEED_KMH)
+        self.s_min_kmh = QtWidgets.QDoubleSpinBox(); self.s_min_kmh.setRange(0.0, 200.0)
+        self.s_min_kmh.setValue(self.min_speed_kmh); self.s_min_kmh.setSingleStep(0.5)
+        self.s_min_kmh.valueChanged.connect(self._on_min_speed_changed)
+
         self.chk_axis.toggled.connect(self.update_view)
         self.chk_grid.toggled.connect(self.update_view)
         self.chk_bbox.toggled.connect(self.update_view)
@@ -438,7 +548,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.chk_hide_static.toggled.connect(self.update_view)
         f_vis.addRow(self.chk_axis, self.chk_grid)
         f_vis.addRow(self.chk_bbox, self.chk_raw)
-        f_vis.addRow(self.chk_hide_static)
+        f_vis.addRow(self.chk_hide_static, self.s_min_kmh)
         gb_vis.setLayout(f_vis); vbox.addWidget(gb_vis)
 
         # (B) Control Values
@@ -455,6 +565,29 @@ class ManualCalibWindow(QtWidgets.QDialog):
         f_step.addRow("Move Step(m):", self.s_trans)
         f_step.addRow("Zoom:", self.s_zoom)
         gb_step.setLayout(f_step); vbox.addWidget(gb_step)
+
+        # (B2) Radar Clustering Params (for stable boxes)
+        gb_clu = QtWidgets.QGroupBox("2.5 Radar Clustering")
+        f_clu = QtWidgets.QFormLayout()
+        self.s_clu_dist = QtWidgets.QDoubleSpinBox(); self.s_clu_dist.setRange(0.3, 10.0); self.s_clu_dist.setValue(CLUSTER_MAX_DIST); self.s_clu_dist.setSingleStep(0.1)
+        self.s_clu_minpts = QtWidgets.QSpinBox(); self.s_clu_minpts.setRange(1, 50); self.s_clu_minpts.setValue(CLUSTER_MIN_PTS)
+        self.s_clu_velgate = QtWidgets.QDoubleSpinBox(); self.s_clu_velgate.setRange(0.0, 50.0); self.s_clu_velgate.setValue(CLUSTER_VEL_GATE_MPS); self.s_clu_velgate.setSingleStep(0.2)
+        self.s_bbox_area = QtWidgets.QSpinBox(); self.s_bbox_area.setRange(0, 20000); self.s_bbox_area.setValue(BBOX2D_MIN_AREA_PX2); self.s_bbox_area.setSingleStep(50)
+        self.s_bbox_margin = QtWidgets.QSpinBox(); self.s_bbox_margin.setRange(0, 50); self.s_bbox_margin.setValue(BBOX2D_MARGIN_PX); self.s_bbox_margin.setSingleStep(1)
+
+        for w in [self.s_clu_dist, self.s_clu_minpts, self.s_clu_velgate, self.s_bbox_area, self.s_bbox_margin]:
+            try:
+                w.valueChanged.connect(self.update_view)
+            except Exception:
+                pass
+
+        f_clu.addRow("max_dist (m):", self.s_clu_dist)
+        f_clu.addRow("min_pts:", self.s_clu_minpts)
+        f_clu.addRow("vel_gate (m/s):", self.s_clu_velgate)
+        f_clu.addRow("bbox min area (px^2):", self.s_bbox_area)
+        f_clu.addRow("bbox margin (px):", self.s_bbox_margin)
+        gb_clu.setLayout(f_clu); vbox.addWidget(gb_clu)
+
 
         # (C) Status Display
         gb_stat = QtWidgets.QGroupBox("3. State")
@@ -587,6 +720,15 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.T_current[:3, 3] = self.T_current[:3, 3] + dt
         self.acc_trans[axis] += (sign * step)
 
+    def _on_min_speed_changed(self, v):
+        self.min_speed_kmh = float(v)
+        # update checkbox label to reflect threshold
+        try:
+            self.chk_hide_static.setText(f"Hide Static (|v| < {self.min_speed_kmh:.1f} km/h)")
+        except Exception:
+            pass
+        self.update_view()
+
     def _update_stat_ui(self):
         vals = [
             f"{self.acc_rot[0]:+.2f}°", f"{self.acc_rot[1]:+.2f}°", f"{self.acc_rot[2]:+.2f}°",
@@ -639,12 +781,18 @@ class ManualCalibWindow(QtWidgets.QDialog):
             
             # --- CLUSTERING (Raw Radar Frame) ---
             # Clustering in raw frame is safer as it's physically grounded
-            clusters = cluster_radar_points(pts_r, dopplers, CLUSTER_MAX_DIST, CLUSTER_MIN_PTS)
+            clusters = cluster_radar_points(
+                pts_r,
+                dopplers,
+                max_dist=float(getattr(self, 's_clu_dist', None).value() if hasattr(self,'s_clu_dist') else CLUSTER_MAX_DIST),
+                min_pts=int(getattr(self, 's_clu_minpts', None).value() if hasattr(self,'s_clu_minpts') else CLUSTER_MIN_PTS),
+                vel_gate_mps=float(getattr(self, 's_clu_velgate', None).value() if hasattr(self,'s_clu_velgate') else CLUSTER_VEL_GATE_MPS),
+            )
             
             # Draw BBox
             if self.chk_bbox.isChecked():
                 for c in clusters:
-                    self._draw_bbox_3d(disp, c, K, cx_opt, cy_opt)
+                    self._draw_bbox_2d(disp, c, pts_r, dopplers, K, cx_opt, cy_opt)
 
             # Draw Raw Points
             if self.chk_raw.isChecked():
@@ -683,6 +831,8 @@ class ManualCalibWindow(QtWidgets.QDialog):
             
             # Color by Doppler
             vel = dops[i] # m/s
+            if self.chk_hide_static.isChecked() and abs(vel) * 3.6 < float(getattr(self,'min_speed_kmh', NOISE_MIN_SPEED_KMH)):
+                continue
             if abs(vel) < 0.2: color = (180, 180, 180) # Static/Noise
             elif vel < SPEED_THRESHOLD_RED: color = (0, 0, 255) # Approach
             elif vel > SPEED_THRESHOLD_BLUE: color = (255, 0, 0) # Recede
@@ -690,6 +840,76 @@ class ManualCalibWindow(QtWidgets.QDialog):
             
             if 0<=u<w and 0<=v<h:
                 cv2.circle(img, (int(u), int(v)), 2, color, -1)
+
+
+    def _draw_bbox_2d(self, img, cluster, pts_r_all, dopplers_all, K, cx, cy):
+        """클러스터 포인트를 이미지로 투영해서 2D bbox를 만든 뒤 그린다 (매칭 친화)."""
+        if pts_r_all is None or K is None:
+            return
+
+        idx = cluster.get('indices', None)
+        if idx is None or len(idx) == 0:
+            return
+
+        # Speed filter (노이즈 제거): |v| < threshold_kmh 은 표시하지 않음
+        vel = float(cluster.get('vel', 0.0))
+        if self.chk_hide_static.isChecked():
+            if abs(vel) * 3.6 < float(getattr(self, 'min_speed_kmh', NOISE_MIN_SPEED_KMH)):
+                return
+
+        # Slow-green box 제거 목적: 접근/이탈만 보여주기
+        if (vel >= SPEED_THRESHOLD_RED) and (vel <= SPEED_THRESHOLD_BLUE):
+            # (이 구간은 5km/h 필터를 쓰면 대부분 걸러지지만, 안전하게 한 번 더)
+            return
+
+        pts_r = pts_r_all[np.array(idx, dtype=np.int64)]
+        # Radar->Camera
+        pts_h = np.hstack((pts_r, np.ones((pts_r.shape[0], 1), dtype=np.float64)))
+        pts_c = (self.T_current @ pts_h.T).T  # (M,4)
+
+        valid = pts_c[:, 2] > 0.5
+        if not np.any(valid):
+            return
+        pts_c = pts_c[valid, :3]
+
+        uv = (K @ pts_c.T)
+        uv /= uv[2, :]
+        u = (uv[0, :] - cx) * self.radar_zoom + cx
+        v = (uv[1, :] - cy) * self.radar_zoom + cy
+
+        h, w = img.shape[:2]
+        in_img = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        if np.count_nonzero(in_img) < 2:
+            return
+        u = u[in_img]
+        v = v[in_img]
+
+        umin, umax = float(np.min(u)), float(np.max(u))
+        vmin, vmax = float(np.min(v)), float(np.max(v))
+
+        margin = int(getattr(self, 's_bbox_margin', None).value() if hasattr(self, 's_bbox_margin') else BBOX2D_MARGIN_PX)
+        umin -= margin; umax += margin
+        vmin -= margin; vmax += margin
+
+        # Clamp
+        umin = max(0, min(w-1, int(round(umin))))
+        umax = max(0, min(w-1, int(round(umax))))
+        vmin = max(0, min(h-1, int(round(vmin))))
+        vmax = max(0, min(h-1, int(round(vmax))))
+
+        if umax <= umin or vmax <= vmin:
+            return
+
+        area = (umax - umin) * (vmax - vmin)
+        min_area = int(getattr(self, 's_bbox_area', None).value() if hasattr(self, 's_bbox_area') else BBOX2D_MIN_AREA_PX2)
+        if area < min_area:
+            return
+
+        # Color: 접근(vel<0) 빨강, 이탈(vel>0) 파랑
+        color = (0, 0, 255) if vel < 0 else (255, 0, 0)
+
+        cv2.rectangle(img, (umin, vmin), (umax, vmax), color, BBOX_LINE_THICKNESS)
+        cv2.putText(img, f"{abs(vel*3.6):.0f} km/h", (umin, max(0, vmin-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     def _draw_bbox_3d(self, img, cluster, K, cx, cy):
         # Cluster info is in Radar Frame. Need to transform min/max to Camera Frame
@@ -727,7 +947,8 @@ class ManualCalibWindow(QtWidgets.QDialog):
             
         # Determine Color
         vel = cluster['vel']
-        if self.chk_hide_static.isChecked() and abs(vel * 3.6) < NOISE_MIN_SPEED_KMH: return  # Hide static clusters (optional)
+        thr_kmh = float(getattr(self, 'min_speed_kmh', NOISE_MIN_SPEED_KMH))
+        if self.chk_hide_static.isChecked() and abs(vel * 3.6) < thr_kmh: return  # Hide static clusters (optional)
         
         color = (0, 0, 255) if vel < SPEED_THRESHOLD_RED else (255, 0, 0) # Red/Blue
         if SPEED_THRESHOLD_RED <= vel <= SPEED_THRESHOLD_BLUE: color = (0, 255, 0)
@@ -891,6 +1112,11 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.extrinsic_mtime = None
         self.extrinsic_last_loaded = None
 
+        # ---------------- Speed estimation memory / smoothing ----------------
+        # track_id -> {'vel_kmh': float, 'ts': float, 'ema': float, 'kf': ScalarKalman}
+        self.vel_memory = {}
+        self.vel_hold_sec_default = 10.0  # 포인트 잠깐 누락 시 속도 유지 시간(초)
+
         # Buffer for the latest synchronized frame
         self.latest_frame = None
 
@@ -1002,6 +1228,68 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v_vis.addWidget(btn_reset_id)
         gb_vis.setLayout(v_vis)
         vbox.addWidget(gb_vis)
+
+        # ---------------- Speed Filters / Smoothing (Main GUI) ----------------
+        gb_speed = QtWidgets.QGroupBox("4. Speed Estimation")
+        v_s = QtWidgets.QVBoxLayout()
+
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(QtWidgets.QLabel("Smoothing:"))
+        self.cmb_smoothing = QtWidgets.QComboBox()
+        self.cmb_smoothing.addItems(["None", "EMA", "Kalman"])
+        self.cmb_smoothing.setCurrentText("EMA")
+        row1.addWidget(self.cmb_smoothing, stretch=1)
+        v_s.addLayout(row1)
+
+        row2 = QtWidgets.QHBoxLayout()
+        row2.addWidget(QtWidgets.QLabel("EMA α:"))
+        self.spin_ema_alpha = QtWidgets.QDoubleSpinBox()
+        self.spin_ema_alpha.setDecimals(2)
+        self.spin_ema_alpha.setRange(0.05, 0.95)
+        self.spin_ema_alpha.setSingleStep(0.05)
+        self.spin_ema_alpha.setValue(0.35)
+        row2.addWidget(self.spin_ema_alpha, stretch=1)
+        v_s.addLayout(row2)
+
+        row3 = QtWidgets.QHBoxLayout()
+        row3.addWidget(QtWidgets.QLabel("Hold (s):"))
+        self.spin_hold_sec = QtWidgets.QDoubleSpinBox()
+        self.spin_hold_sec.setDecimals(1)
+        self.spin_hold_sec.setRange(0.0, 30.0)
+        self.spin_hold_sec.setSingleStep(0.5)
+        self.spin_hold_sec.setValue(10.0)
+        row3.addWidget(self.spin_hold_sec, stretch=1)
+        v_s.addLayout(row3)
+
+        gb_speed.setLayout(v_s)
+        vbox.addWidget(gb_speed)
+
+        gb_radar_f = QtWidgets.QGroupBox("5. Radar Speed Filters")
+        v_rf = QtWidgets.QVBoxLayout()
+        self.chk_show_approach = QtWidgets.QCheckBox("Approaching (+)")
+        self.chk_show_approach.setChecked(True)
+        self.chk_show_recede = QtWidgets.QCheckBox("Receding (-)")
+        self.chk_show_recede.setChecked(True)
+
+        self.chk_filter_low_speed = QtWidgets.QCheckBox("Low-Speed Noise Filter")
+        self.chk_filter_low_speed.setChecked(True)
+
+        row_thr = QtWidgets.QHBoxLayout()
+        row_thr.addWidget(QtWidgets.QLabel("Min Speed (km/h):"))
+        self.spin_min_speed_kmh = QtWidgets.QDoubleSpinBox()
+        self.spin_min_speed_kmh.setDecimals(1)
+        self.spin_min_speed_kmh.setRange(0.0, 80.0)
+        self.spin_min_speed_kmh.setSingleStep(0.5)
+        self.spin_min_speed_kmh.setValue(NOISE_MIN_SPEED_KMH)
+        row_thr.addWidget(self.spin_min_speed_kmh, stretch=1)
+
+        v_rf.addWidget(self.chk_show_approach)
+        v_rf.addWidget(self.chk_show_recede)
+        v_rf.addWidget(self.chk_filter_low_speed)
+        v_rf.addLayout(row_thr)
+
+        gb_radar_f.setLayout(v_rf)
+        vbox.addWidget(gb_radar_f)
 
         vbox.addStretch()
         self.lbl_log = QtWidgets.QLabel("System Ready")
@@ -1143,26 +1431,41 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 active_lane_polys[name] = poly
         has_lane_filter = bool(active_lane_polys)
 
-        front_lanes = {"IN1", "IN2", "IN3"}
-        front_by_lane = {}
-        if has_lane_filter:
-            for obj in self.vis_objects:
-                g_id = obj['id']
-                x1, y1, x2, y2 = obj['bbox']
-                cx, cy = (x1 + x2) // 2, y2
+        # ---------------- Velocity estimation from radar points inside bbox ----------------
+        # 1) Project radar points once (Radar->Cam->Image)
+        proj_uvs = None
+        proj_valid = None
+        proj_dopplers = None
+        if radar_points is not None and self.cam_K is not None and radar_doppler is not None:
+            uvs, valid = project_points(self.cam_K, self.Extr_R, self.Extr_t, radar_points)
+            proj_uvs = uvs
+            proj_valid = valid
+            proj_dopplers = radar_doppler
 
-                target_lane = None
-                for name, poly in active_lane_polys.items():
-                    if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
-                        target_lane = name
-                        break
+        # Helper: apply GUI radar speed filters (sign + low-speed)
+        def _pass_speed_filters(dop_mps: float) -> bool:
+            # sign filter
+            if dop_mps >= 0 and hasattr(self, "chk_show_approach") and (not self.chk_show_approach.isChecked()):
+                return False
+            if dop_mps < 0 and hasattr(self, "chk_show_recede") and (not self.chk_show_recede.isChecked()):
+                return False
+            # low-speed filter
+            if hasattr(self, "chk_filter_low_speed") and self.chk_filter_low_speed.isChecked():
+                thr = float(self.spin_min_speed_kmh.value()) if hasattr(self, "spin_min_speed_kmh") else NOISE_MIN_SPEED_KMH
+                if abs(dop_mps * 3.6) < thr:
+                    return False
+            return True
 
-                if target_lane and target_lane in front_lanes:
-                    current = front_by_lane.get(target_lane)
-                    if current is None or y2 > current["y2"]:
-                        front_by_lane[target_lane] = {"id": g_id, "y2": y2}
-
-        front_ids = {v["id"] for v in front_by_lane.values()}
+        # 2) Prepare objects to draw (lane filter applied), and compute local id labels
+        draw_items = []
+        active_lane_polys = {}
+        for name, chk in self.chk_lanes.items():
+            if not chk.isChecked():
+                continue
+            poly = self.lane_polys.get(name)
+            if poly is not None and len(poly) > 2:
+                active_lane_polys[name] = poly
+        has_lane_filter = bool(active_lane_polys)
 
         for obj in self.vis_objects:
             g_id = obj['id']
@@ -1175,7 +1478,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
                         target_lane = name
                         break
-
                 if target_lane is None:
                     continue
 
@@ -1184,16 +1486,117 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     self.lane_counters[target_lane] += 1
                     self.global_to_local_ids[g_id] = self.lane_counters[target_lane]
                 local_id = self.global_to_local_ids[g_id]
-
                 label_prefix = f"No: {local_id} ({target_lane})"
             else:
                 label_prefix = f"ID: {g_id}"
 
+            draw_items.append({
+                "obj": obj,
+                "id": g_id,
+                "bbox": (x1, y1, x2, y2),
+                "label": label_prefix,
+                "y2": y2
+            })
+
+        # 3) Handle overlapping bboxes: assign each radar point to the nearest(front-most) bbox only
+        # Front-most in image ≈ larger y2 (lower in image)
+        used_point_mask = None
+        if proj_uvs is not None:
+            used_point_mask = np.zeros(proj_uvs.shape[0], dtype=bool)
+
+        # Sort bboxes front-to-back
+        draw_items.sort(key=lambda d: d["y2"], reverse=True)
+
+        now_ts = time.time()
+        hold_sec = float(self.spin_hold_sec.value()) if hasattr(self, "spin_hold_sec") else self.vel_hold_sec_default
+        smoothing = self.cmb_smoothing.currentText() if hasattr(self, "cmb_smoothing") else "None"
+        ema_alpha = float(self.spin_ema_alpha.value()) if hasattr(self, "spin_ema_alpha") else 0.35
+
+        for item in draw_items:
+            g_id = item["id"]
+            x1, y1, x2, y2 = item["bbox"]
+
+            meas_kmh = None
+
+            # If tracker doesn't provide speed yet, estimate from radar points within bbox
+            if proj_uvs is not None and proj_dopplers is not None:
+                inside = (
+                    proj_valid &
+                    (proj_uvs[:, 0] >= x1) & (proj_uvs[:, 0] <= x2) &
+                    (proj_uvs[:, 1] >= y1) & (proj_uvs[:, 1] <= y2)
+                )
+                if used_point_mask is not None:
+                    inside = inside & (~used_point_mask)
+
+                idxs = np.where(inside)[0]
+                if idxs.size > 0:
+                    dops = np.asarray([proj_dopplers[i] for i in idxs], dtype=np.float64)
+                    keep = np.array([_pass_speed_filters(d) for d in dops], dtype=bool)
+                    idxs = idxs[keep]
+                    dops = dops[keep]
+
+                    if idxs.size > 0:
+                        fwd = radar_points[idxs, 1]  # y: forward axis
+                        sel_dops = select_best_forward_cluster(fwd, dops, max_gap_m=2.0)
+                        if sel_dops.size > 0:
+                            dop_med = float(np.median(sel_dops))
+                            meas_kmh = abs(dop_med * 3.6)
+
+                    # Mark used points for overlap handling (reserve points to front bbox)
+                    if used_point_mask is not None and idxs.size > 0:
+                        used_point_mask[idxs] = True
+
+            # If perception pipeline already provides vel, prefer it when finite
+            obj_ref = item["obj"]
+            if np.isfinite(obj_ref.get("vel", float("nan"))):
+                meas_kmh = abs(float(obj_ref["vel"]))
+
+            # 4) Hold + smoothing per track
+            mem = self.vel_memory.get(g_id, {})
+            last_ts = float(mem.get("ts", -1.0))
+            last_vel = mem.get("vel_kmh", None)
+
+            vel_out = None
+            if meas_kmh is not None and np.isfinite(meas_kmh):
+                if smoothing == "EMA":
+                    prev = float(mem.get("ema", meas_kmh))
+                    vel_f = (ema_alpha * meas_kmh) + ((1.0 - ema_alpha) * prev)
+                    mem["ema"] = vel_f
+                    vel_out = vel_f
+                elif smoothing == "Kalman":
+                    kf = mem.get("kf", None)
+                    if kf is None:
+                        kf = ScalarKalman(x0=meas_kmh, P0=25.0, Q=2.0, R=9.0)
+                    kf.predict()
+                    vel_out = kf.update(meas_kmh)
+                    mem["kf"] = kf
+                else:
+                    vel_out = float(meas_kmh)
+
+                mem["vel_kmh"] = float(vel_out)
+                mem["ts"] = now_ts
+                self.vel_memory[g_id] = mem
+            else:
+                if last_vel is not None and np.isfinite(last_vel):
+                    if hold_sec <= 0.0 or (now_ts - last_ts) <= hold_sec:
+                        vel_out = float(last_vel)
+
+            if vel_out is not None and np.isfinite(vel_out):
+                vel_out = float(np.round(abs(vel_out), 2))
+                obj_ref["vel"] = vel_out
+            else:
+                obj_ref["vel"] = float("nan")
+
+        # 5) Draw bboxes + labels
+        for item in draw_items:
+            obj = item["obj"]
+            x1, y1, x2, y2 = item["bbox"]
+            label_prefix = item["label"]
+
             cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), BBOX_LINE_THICKNESS)
-            vel = obj['vel']
-            if target_lane in front_lanes and g_id not in front_ids:
-                vel = float("nan")
-            v_str = f"{int(vel)}km/h" if np.isfinite(vel) else "--km/h"
+
+            vel = obj.get("vel", float("nan"))
+            v_str = f"{vel:.2f}km/h" if np.isfinite(vel) else "--km/h"
             line1 = label_prefix
             line2 = f"Vel: {v_str}"
 
@@ -1206,6 +1609,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             cv2.rectangle(disp, (x1, bg_top), (x1 + max_w + 10, y1), (0, 0, 0), -1)
             cv2.putText(disp, line1, (x1 + 5, y1 - h2 - 10), font, scale, (255, 255, 255), thick)
             cv2.putText(disp, line2, (x1 + 5, y1 - 5), font, scale, (255, 255, 255), thick)
+
 
         # 2. Radar Overlay
         projected_count = 0
@@ -1230,7 +1634,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     if 0 <= u < w and 0 <= v < h:
                         if has_doppler:
                             speed_kmh = dopplers[i] * 3.6
-                            if abs(speed_kmh) < NOISE_MIN_SPEED_KMH:
+                            # Main GUI Radar Speed Filters
+                            if hasattr(self, 'chk_filter_low_speed') and self.chk_filter_low_speed.isChecked():
+                                thr_kmh = float(self.spin_min_speed_kmh.value())
+                                if abs(speed_kmh) < thr_kmh:
+                                    continue
+                            if speed_kmh >= 0 and hasattr(self, 'chk_show_approach') and (not self.chk_show_approach.isChecked()):
+                                continue
+                            if speed_kmh < 0 and hasattr(self, 'chk_show_recede') and (not self.chk_show_recede.isChecked()):
                                 continue
 
                             if abs(speed_kmh) <= 0.5:
@@ -1250,7 +1661,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         speed_values = [obj["vel"] for obj in self.vis_objects if np.isfinite(obj["vel"])]
         speed_text = "--"
         if speed_values:
-            speed_text = f"{np.median(speed_values):.1f}km/h"
+            speed_text = f"{np.median(speed_values):.2f}km/h"
 
         extrinsic_text = "Extrinsic: --"
         if self.extrinsic_last_loaded is not None:
