@@ -27,6 +27,7 @@ from collections import deque
 # ==============================================================================
 
 REFRESH_RATE_MS = 33           # 30 FPS
+MAX_REASONABLE_KMH = 100.0   # 육교 고정형 기준 상한
 
 # Radar Coloring & Filtering
 SPEED_THRESHOLD_RED = -0.5     # m/s (이보다 작으면 접근/빨강)
@@ -1116,6 +1117,15 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         # track_id -> {'vel_kmh': float, 'ts': float, 'ema': float, 'kf': ScalarKalman}
         self.vel_memory = {}
         self.vel_hold_sec_default = 10.0  # 포인트 잠깐 누락 시 속도 유지 시간(초)
+        self.radar_frame_count = 0
+        self.radar_warmup_frames = 8        # rosbag 시작 튐 방지용 (권장 5~10)
+        self.max_jump_kmh = 25.0            # 1프레임 점프 제한 (권장 20~30)
+        self.use_nearest_k_points = True    # bbox 중심 근접 K점 방식
+        self.nearest_k = 3                  # 기본 3점
+        self.speed_update_period = 2   # N 프레임마다 한 번만 계산
+        self._speed_frame_counter = 0
+        self.speed_hard_max_kmh = 280.0   # 레이더 스펙 상한 (절대 상한)
+        self.speed_soft_max_kmh = 100.0   # 육교 환경 차량 상한
 
         # Buffer for the latest synchronized frame
         self.latest_frame = None
@@ -1354,6 +1364,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             "radar_doppler": radar_doppler,
         }
 
+        if radar_points is not None and radar_doppler is not None:
+            self.radar_frame_count += 1 
         # Always store the latest synchronized frame (pause functionality removed)
         self.latest_frame = frame
 
@@ -1405,6 +1417,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
     # ------------------ Update Loops ------------------
     def update_loop(self):
         self._maybe_reload_extrinsic()
+        self._speed_frame_counter += 1
+        do_speed_update = (self._speed_frame_counter % self.speed_update_period == 0)
         # Always use the latest frame. Pause/resume functionality removed.
         frame = self.latest_frame
 
@@ -1450,6 +1464,15 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             if dop_mps < 0 and hasattr(self, "chk_show_recede") and (not self.chk_show_recede.isChecked()):
                 return False
             # low-speed filter
+            if hasattr(self, "chk_filter_low_speed") and self.chk_filter_low_speed.isChecked():
+                thr = float(self.spin_min_speed_kmh.value()) if hasattr(self, "spin_min_speed_kmh") else NOISE_MIN_SPEED_KMH
+                if abs(dop_mps * 3.6) < thr:
+                    return False
+            return True
+        
+        def _pass_estimation_filters(dop_mps: float) -> bool:
+            # 속도 계산용은 토글(Approach/Recede)과 무관하게,
+            # low-speed 노이즈만 최소로 제거하는 게 안전함
             if hasattr(self, "chk_filter_low_speed") and self.chk_filter_low_speed.isChecked():
                 thr = float(self.spin_min_speed_kmh.value()) if hasattr(self, "spin_min_speed_kmh") else NOISE_MIN_SPEED_KMH
                 if abs(dop_mps * 3.6) < thr:
@@ -1518,44 +1541,107 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
             meas_kmh = None
 
-            # If tracker doesn't provide speed yet, estimate from radar points within bbox
-            if proj_uvs is not None and proj_dopplers is not None:
-                inside = (
-                    proj_valid &
-                    (proj_uvs[:, 0] >= x1) & (proj_uvs[:, 0] <= x2) &
-                    (proj_uvs[:, 1] >= y1) & (proj_uvs[:, 1] <= y2)
-                )
-                if used_point_mask is not None:
-                    inside = inside & (~used_point_mask)
-
-                idxs = np.where(inside)[0]
-                if idxs.size > 0:
-                    dops = np.asarray([proj_dopplers[i] for i in idxs], dtype=np.float64)
-                    keep = np.array([_pass_speed_filters(d) for d in dops], dtype=bool)
-                    idxs = idxs[keep]
-                    dops = dops[keep]
-
-                    if idxs.size > 0:
-                        fwd = radar_points[idxs, 1]  # y: forward axis
-                        sel_dops = select_best_forward_cluster(fwd, dops, max_gap_m=2.0)
-                        if sel_dops.size > 0:
-                            dop_med = float(np.median(sel_dops))
-                            meas_kmh = abs(dop_med * 3.6)
-
-                    # Mark used points for overlap handling (reserve points to front bbox)
-                    if used_point_mask is not None and idxs.size > 0:
-                        used_point_mask[idxs] = True
-
-            # If perception pipeline already provides vel, prefer it when finite
-            obj_ref = item["obj"]
-            if np.isfinite(obj_ref.get("vel", float("nan"))):
-                meas_kmh = abs(float(obj_ref["vel"]))
-
-            # 4) Hold + smoothing per track
+            # ✅ (A) 먼저 mem/last 읽기 (순서 버그 수정)
             mem = self.vel_memory.get(g_id, {})
             last_ts = float(mem.get("ts", -1.0))
             last_vel = mem.get("vel_kmh", None)
 
+            # ✅ (B) 무거운 레이더 기반 속도 계산은 주기적으로만 실행
+            if do_speed_update:
+                # If tracker doesn't provide speed yet, estimate from radar points within bbox
+                if proj_uvs is not None and proj_dopplers is not None:
+                    inside = (
+                        proj_valid &
+                        (proj_uvs[:, 0] >= x1) & (proj_uvs[:, 0] <= x2) &
+                        (proj_uvs[:, 1] >= y1) & (proj_uvs[:, 1] <= y2)
+                    )
+                    if used_point_mask is not None:
+                        inside = inside & (~used_point_mask)
+
+                    idxs = np.where(inside)[0]
+                    if idxs.size > 0:
+                        dops = proj_dopplers[idxs].astype(np.float64, copy=False)
+
+                        keep = np.array([_pass_estimation_filters(d) for d in dops], dtype=bool)
+                        idxs = idxs[keep]
+                        dops = dops[keep]
+
+                        if idxs.size > 0:
+                            if not hasattr(self, "radar_start_ts"):
+                                self.radar_start_ts = now_ts
+
+                            if (now_ts - self.radar_start_ts) < 0.5:
+                                meas_kmh = None
+                            else:
+                                if self.use_nearest_k_points:
+                                    cx_box = 0.5 * (x1 + x2)
+                                    cy_box = 0.5 * (y1 + y2)
+
+                                    du = proj_uvs[idxs, 0] - cx_box
+                                    dv = proj_uvs[idxs, 1] - cy_box
+                                    dist2 = du*du + dv*dv
+
+                                    k = min(int(self.nearest_k), idxs.size)
+                                    if dist2.size > k:
+                                        pick = np.argpartition(dist2, k)[:k]
+                                    else:
+                                        pick = np.arange(dist2.size)
+
+                                    dops_sel = dops[pick]
+                                    dop_med = float(np.median(dops_sel))
+                                    meas_kmh = abs(dop_med * 3.6)
+                                else:
+                                    fwd = radar_points[idxs, 1]
+                                    sel_dops = select_best_forward_cluster(fwd, dops, max_gap_m=2.0)
+                                    if sel_dops.size > 0:
+                                        dop_med = float(np.median(sel_dops))
+                                        meas_kmh = abs(dop_med * 3.6)
+                                    else:
+                                        meas_kmh = None
+
+                        # Mark used points for overlap handling
+                        if used_point_mask is not None and idxs.size > 0:
+                            used_point_mask[idxs] = True
+            else:
+                # ✅ 이번 프레임은 레이더 기반 재계산 안함 → hold로 흘려보냄
+                meas_kmh = None
+
+            # ✅ (C) perception pipeline 값이 있으면 언제나 우선 (가벼움 → 매프레임 OK)
+            obj_ref = item["obj"]
+            if np.isfinite(obj_ref.get("vel", float("nan"))):
+                meas_kmh = abs(float(obj_ref["vel"]))
+
+            # ✅ (D) 점프 게이트 (last_vel 정의된 이후에 해야 함)
+            if meas_kmh is not None and last_vel is not None and np.isfinite(last_vel):
+                if abs(meas_kmh - float(last_vel)) > float(self.max_jump_kmh):
+                    meas_kmh = None
+
+            if meas_kmh is not None and np.isfinite(meas_kmh):
+                if meas_kmh > MAX_REASONABLE_KMH:
+                    meas_kmh = None   # ❗ 저장 자체를 막음
+
+            # (D-2) last_vel 자체가 비정상(고정 문제)일 때는 메모리 리셋해서 hold가 못 살리게 함
+            if last_vel is not None and np.isfinite(last_vel):
+                if float(last_vel) > float(self.speed_soft_max_kmh):
+                    # 127 같은 값이 한 번 들어가면 이후 측정이 막힐 때 hold로 고정되므로,
+                    # soft max 이상이면 메모리 폐기
+                    mem.pop("vel_kmh", None)
+                    mem.pop("ema", None)
+                    mem.pop("kf", None)
+                    mem["ts"] = -1.0
+                    last_vel = None
+                    last_ts = -1.0
+                    self.vel_memory[g_id] = mem
+
+            # (D-3) 이번 측정값 자체도 절대 상한/현실 상한으로 컷
+            if meas_kmh is not None and np.isfinite(meas_kmh):
+                if float(meas_kmh) > float(self.speed_hard_max_kmh):
+                    meas_kmh = None
+                elif float(meas_kmh) > float(self.speed_soft_max_kmh):
+                    # soft max는 "버림" 또는 "클램프" 중 선택 가능
+                    meas_kmh = None
+
+            # ✅ (E) Hold + smoothing (매프레임 OK)
             vel_out = None
             if meas_kmh is not None and np.isfinite(meas_kmh):
                 if smoothing == "EMA":
@@ -1586,6 +1672,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 obj_ref["vel"] = vel_out
             else:
                 obj_ref["vel"] = float("nan")
+
 
         # 5) Draw bboxes + labels
         for item in draw_items:

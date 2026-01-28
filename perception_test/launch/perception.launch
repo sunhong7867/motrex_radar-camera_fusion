@@ -58,7 +58,7 @@
     <param name="save_images/path" value="$(find perception_test)/calibration_images"/>
   </node>
 
-  <node pkg="perception_test" type="calibration_ex_node.py" name="radar_cam_extrinsic" output="screen">
+  <!-- <node pkg="perception_test" type="calibration_ex_node.py" name="radar_cam_extrinsic" output="screen">
     <param name="detections_topic" value="/perception_test/detections"/>
     <param name="radar_topic" value="/point_cloud"/>
     <param name="camera_info_topic" value="/camera/camera_info"/>
@@ -69,5 +69,5 @@
     <param name="min_power" value="0.0"/>
     <param name="sync_queue_size" value="10"/>
     <param name="sync_slop" value="0.1"/>
-  </node>
+  </node> -->
 </launch>

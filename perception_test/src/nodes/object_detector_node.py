@@ -48,8 +48,8 @@ class ObjectDetectorNode:
         raw_weights = rospy.get_param("~detector/weights", "$(find perception_test)/models/yolo11m.pt")
         self.weights_path = self.resolve_ros_path(raw_weights)
 
-        self.conf_thres = float(rospy.get_param("~detector/conf_thres", 0.25))
-        self.iou_thres = float(rospy.get_param("~detector/iou_thres", 0.45))
+        self.conf_thres = float(rospy.get_param("~detector/conf_thres", 0.6))
+        self.iou_thres = float(rospy.get_param("~detector/iou_thres", 0.5))
         self.classes = rospy.get_param("~detector/classes", [2, 3, 5, 7]) # Car, Motorcycle, Bus, Truck
         self.device = rospy.get_param("~detector/device", "cuda:0")
         self.img_size = int(rospy.get_param("~detector/img_size", 640))
