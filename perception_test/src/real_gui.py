@@ -1301,6 +1301,23 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_radar_f.setLayout(v_rf)
         vbox.addWidget(gb_radar_f)
 
+        gb_brightness = QtWidgets.QGroupBox("6. Image Brightness")
+        v_b = QtWidgets.QVBoxLayout()
+        self.chk_brightness = QtWidgets.QCheckBox("Enable Brightness Gain")
+        self.chk_brightness.setChecked(False)
+        row_b = QtWidgets.QHBoxLayout()
+        row_b.addWidget(QtWidgets.QLabel("Gain (x):"))
+        self.spin_brightness_gain = QtWidgets.QDoubleSpinBox()
+        self.spin_brightness_gain.setDecimals(2)
+        self.spin_brightness_gain.setRange(0.3, 2.5)
+        self.spin_brightness_gain.setSingleStep(0.05)
+        self.spin_brightness_gain.setValue(1.0)
+        row_b.addWidget(self.spin_brightness_gain, stretch=1)
+        v_b.addWidget(self.chk_brightness)
+        v_b.addLayout(row_b)
+        gb_brightness.setLayout(v_b)
+        vbox.addWidget(gb_brightness)
+
         vbox.addStretch()
         self.lbl_log = QtWidgets.QLabel("System Ready")
         vbox.addWidget(self.lbl_log)
@@ -1431,6 +1448,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.radar_doppler = frame["radar_doppler"]
 
         disp = frame["cv_image"].copy()
+        if hasattr(self, "chk_brightness") and self.chk_brightness.isChecked():
+            gain = float(self.spin_brightness_gain.value()) if hasattr(self, "spin_brightness_gain") else 1.0
+            if abs(gain - 1.0) > 1e-3:
+                disp = cv2.convertScaleAbs(disp, alpha=gain, beta=0)
         radar_points = frame["radar_points"]
         radar_power = frame["radar_power"]
         radar_doppler = frame["radar_doppler"]
