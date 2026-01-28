@@ -22,14 +22,12 @@ frames:
   radar_frame: retina_link
   camera_frame: camera_optical_frame
 
-extrinsic_source:
-  # 캘리브레이션 수행 결과가 "자동으로 갱신"되는 파일
+extrinsic:
+  # [정책] extrinsic 파일 경로는 YAML에 박지 않습니다.
+  # - 모든 노드/GUI는 ROS 파라미터 ~extrinsic_path 를 '단일 소스 오브 트루스'로 사용합니다.
+  # - 예: roslaunch perception.launch extrinsic_path:=/abs/path/extrinsic.json
   format: json
-  # association_node에서 $(find perception_test) 치환해서 로드
-  path: "$(find perception_test)/src/nodes/extrinsic.json"
-  # extrinsic.json 포맷(고정):
-  # { "R": [[...],[...],[...]], "t": [tx,ty,tz] }  (t: meters)
-
+  json_schema: {R: 3x3, t: 3}  # X_cam = R*X_radar + t (meters)
 projection:
   # 왜곡계수를 투영에 반영할지 (CameraInfo에 D가 있고, 코드가 지원하면 true)
   use_distortion: false
@@ -37,8 +35,8 @@ projection:
   z_min_m: 0.10
 
 association:
-  # CARLA에서 하던 것처럼 최근 N프레임 레이더를 누적해서 사용할지
-  radar_history_frames: 5
+  # 최근 N프레임 레이더를 누적해서 사용할지
+  radar_history_frames: 2
   # bbox 내부 레이더 점 기반 속도/거리 산출 필터
   min_range_m: 20.0
   min_abs_doppler_mps: 0.10

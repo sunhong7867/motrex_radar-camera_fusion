@@ -1,56 +1,64 @@
-# camera_intrinsic.yaml
-# MV-GE231GC-M (GigE) 카메라 기본 스펙과 내부파라미터(K/D) 보관용 설정
-# - 해상도: 1920 x 1200
-# - 최대 FPS: 40.25
-# - 센서: 1/1.2" CMOS
-# - 셔터: Global shutter
-
 camera_spec:
   manufacturer: MindVision
   model: MV-GE231GC-M
   interface: GigE
-  sensor: '1/1.2" CMOS'
+  sensor: 1/1.2" CMOS
   shutter: global
   resolution:
     width: 1920
     height: 1200
   max_fps: 40.25
-
 stream:
-  # 실제 운용 시 목표 fps (드라이버/노출/대역폭에 따라 조정)
   target_fps: 30.0
   encoding: bgr8
-
 frames:
   camera_frame: camera_link
   camera_optical_frame: camera_optical_frame
-
 topics:
   image: /camera/image_raw
   camera_info: /camera/camera_info
-
 camera_info:
-  # 캘리브레이션 결과를 입력해야 정확한 투영이 가능
   distortion_model: plumb_bob
-
-  # D: [k1, k2, p1, p2, k3] (필요시 더 긴 모델도 가능)
-  D: [0.0, 0.0, 0.0, 0.0, 0.0]
-
-  # K (3x3): [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-  # 아래는 "플레이스홀더" (캘리브레이션 값으로 교체)
-  K: [1200.0, 0.0, 960.0,
-      0.0, 1200.0, 600.0,
-      0.0, 0.0, 1.0]
-
-  # (선택) Rectification/Projection (보정 후 사용할 경우)
-  R: [1.0, 0.0, 0.0,
-      0.0, 1.0, 0.0,
-      0.0, 0.0, 1.0]
-
-  # P (3x4): [fx, 0, cx, Tx, 0, fy, cy, Ty, 0, 0, 1, 0]
-  P: [1200.0, 0.0, 960.0, 0.0,
-      0.0, 1200.0, 600.0, 0.0,
-      0.0, 0.0, 1.0, 0.0]
-
+  D:
+  - -0.25396217493505846
+  - 2.2265072450981807
+  - 0.05911083101044734
+  - -0.00022021034540089686
+  - -8.076007250197167
+  K:
+  - 4106.488206547475
+  - 0.0
+  - 983.5401190689403
+  - 0.0
+  - 4292.0600475757055
+  - 1418.7449342953119
+  - 0.0
+  - 0.0
+  - 1.0
+  R:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  P:
+  - 4106.488206547475
+  - 0.0
+  - 983.5401190689403
+  - 0.0
+  - 0.0
+  - 4292.0600475757055
+  - 1418.7449342953119
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
 notes:
-  - "K/D는 체커보드 캘리브레이션 등으로 산출한 값으로 반드시 교체해야 함"
+- "JSON \uB370\uC774\uD130\uC5D0\uC11C \uCD94\uCD9C\uD55C \uCD5C\uC2E0 \uCE98\uB9AC\
+  \uBE0C\uB808\uC774\uC158 \uAC12\uC73C\uB85C \uC5C5\uB370\uC774\uD2B8\uB418\uC5C8\
+  \uC2B5\uB2C8\uB2E4."

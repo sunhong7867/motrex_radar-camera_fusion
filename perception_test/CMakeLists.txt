@@ -52,14 +52,16 @@ include_directories(${catkin_INCLUDE_DIRS})
 
 ## 파이썬 노드 설치
 catkin_install_python(PROGRAMS
+  src/nodes/calibration_in_node.py
+  src/nodes/calibration_ex_node.py
   src/nodes/association_node.py
-  src/nodes/object_detector_node.py
   src/nodes/lane_detector_node.py
+  src/nodes/object_detector_node.py
+  src/nodes/offline_provider.py
+  src/nodes/radar_cluster_bbox_viz.py
+  src/nodes/radar_metrics_node.py
   src/nodes/speed_estimator_node.py
   src/nodes/tracker_node.py
-  src/nodes/offline_provider.py
-  src/nodes/calibration_node.py
-  src/real_gui.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
