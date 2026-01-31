@@ -99,10 +99,15 @@ class ObjectDetectorNode:
         except CvBridgeError as e:
             return
 
-        if len(cv_img.shape) == 2: 
-            img_input = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
-        else:
-            img_input = cv_img
+        brightness_enable = rospy.get_param("~runtime/brightness_enable", False)
+        brightness_gain = float(rospy.get_param("~runtime/brightness_gain", 1.0))
+
+        img_input = cv_img
+        if brightness_enable and abs(brightness_gain - 1.0) > 1e-3:
+            img_input = cv2.convertScaleAbs(img_input, alpha=brightness_gain, beta=0)
+
+        if len(img_input.shape) == 2:
+            img_input = cv2.cvtColor(img_input, cv2.COLOR_GRAY2BGR)
 
         # YOLO 추론
         results = self.model.predict(
