@@ -1316,6 +1316,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         btn_intri = QtWidgets.QPushButton("Run Intrinsic")
         btn_intri.clicked.connect(self.run_intrinsic_calibration)
+        btn_autocal = QtWidgets.QPushButton("Run AutoCal (Extrinsic)")
+        btn_autocal.clicked.connect(self.run_autocalibration)
         btn_calib = QtWidgets.QPushButton("Run Extrinsic")
         btn_calib.clicked.connect(self.run_calibration)
         btn_reload = QtWidgets.QPushButton("Reload JSON")
@@ -1329,11 +1331,22 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.txt_intrinsic_log.setReadOnly(True)
         self.txt_intrinsic_log.setMaximumHeight(100)
 
+        self.pbar_extrinsic = QtWidgets.QProgressBar()
+        self.pbar_extrinsic.setRange(0, 0)
+        self.pbar_extrinsic.setVisible(False)
+
+        self.txt_extrinsic_log = QtWidgets.QPlainTextEdit()
+        self.txt_extrinsic_log.setReadOnly(True)
+        self.txt_extrinsic_log.setMaximumHeight(100)
+
         v_c.addWidget(btn_intri)
+        v_c.addWidget(btn_autocal)
         v_c.addWidget(btn_calib)
         v_c.addWidget(btn_reload)
         v_c.addWidget(self.pbar_intrinsic)
         v_c.addWidget(self.txt_intrinsic_log)
+        v_c.addWidget(self.pbar_extrinsic)
+        v_c.addWidget(self.txt_extrinsic_log)
 
         gb_calib.setLayout(v_c)
         vbox.addWidget(gb_calib)
@@ -1893,6 +1906,60 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         dlg = ManualCalibWindow(self)
         dlg.exec()
 
+    def run_autocalibration(self):
+        try:
+            if hasattr(self, "extrinsic_proc") and self.extrinsic_proc is not None:
+                if self.extrinsic_proc.state() != QtCore.QProcess.NotRunning:
+                    print("[Extrinsic] already running...")
+                    return
+
+            self.extrinsic_proc = QtCore.QProcess(self)
+            self.extrinsic_proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+
+            self.txt_extrinsic_log.clear()
+            self.txt_extrinsic_log.appendPlainText("[Extrinsic] START")
+            self.pbar_extrinsic.setVisible(True)
+            self.pbar_extrinsic.setRange(0, 0)
+
+            ws = os.path.expanduser("~/motrex/catkin_ws")
+            setup_bash = os.path.join(ws, "devel", "setup.bash")
+
+            cmd = "bash"
+            ros_cmd = (
+                f"source {setup_bash} && "
+                f"rosrun perception_test calibration_ex_node.py "
+                f"_extrinsic_path:={self.extrinsic_path}"
+            )
+            args = ["-lc", ros_cmd]
+            self.extrinsic_proc.readyReadStandardOutput.connect(self._on_extrinsic_stdout)
+            self.extrinsic_proc.readyReadStandardError.connect(self._on_extrinsic_stderr)
+            self.extrinsic_proc.finished.connect(self._on_extrinsic_finished)
+            self.extrinsic_proc.start(cmd, args)
+        except Exception as e:
+            print(f"[Extrinsic] start error: {e}")
+            traceback.print_exc()
+
+    def _on_extrinsic_stdout(self):
+        if not hasattr(self, "extrinsic_proc") or self.extrinsic_proc is None:
+            return
+        data = bytes(self.extrinsic_proc.readAllStandardOutput()).decode("utf-8", errors="ignore")
+        if not data:
+            return
+        self.txt_extrinsic_log.appendPlainText(data.rstrip())
+
+    def _on_extrinsic_stderr(self):
+        if not hasattr(self, "extrinsic_proc") or self.extrinsic_proc is None:
+            return
+        data = bytes(self.extrinsic_proc.readAllStandardError()).decode("utf-8", errors="ignore")
+        if not data:
+            return
+        self.txt_extrinsic_log.appendPlainText(data.rstrip())
+
+    def _on_extrinsic_finished(self):
+        if hasattr(self, "pbar_extrinsic") and self.pbar_extrinsic is not None:
+            self.pbar_extrinsic.setVisible(False)
+        self.txt_extrinsic_log.appendPlainText("\n[Extrinsic] DONE.")
+
     def run_intrinsic_calibration(self):
         try:
             rp = rospkg.RosPack()
@@ -1916,6 +1983,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     return
 
             self.txt_intrinsic_log.clear()
+            self.txt_intrinsic_log.appendPlainText("[Intrinsic] START")
             self.pbar_intrinsic.setVisible(True)
             self.pbar_intrinsic.setRange(0, 0)
 
@@ -1938,6 +2006,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
             args = ["-lc", ros_cmd]
             self.intrinsic_proc.readyReadStandardOutput.connect(self._on_intrinsic_stdout)
+            self.intrinsic_proc.readyReadStandardError.connect(self._on_intrinsic_stderr)
             self.intrinsic_proc.finished.connect(self._on_intrinsic_finished)
             self.intrinsic_proc.start(cmd, args)
 
@@ -1958,6 +2027,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             selected = text.count("Select image")
             self.pbar_intrinsic.setRange(0, 45)
             self.pbar_intrinsic.setValue(min(selected, 45))
+
+    def _on_intrinsic_stderr(self):
+        if not hasattr(self, "intrinsic_proc") or self.intrinsic_proc is None:
+            return
+        data = bytes(self.intrinsic_proc.readAllStandardError()).decode("utf-8", errors="ignore")
+        if not data:
+            return
+        self.txt_intrinsic_log.appendPlainText(data.rstrip())
 
     def _on_intrinsic_finished(self, exit_code, exit_status):
         try:
