@@ -161,6 +161,42 @@ class AssociationNode:
         self.use_power_weighted = bool(rospy.get_param("~association/use_power_weighted_speed", True))
         self.use_abs_speed = bool(rospy.get_param("~association/use_abs_speed", True))
 
+        # -------------------------------------------------
+        # Tracking-based speed (ground-plane) parameters
+        # - Doppler(LOS 성분)이 작아지거나 0으로 뭉개지는 상황(멀어짐/측면/저 SNR)에서
+        #   레이더 클러스터 중심의 (x,y) 이동량 / dt 로 속도를 추정하여 fallback 합니다.
+        # - 카메라 트래커가 부여한 det.id(=track id)를 key로 사용합니다.
+        # -------------------------------------------------
+        self.track_speed_enable = bool(rospy.get_param("~track_speed/enable", True))
+        # track-speed의 시간(dt) 계산에 사용할 타임스탬프.
+        # - 기본값은 레이더 stamp를 사용(False). (레이더 점의 실제 시간축과 일치)
+        # - 카메라 stamp를 사용하고 싶으면 True로 설정.
+        self.track_speed_use_camera_stamp = bool(rospy.get_param("~track_speed/use_camera_stamp", False))
+        # IMPORTANT:
+        # 레이더 history_frames를 스택으로 합치면(여러 프레임을 한 번에 사용) bbox 내부 레이더 점들이 시간적으로 섞여
+        # (x,y) 중심이 평균화됩니다. 그러면 프레임 간 중심 이동량이 작아져 track-speed가 0에 수렴할 수 있습니다.
+        # 특히 멀어지는 차량은 Doppler(LOS 성분)가 0 근처로 뭉개지는 경우가 많아 track-speed가 핵심인데,
+        # 스택 평균화로 track-speed가 무력화되는 문제가 실제로 발생합니다.
+        # 따라서 track-speed는 기본적으로 "가장 최신 레이더 프레임"만 사용하도록 옵션을 제공합니다.
+        self.track_speed_use_latest_radar_only = bool(
+            rospy.get_param("~track_speed/use_latest_radar_only", True)
+        )
+        # 카메라 30fps 환경에서도 계산 가능하도록 기본 min_dt를 0.02s로 설정
+        self.track_speed_min_dt = float(rospy.get_param("~track_speed/min_dt", 0.02))
+        self.track_speed_max_dt = float(rospy.get_param("~track_speed/max_dt", 0.80))
+        # 원거리 차량도 프레임간 이동량이 작게 보일 수 있어 기본 min_disp를 0.03m로 설정
+        self.track_speed_min_disp = float(rospy.get_param("~track_speed/min_disp_m", 0.03))
+        self.track_speed_max_mps = float(rospy.get_param("~track_speed/max_mps", 60.0))
+        self.track_speed_ema_alpha = float(rospy.get_param("~track_speed/ema_alpha", 0.40))
+        # tracker_node의 det.id가 ROI별로 1,2,3...으로 재시작되는 경우가 있어
+        # 같은 id가 화면 내 여러 영역에서 중복될 수 있습니다.
+        # 이를 완화하기 위해 bbox center x를 일정 픽셀 bucket으로 양자화하여 key에 포함합니다.
+        self.track_speed_key_bucket_px = float(rospy.get_param("~track_speed/key_bucket_px", 200.0))
+        # Doppler 기반 속도가 이 값보다 작으면(track_speed가 유효할 때) track_speed로 대체
+        self.track_speed_fallback_abs_doppler_lt = float(
+            rospy.get_param("~track_speed/fallback_when_abs_doppler_lt_mps", 1.0)
+        )
+
         # extrinsic
         extr_path = rospy.get_param("~extrinsic_source/path", "$(find perception_test)/config/extrinsic.json")
         self.extrinsic_path = resolve_ros_path(extr_path)
@@ -185,6 +221,12 @@ class AssociationNode:
 
         # radar history: deque of (header, points_array)
         self._rad_hist: deque = deque(maxlen=max(1, self.history_frames))
+
+        # tracking-speed internal states
+        # {track_key: (t_sec, cx, cy)}  where (cx,cy) are radar-frame cluster center (median)
+        self._track_last_xy = {}
+        # {track_key: ema_speed_mps}
+        self._track_speed_ema = {}
 
         # Publishers
         self.pub_assoc = rospy.Publisher(self.associated_topic, AssociationArray, queue_size=5)
@@ -293,6 +335,15 @@ class AssociationNode:
 
         return radar_header, np.vstack([a[:, :3] for a in arrays])
 
+    def _get_latest_radar_frame(self):
+        """최근 레이더 프레임(헤더, pts)을 반환. 없으면 (None, empty)."""
+        if len(self._rad_hist) == 0:
+            return None, np.zeros((0, 0), dtype=np.float64)
+        h, p = self._rad_hist[-1]
+        if p is None or p.size == 0:
+            return h, np.zeros((0, 0), dtype=np.float64)
+        return h, p
+
     def _on_detections(self, msg: DetectionArray):
         # 1. 캘리브레이션 갱신 확인
         self._maybe_reload_extrinsic()
@@ -303,6 +354,8 @@ class AssociationNode:
 
         # 3. 레이더 데이터 스택 가져오기
         radar_header, pts = self._build_radar_stack()
+        # track-speed는 기본적으로 최신 레이더 프레임만 쓰도록 별도 보관
+        latest_header, latest_pts = self._get_latest_radar_frame()
         if radar_header is None or pts.size == 0:
             self._publish_empty(msg, radar_header)
             return
@@ -352,6 +405,37 @@ class AssociationNode:
         marker_id = 0
         radar_frame = radar_header.frame_id if radar_header.frame_id else self.radar_frame_default
 
+        # Track-speed용: 최신 레이더 프레임만 따로 투영(옵션)
+        latest_uv = None
+        latest_pts_valid = None
+        latest_uu = latest_vv = None
+        latest_radar_header = latest_header if latest_header is not None else radar_header
+        if self.track_speed_enable and self.track_speed_use_latest_radar_only:
+            if latest_pts is not None and latest_pts.size > 0 and self._cam_K is not None:
+                # 최신 레이더 프레임도 동일한 range gate 적용
+                lpts = latest_pts
+                lxyz0 = lpts[:, :3]
+                lrng = np.linalg.norm(lxyz0, axis=1)
+                lkeep = lrng >= max(0.0, self.min_range_m)
+                lpts = lpts[lkeep]
+                lxyz = lpts[:, :3]
+                luv, lkeep_idx = project_radar_to_image_with_indices(
+                    radar_xyz=lxyz,
+                    cam_K=self._cam_K,
+                    cam_D=self._cam_D,
+                    R=self._R,
+                    t=self._t,
+                    w=self._img_w,
+                    h=self._img_h,
+                    use_distortion=self.use_distortion,
+                    z_min_m=self.z_min_m,
+                )
+                if luv.shape[0] > 0:
+                    latest_uv = luv
+                    latest_pts_valid = lpts[lkeep_idx]
+                    latest_uu = latest_uv[:, 0].astype(np.float64)
+                    latest_vv = latest_uv[:, 1].astype(np.float64)
+
         # 6. 각 차량 박스(bbox)에 대해 루프
         for det in msg.detections:
             x1, y1 = float(det.bbox.xmin), float(det.bbox.ymin)
@@ -381,37 +465,64 @@ class AssociationNode:
             sel_rng = np.linalg.norm(sel_xyz, axis=1)
             dist_m = float(np.median(sel_rng))
 
-# --- Tracking-based speed (ground-plane) ---
-# Use cluster center movement across frames (in radar XY) to estimate speed,
-# so receding targets with small/zero Doppler still get speed.
-track_id = int(det.id)
-t_sec = radar_header.stamp.to_sec() if radar_header is not None else detection_msg.header.stamp.to_sec()
-cx = float(np.median(sel_xyz[:, 0]))
-cy = float(np.median(sel_xyz[:, 1]))
-track_speed_mps = float("nan")
+            # -------------------------------------------------
+            # Tracking-based speed (ground-plane)
+            # - 같은 track_id(det.id)로 매칭된 레이더 점들의 중심(cx,cy)이
+            #   시간에 따라 얼마나 이동했는지로 속도(m/s)를 추정합니다.
+            # - 레이더 프레임 (x,y) 평면에서의 이동량이므로,
+            #   멀어지는 차량에서 Doppler가 0에 가까워져도 속도를 유지할 수 있습니다.
+            # -------------------------------------------------
+            track_speed_mps = float("nan")
+            if self.track_speed_enable:
+                track_id = int(det.id)
+                # det.id 중복을 완화하기 위한 bucket 기반 key
+                cx_pix = 0.5 * (x1 + x2)
+                bucket = int(cx_pix / max(1.0, self.track_speed_key_bucket_px))
+                track_key = f"{track_id}:{bucket}"
+                # 시간 소스: 기본은 최신 레이더 프레임의 stamp를 사용(레이더 속도 추정에 더 자연스럽고,
+                # rosbag 재생 시 카메라 stamp가 불연속/중복될 때의 리스크도 줄임).
+                if (not self.track_speed_use_camera_stamp) and (latest_radar_header is not None) and (latest_radar_header.stamp.to_sec() > 0):
+                    t_sec = latest_radar_header.stamp.to_sec()
+                elif self.track_speed_use_camera_stamp and (msg.header.stamp.to_sec() > 0):
+                    t_sec = msg.header.stamp.to_sec()
+                else:
+                    t_sec = (latest_radar_header.stamp.to_sec() if latest_radar_header is not None else rospy.Time.now().to_sec())
 
-if self.track_speed_enable:
-    prev = self._track_last_xy.get(track_id, None)
-    if prev is not None:
-        t_prev, x_prev, y_prev = prev
-        dt = t_sec - t_prev
-        if self.track_speed_min_dt <= dt <= self.track_speed_max_dt:
-            dx = cx - x_prev
-            dy = cy - y_prev
-            disp = float(np.hypot(dx, dy))
-            if disp >= self.track_speed_min_disp:
-                v = disp / dt
-                if v <= self.track_speed_max_mps:
-                    # EMA smoothing per track_id
-                    ema_prev = self._track_speed_ema.get(track_id, v)
-                    alpha = self.track_speed_ema_alpha
-                    track_speed_mps = float(alpha * v + (1.0 - alpha) * ema_prev)
-                    self._track_speed_ema[track_id] = track_speed_mps
+                # (x,y) 중심 계산에 사용할 점 집합 선택
+                # - 기본: 최신 레이더 프레임만 사용(시간 섞임 방지)
+                # - 옵션 off: 기존처럼 스택된 sel_xyz 사용
+                xy_src = sel_xyz
+                if self.track_speed_use_latest_radar_only and (latest_pts_valid is not None) and (latest_uu is not None):
+                    l_inside = (latest_uu >= x1) & (latest_uu <= x2) & (latest_vv >= y1) & (latest_vv <= y2)
+                    l_sel = latest_pts_valid[l_inside]
+                    if l_sel is not None and l_sel.shape[0] > 0:
+                        xy_src = l_sel[:, :3]
 
-    # update last position (even if dt invalid, for next time)
-    self._track_last_xy[track_id] = (t_sec, cx, cy)
+                cx = float(np.median(xy_src[:, 0]))
+                cy = float(np.median(xy_src[:, 1]))
 
-            # --- [핵심] 속도 계산 및 보정 ---
+                prev = self._track_last_xy.get(track_key, None)
+                if prev is not None:
+                    t_prev, x_prev, y_prev = prev
+                    dt = float(t_sec - t_prev)
+                    if self.track_speed_min_dt <= dt <= self.track_speed_max_dt:
+                        dx = float(cx - x_prev)
+                        dy = float(cy - y_prev)
+                        disp = float(np.hypot(dx, dy))
+                        if disp >= self.track_speed_min_disp:
+                            v = disp / dt
+                            if v <= self.track_speed_max_mps:
+                                ema_prev = self._track_speed_ema.get(track_key, v)
+                                a = self.track_speed_ema_alpha
+                                track_speed_mps = float(a * v + (1.0 - a) * ema_prev)
+                                self._track_speed_ema[track_key] = track_speed_mps
+
+                # 동일 timestamp로 last_xy가 덮여써지면 dt=0 문제가 생길 수 있어,
+                # 시간 값이 실제로 증가할 때만 업데이트합니다.
+                if (prev is None) or (t_sec > prev[0] + 1e-6):
+                    self._track_last_xy[track_key] = (t_sec, cx, cy)
+
+            # --- [핵심] 속도 계산 및 보정 (Doppler 기반) ---
             speed_mps = float("nan")
             
             # 데이터 컬럼 파싱 (x, y, z, doppler, power)
@@ -492,14 +603,27 @@ if self.track_speed_enable:
                     else:
                         speed_mps = float("nan")
 
-# --- Final speed selection: Doppler vs Track-speed fallback ---
-if self.track_speed_enable and np.isfinite(track_speed_mps):
-    if (not np.isfinite(speed_mps)) or (abs(speed_mps) < self.track_speed_fallback_abs_doppler_lt):
-        speed_mps = float(track_speed_mps)
-        if self.use_abs_speed and np.isfinite(speed_mps):
-            speed_mps = float(abs(speed_mps))
+            # -------------------------------------------------
+            # Final speed selection: Doppler vs Track-speed fallback
+            # - Doppler 기반 속도가 NaN이거나, abs(speed_mps)가 너무 작을 때(LOS 성분이 거의 없음)
+            #   track_speed_mps가 유효하면 이를 사용합니다.
+            # -------------------------------------------------
+            doppler_speed_mps = float(speed_mps)
+            used_track_fallback = False
+            if self.track_speed_enable and np.isfinite(track_speed_mps):
+                if (not np.isfinite(speed_mps)) or (abs(speed_mps) < self.track_speed_fallback_abs_doppler_lt):
+                    speed_mps = float(track_speed_mps)
+                    used_track_fallback = True
+                    if self.use_abs_speed and np.isfinite(speed_mps):
+                        speed_mps = float(abs(speed_mps))
 
-speed_kph = speed_mps * 3.6 if np.isfinite(speed_mps) else float("nan")
+            # 진행 상태 확인용: 1초에 1번만 출력
+            if used_track_fallback:
+                dop_kph = doppler_speed_mps * 3.6 if np.isfinite(doppler_speed_mps) else float('nan')
+                trk_kph = track_speed_mps * 3.6
+                rospy.loginfo_throttle(1.0, f"[association] track-speed fallback key={track_key} | dop={dop_kph:.2f} km/h -> track={trk_kph:.2f} km/h")
+
+            speed_kph = speed_mps * 3.6 if np.isfinite(speed_mps) else float("nan")
 
             assoc.dist_m = dist_m
             assoc.speed_mps = float(speed_mps)
@@ -536,7 +660,6 @@ speed_kph = speed_mps * 3.6 if np.isfinite(speed_mps) else float("nan")
                 marker_pack.markers.append(mk)
 
         self.pub_assoc.publish(out)
-        rospy.loginfo_throttle(1.0, f"[association] published {len(out.objects)} objects | track_speed_enable={self.track_speed_enable}")
         if self.publish_markers and self.pub_markers is not None and marker_pack is not None:
             self.pub_markers.publish(marker_pack)
 

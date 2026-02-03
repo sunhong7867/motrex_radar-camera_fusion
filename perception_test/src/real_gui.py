@@ -1610,10 +1610,11 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             gain = float(self.spin_brightness_gain.value()) if hasattr(self, "spin_brightness_gain") else 1.0
             if abs(gain - 1.0) > 1e-3:
                 disp = cv2.convertScaleAbs(disp, alpha=gain, beta=0)
+
         radar_points = frame["radar_points"]
         radar_doppler = frame["radar_doppler"]
 
-        # 1. Objects
+        # 1. 차선 필터 설정 확인
         active_lane_polys = {}
         for name, chk in self.chk_lanes.items():
             if not chk.isChecked():
@@ -1623,7 +1624,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 active_lane_polys[name] = poly
         has_lane_filter = bool(active_lane_polys)
 
-        # Velocity estimation
+        # 2. 레이더 투영 준비
         proj_uvs = None
         proj_valid = None
         proj_dopplers = None
@@ -1635,11 +1636,12 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         def _pass_estimation_filters(dop_mps: float) -> bool:
             if hasattr(self, "chk_filter_low_speed") and self.chk_filter_low_speed.isChecked():
-                thr = float(self.spin_min_speed_kmh.value()) if hasattr(self, "spin_min_speed_kmh") else NOISE_MIN_SPEED_KMH
+                thr = float(self.spin_min_speed_kmh.value()) if hasattr(self, "spin_min_speed_kmh") else 5.0
                 if abs(dop_mps * 3.6) < thr:
                     return False
             return True
 
+        # 3. 대상 객체 정리
         draw_items = []
         for obj in self.vis_objects:
             g_id = obj['id']
@@ -1654,32 +1656,26 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 if target_lane is None:
                     continue
 
-            if target_lane:
-                if g_id not in self.global_to_local_ids:
-                    self.lane_counters[target_lane] += 1
-                    self.global_to_local_ids[g_id] = self.lane_counters[target_lane]
-                local_id = self.global_to_local_ids[g_id]
-                label_prefix = f"No: {local_id} ({target_lane})"
-            else:
-                label_prefix = f"ID: {g_id}"
+            label_prefix = f"No: {self.global_to_local_ids.get(g_id, g_id)} ({target_lane})" if target_lane else f"ID: {g_id}"
+            
+            # 차선 기반 카운팅 로직
+            if target_lane and g_id not in self.global_to_local_ids:
+                self.lane_counters[target_lane] += 1
+                self.global_to_local_ids[g_id] = self.lane_counters[target_lane]
+                label_prefix = f"No: {self.global_to_local_ids[g_id]} ({target_lane})"
 
             draw_items.append({
-                "obj": obj,
-                "id": g_id,
-                "bbox": (x1, y1, x2, y2),
-                "label": label_prefix,
-                "y2": y2
+                "obj": obj, "id": g_id, "bbox": (x1, y1, x2, y2),
+                "label": label_prefix, "y2": y2
             })
 
-        used_point_mask = None
-        if proj_uvs is not None:
-            used_point_mask = np.zeros(proj_uvs.shape[0], dtype=bool)
-
-        draw_items.sort(key=lambda d: d["y2"], reverse=True)
+        # 4. 속도 추정 및 마스킹
+        used_point_mask = np.zeros(proj_uvs.shape[0], dtype=bool) if proj_uvs is not None else None
+        draw_items.sort(key=lambda d: d["y2"], reverse=True) # 아래쪽 차량부터 점 할당
 
         now_ts = time.time()
-        hold_sec = float(self.spin_hold_sec.value()) if hasattr(self, "spin_hold_sec") else self.vel_hold_sec_default
-        smoothing = self.cmb_smoothing.currentText() if hasattr(self, "cmb_smoothing") else "None"
+        hold_sec = float(self.spin_hold_sec.value()) if hasattr(self, "spin_hold_sec") else 10.0
+        smoothing = self.cmb_smoothing.currentText() if hasattr(self, "cmb_smoothing") else "EMA"
         ema_alpha = float(self.spin_ema_alpha.value()) if hasattr(self, "spin_ema_alpha") else 0.35
 
         for item in draw_items:
@@ -1690,188 +1686,117 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             last_ts = float(mem.get("ts", -1.0))
             last_vel = mem.get("vel_kmh", None)
 
-            if do_speed_update:
-                if proj_uvs is not None and proj_dopplers is not None:
-                    inside = (proj_valid & (proj_uvs[:, 0] >= x1) & (proj_uvs[:, 0] <= x2) & (proj_uvs[:, 1] >= y1) & (proj_uvs[:, 1] <= y2))
-                    if used_point_mask is not None:
-                        inside = inside & (~used_point_mask)
+            if do_speed_update and proj_uvs is not None and proj_dopplers is not None:
+                inside = (proj_valid & (proj_uvs[:, 0] >= x1) & (proj_uvs[:, 0] <= x2) & (proj_uvs[:, 1] >= y1) & (proj_uvs[:, 1] <= y2))
+                if used_point_mask is not None:
+                    inside = inside & (~used_point_mask)
 
-                    idxs = np.where(inside)[0]
+                idxs = np.where(inside)[0]
+                if idxs.size > 0:
+                    dops = proj_dopplers[idxs].astype(np.float64)
+                    keep = np.array([_pass_estimation_filters(d) for d in dops], dtype=bool)
+                    idxs = idxs[keep]
+                    dops = dops[keep]
+
                     if idxs.size > 0:
-                        dops = proj_dopplers[idxs].astype(np.float64, copy=False)
-                        keep = np.array([_pass_estimation_filters(d) for d in dops], dtype=bool)
-                        idxs = idxs[keep]
-                        dops = dops[keep]
-
-                        if idxs.size > 0:
-                            if not hasattr(self, "radar_start_ts"):
-                                self.radar_start_ts = now_ts
-                            if (now_ts - self.radar_start_ts) < 0.5:
-                                meas_kmh = None
+                        if not hasattr(self, "radar_start_ts"): self.radar_start_ts = now_ts
+                        
+                        if (now_ts - self.radar_start_ts) >= 0.5:
+                            if self.use_nearest_k_points:
+                                cx_box, cy_box = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+                                dist2 = (proj_uvs[idxs, 0] - cx_box)**2 + (proj_uvs[idxs, 1] - cy_box)**2
+                                k = min(int(self.nearest_k), idxs.size)
+                                pick = np.argpartition(dist2, k)[:k] if dist2.size > k else np.arange(dist2.size)
+                                dop_med = float(np.median(dops[pick]))
                             else:
-                                if self.use_nearest_k_points:
-                                    cx_box = 0.5 * (x1 + x2)
-                                    cy_box = 0.5 * (y1 + y2)
-                                    du = proj_uvs[idxs, 0] - cx_box
-                                    dv = proj_uvs[idxs, 1] - cy_box
-                                    dist2 = du*du + dv*dv
-                                    k = min(int(self.nearest_k), idxs.size)
-                                    if dist2.size > k:
-                                        pick = np.argpartition(dist2, k)[:k]
-                                    else:
-                                        pick = np.arange(dist2.size)
-                                    dops_sel = dops[pick]
-                                    dop_med = float(np.median(dops_sel))
-                                    meas_kmh = abs(dop_med * 3.6)
-                                else:
-                                    fwd = radar_points[idxs, 1]
-                                    sel_dops = select_best_forward_cluster(fwd, dops, max_gap_m=2.0)
-                                    if sel_dops.size > 0:
-                                        dop_med = float(np.median(sel_dops))
-                                        meas_kmh = abs(dop_med * 3.6)
-                                    else:
-                                        meas_kmh = None
-                        if used_point_mask is not None and idxs.size > 0:
+                                fwd = radar_points[idxs, 1]
+                                sel_dops = select_best_forward_cluster(fwd, dops, max_gap_m=2.0)
+                                dop_med = float(np.median(sel_dops)) if sel_dops.size > 0 else None
+                            
+                            if dop_med is not None:
+                                # [핵심] 멀어지는 파란점(양수)과 다가오는 빨간점(음수) 모두 절댓값 처리하여 속도 산출
+                                meas_kmh = abs(dop_med * 3.6) 
+
+                        if used_point_mask is not None:
                             used_point_mask[idxs] = True
-            else:
-                meas_kmh = None
 
-            obj_ref = item["obj"]
-            if np.isfinite(obj_ref.get("vel", float("nan"))):
-                meas_kmh = abs(float(obj_ref["vel"]))
+            # [수정 지점] 백엔드(association_node)의 잘못된 0.00 값을 무시하고 
+            # 위에서 GUI가 직접 계산한 meas_kmh를 그대로 사용하도록 덮어씌우기 로직 제거
 
-            if meas_kmh is not None and last_vel is not None and np.isfinite(last_vel):
-                if abs(meas_kmh - float(last_vel)) > float(self.max_jump_kmh):
-                    meas_kmh = None
-
-            if meas_kmh is not None and np.isfinite(meas_kmh):
-                if meas_kmh > MAX_REASONABLE_KMH:
-                    meas_kmh = None
-
-            if last_vel is not None and np.isfinite(last_vel):
-                if float(last_vel) > float(self.speed_soft_max_kmh):
-                    mem.pop("vel_kmh", None); mem.pop("ema", None); mem.pop("kf", None)
-                    mem["ts"] = -1.0; last_vel = None; last_ts = -1.0
-                    self.vel_memory[g_id] = mem
-
-            if meas_kmh is not None and np.isfinite(meas_kmh):
-                if float(meas_kmh) > float(self.speed_hard_max_kmh):
-                    meas_kmh = None
-                elif float(meas_kmh) > float(self.speed_soft_max_kmh):
-                    meas_kmh = None
+            # 필터링 및 스무딩 로직
+            if meas_kmh is not None:
+                if meas_kmh > MAX_REASONABLE_KMH: meas_kmh = None
+                if last_vel is not None and abs(meas_kmh - last_vel) > self.max_jump_kmh: meas_kmh = None
 
             vel_out = None
-            if meas_kmh is not None and np.isfinite(meas_kmh):
+            if meas_kmh is not None:
                 if smoothing == "EMA":
                     prev = float(mem.get("ema", meas_kmh))
-                    vel_f = (ema_alpha * meas_kmh) + ((1.0 - ema_alpha) * prev)
-                    mem["ema"] = vel_f
-                    vel_out = vel_f
+                    vel_out = (ema_alpha * meas_kmh) + ((1.0 - ema_alpha) * prev)
+                    mem["ema"] = vel_out
                 elif smoothing == "Kalman":
-                    kf = mem.get("kf", None)
-                    if kf is None:
-                        kf = ScalarKalman(x0=meas_kmh, P0=25.0, Q=2.0, R=9.0)
-                    kf.predict()
-                    vel_out = kf.update(meas_kmh)
+                    kf = mem.get("kf", ScalarKalman(x0=meas_kmh))
+                    kf.predict(); vel_out = kf.update(meas_kmh)
                     mem["kf"] = kf
                 else:
                     vel_out = float(meas_kmh)
-                mem["vel_kmh"] = float(vel_out)
-                mem["ts"] = now_ts
+                mem["vel_kmh"] = vel_out; mem["ts"] = now_ts
                 self.vel_memory[g_id] = mem
-            else:
-                if last_vel is not None and np.isfinite(last_vel):
-                    if hold_sec <= 0.0 or (now_ts - last_ts) <= hold_sec:
-                        vel_out = float(last_vel)
+            elif last_vel is not None and (hold_sec <= 0.0 or (now_ts - last_ts) <= hold_sec):
+                vel_out = last_vel
 
-            if vel_out is not None and np.isfinite(vel_out):
-                vel_out = float(np.round(abs(vel_out), 2))
-                obj_ref["vel"] = vel_out
-            else:
-                obj_ref["vel"] = float("nan")
+            item["obj"]["vel"] = round(abs(vel_out), 2) if vel_out is not None else float("nan")
 
-        # Draw
+        # 5. 그리기 (Draw)
         for item in draw_items:
-            obj = item["obj"]
-            x1, y1, x2, y2 = item["bbox"]
-            label_prefix = item["label"]
-            cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), BBOX_LINE_THICKNESS)
+            obj = item["obj"]; x1, y1, x2, y2 = item["bbox"]; label_prefix = item["label"]
+            cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
             vel = obj.get("vel", float("nan"))
             v_str = f"{vel:.2f}km/h" if np.isfinite(vel) else "--km/h"
-            line1 = label_prefix
-            line2 = f"Vel: {v_str}"
-
+            
             font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
+            line1, line2 = label_prefix, f"Vel: {v_str}"
             (w1, h1), _ = cv2.getTextSize(line1, font, scale, thick)
             (w2, h2), _ = cv2.getTextSize(line2, font, scale, thick)
-            max_w = max(w1, w2)
-            total_h = h1 + h2 + 8
-            bg_top = y1 - total_h - 12
-            cv2.rectangle(disp, (x1, bg_top), (x1 + max_w + 10, y1), (0, 0, 0), -1)
+            bg_top = y1 - (h1 + h2 + 20)
+            cv2.rectangle(disp, (x1, bg_top), (x1 + max(w1, w2) + 10, y1), (0, 0, 0), -1)
             cv2.putText(disp, line1, (x1 + 5, y1 - h2 - 10), font, scale, (255, 255, 255), thick)
             cv2.putText(disp, line2, (x1 + 5, y1 - 5), font, scale, (255, 255, 255), thick)
 
-        # Radar Overlay
+        # 6. 레이더 오버레이 및 메트릭 표시
         projected_count = 0
         if radar_points is not None and self.cam_K is not None:
             pts_r = radar_points.T
             pts_c = self.Extr_R @ pts_r + self.Extr_t.reshape(3, 1)
             valid_idx = pts_c[2, :] > 0.5
             if np.any(valid_idx):
-                pts_c = pts_c[:, valid_idx]
-                has_doppler = radar_doppler is not None
-                dopplers = radar_doppler[valid_idx] if has_doppler else np.zeros(pts_c.shape[1])
-                projected_count = int(pts_c.shape[1])
-                uvs = self.cam_K @ pts_c
+                uvs = (self.cam_K @ pts_c[:, valid_idx])
                 uvs /= uvs[2, :]
+                dopplers = radar_doppler[valid_idx]
+                projected_count = int(np.sum(valid_idx))
                 h, w = disp.shape[:2]
                 for i in range(uvs.shape[1]):
                     u, v = int(uvs[0, i]), int(uvs[1, i])
                     if 0 <= u < w and 0 <= v < h:
-                        if has_doppler:
-                            speed_kmh = dopplers[i] * 3.6
-                            if hasattr(self, 'chk_filter_low_speed') and self.chk_filter_low_speed.isChecked():
-                                thr_kmh = float(self.spin_min_speed_kmh.value())
-                                if abs(speed_kmh) < thr_kmh: continue
-                            if speed_kmh >= 0 and hasattr(self, 'chk_show_approach') and (not self.chk_show_approach.isChecked()): continue
-                            if speed_kmh < 0 and hasattr(self, 'chk_show_recede') and (not self.chk_show_recede.isChecked()): continue
-                            if abs(speed_kmh) <= 0.5: color = (0, 255, 0)
-                            elif speed_kmh < SPEED_THRESHOLD_RED: color = (0, 0, 255)
-                            elif speed_kmh > SPEED_THRESHOLD_BLUE: color = (255, 0, 0)
-                            else: color = (255, 255, 255)
-                        else:
-                            color = (255, 255, 255)
-                        cv2.circle(disp, (u, v), OVERLAY_POINT_RADIUS, color, -1)
+                        speed_kmh = dopplers[i] * 3.6
+                        if abs(speed_kmh) < self.spin_min_speed_kmh.value(): continue
+                        color = (0, 0, 255) if speed_kmh < -0.5 else (255, 0, 0) if speed_kmh > 0.5 else (0, 255, 0)
+                        cv2.circle(disp, (u, v), 4, color, -1)
 
-        speed_values = [obj["vel"] for obj in self.vis_objects if np.isfinite(obj["vel"])]
-        speed_text = "--"
-        if speed_values:
-            speed_text = f"{np.median(speed_values):.2f}km/h"
-
-        extrinsic_text = "Extrinsic: --"
-        if self.extrinsic_last_loaded is not None:
-            extrinsic_text = time.strftime("Extrinsic: %H:%M:%S", time.localtime(self.extrinsic_last_loaded))
-
-        overlay_lines = [
-            extrinsic_text,
-            f"Radar in view: {projected_count}",
-            f"Median speed: {speed_text}",
-        ]
-        for idx, line in enumerate(overlay_lines):
-            y = 30 + idx * 30 
-            cv2.putText(disp, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        # 상단 정보 표시
+        speed_vals = [obj["vel"] for obj in self.vis_objects if np.isfinite(obj["vel"])]
+        med_speed = f"{np.median(speed_vals):.2f}km/h" if speed_vals else "--"
+        overlay = [f"Radar in view: {projected_count}", f"Median speed: {med_speed}"]
+        for idx, line in enumerate(overlay):
+            cv2.putText(disp, line, (12, 60 + idx * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         if self.chk_show_poly.isChecked():
             for name, pts in self.lane_polys.items():
-                if name in self.chk_lanes and not self.chk_lanes[name].isChecked():
-                    continue
-                if pts is not None and len(pts) > 0:
+                if name in self.chk_lanes and self.chk_lanes[name].isChecked() and pts.size > 0:
                     cv2.polylines(disp, [pts], True, (0, 255, 255), 2)
-                    text_pos = self.get_text_position(pts)
-                    cv2.putText(disp, name, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
         self.viewer.update_image(disp)
-
+        
     def open_lane_editor(self):
         if self.cv_image is None:
             return
