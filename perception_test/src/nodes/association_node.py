@@ -16,8 +16,7 @@ association_node.py
 - ~bbox_topic (perception_test/DetectionArray)
 
 출력:
-- ~associated_topic (perception_test/AssociationArray)extr_path = rospy.get_param("~extrinsic_source/path", "$(find perception_test)/config/extrinsic.json")
-
+- ~associated_topic (perception_test/AssociationArray)
 - (옵션) ~debug/marker_topic (visualization_msgs/MarkerArray)
 """
 
@@ -163,10 +162,7 @@ class AssociationNode:
         self.use_abs_speed = bool(rospy.get_param("~association/use_abs_speed", True))
 
         # extrinsic
-        extr_path = rospy.get_param("~extrinsic_path", None)
-        if not extr_path:
-            extr_path = rospy.get_param("~extrinsic_source/path", "$(find perception_test)/config/extrinsic.json")
-
+        extr_path = rospy.get_param("~extrinsic_source/path", "$(find perception_test)/config/extrinsic.json")
         self.extrinsic_path = resolve_ros_path(extr_path)
         self.extrinsic_reload_sec = float(rospy.get_param("~extrinsic_reload_sec", 1.0))
 
@@ -385,6 +381,36 @@ class AssociationNode:
             sel_rng = np.linalg.norm(sel_xyz, axis=1)
             dist_m = float(np.median(sel_rng))
 
+# --- Tracking-based speed (ground-plane) ---
+# Use cluster center movement across frames (in radar XY) to estimate speed,
+# so receding targets with small/zero Doppler still get speed.
+track_id = int(det.id)
+t_sec = radar_header.stamp.to_sec() if radar_header is not None else detection_msg.header.stamp.to_sec()
+cx = float(np.median(sel_xyz[:, 0]))
+cy = float(np.median(sel_xyz[:, 1]))
+track_speed_mps = float("nan")
+
+if self.track_speed_enable:
+    prev = self._track_last_xy.get(track_id, None)
+    if prev is not None:
+        t_prev, x_prev, y_prev = prev
+        dt = t_sec - t_prev
+        if self.track_speed_min_dt <= dt <= self.track_speed_max_dt:
+            dx = cx - x_prev
+            dy = cy - y_prev
+            disp = float(np.hypot(dx, dy))
+            if disp >= self.track_speed_min_disp:
+                v = disp / dt
+                if v <= self.track_speed_max_mps:
+                    # EMA smoothing per track_id
+                    ema_prev = self._track_speed_ema.get(track_id, v)
+                    alpha = self.track_speed_ema_alpha
+                    track_speed_mps = float(alpha * v + (1.0 - alpha) * ema_prev)
+                    self._track_speed_ema[track_id] = track_speed_mps
+
+    # update last position (even if dt invalid, for next time)
+    self._track_last_xy[track_id] = (t_sec, cx, cy)
+
             # --- [핵심] 속도 계산 및 보정 ---
             speed_mps = float("nan")
             
@@ -466,7 +492,14 @@ class AssociationNode:
                     else:
                         speed_mps = float("nan")
 
-            speed_kph = speed_mps * 3.6 if np.isfinite(speed_mps) else float("nan")
+# --- Final speed selection: Doppler vs Track-speed fallback ---
+if self.track_speed_enable and np.isfinite(track_speed_mps):
+    if (not np.isfinite(speed_mps)) or (abs(speed_mps) < self.track_speed_fallback_abs_doppler_lt):
+        speed_mps = float(track_speed_mps)
+        if self.use_abs_speed and np.isfinite(speed_mps):
+            speed_mps = float(abs(speed_mps))
+
+speed_kph = speed_mps * 3.6 if np.isfinite(speed_mps) else float("nan")
 
             assoc.dist_m = dist_m
             assoc.speed_mps = float(speed_mps)
@@ -503,6 +536,7 @@ class AssociationNode:
                 marker_pack.markers.append(mk)
 
         self.pub_assoc.publish(out)
+        rospy.loginfo_throttle(1.0, f"[association] published {len(out.objects)} objects | track_speed_enable={self.track_speed_enable}")
         if self.publish_markers and self.pub_markers is not None and marker_pack is not None:
             self.pub_markers.publish(marker_pack)
 

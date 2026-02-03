@@ -61,7 +61,7 @@ TOPIC_ASSOCIATED = "/perception_test/associated"
 BRIGHTNESS_PARAM_ENABLE = "/object_detector/runtime/brightness_enable"
 BRIGHTNESS_PARAM_GAIN = "/object_detector/runtime/brightness_gain"
 
-START_ACTIVE_LANES = ["IN1", "IN2", "IN3"]
+START_ACTIVE_LANES = ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]
 
 # ==============================================================================
 # Setup & Imports
@@ -1316,9 +1316,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         btn_intri = QtWidgets.QPushButton("Run Intrinsic")
         btn_intri.clicked.connect(self.run_intrinsic_calibration)
-        btn_autocal = QtWidgets.QPushButton("Run AutoCal (Extrinsic)")
+        btn_autocal = QtWidgets.QPushButton("Run Extrinsic (Auto)")
         btn_autocal.clicked.connect(self.run_autocalibration)
-        btn_calib = QtWidgets.QPushButton("Run Extrinsic")
+        btn_calib = QtWidgets.QPushButton("Run Extrinsic (Manual)")
         btn_calib.clicked.connect(self.run_calibration)
         btn_reload = QtWidgets.QPushButton("Reload JSON")
         btn_reload.clicked.connect(self.load_extrinsic)
