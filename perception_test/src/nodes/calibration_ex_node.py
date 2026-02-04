@@ -49,12 +49,16 @@ class ExtrinsicCalibrationManager:
         self.radar_topic = rospy.get_param('~radar_topic', '/point_cloud')
         self.camera_info_topic = rospy.get_param('~camera_info_topic', '/camera/camera_info')
         
-        # 캘리브레이션 파라미터 (엄격하게 설정)
-        self.min_samples = 100          # 충분한 벡터 확보
+        # -------------------------------------------------------------
+        # [수정] 캘리브레이션 파라미터 (데이터 수집 조건 강화)
+        # -------------------------------------------------------------
+        self.min_samples = 600          # 최소 600개 이상의 포인트가 모여야 함 (기존 100 -> 600)
+        self.req_duration = 15.0        # 최소 15초 동안은 무조건 수집 (시간 확보)
+        
         self.min_track_len = 15         # 짧은 노이즈 트랙 제거
         self.min_cluster_points = 3     
         self.cluster_eps = 2.0          
-        self.min_speed_mps = 1.0        # 정지 물체 배제
+        self.min_speed_mps = 3.0        # 3m/s (약 10km/h) 미만 정지 물체는 노이즈로 보고 제외
         self.max_assoc_angle_deg = 30.0 # 초기 매칭 허용 범위
         
         # 파일 경로 설정
@@ -72,7 +76,8 @@ class ExtrinsicCalibrationManager:
         self.curr_t = np.zeros((3,1))
         self._load_extrinsic()
 
-        # 상태 플래그
+        # [수정] 수집 시작 시간 변수 초기화
+        self.collection_start_time = None
         self.is_calibrating = False
 
         # 구독 설정
@@ -83,7 +88,7 @@ class ExtrinsicCalibrationManager:
         self.ts.registerCallback(self._callback)
         rospy.Subscriber(self.camera_info_topic, CameraInfo, self._info_callback)
 
-        rospy.loginfo("[Autocal] SVD-based Rotation Optimization Mode Started.")
+        rospy.loginfo(f"[Autocal] Started. Waiting for {self.req_duration}s & {self.min_samples} samples...")
 
     def _load_extrinsic(self):
         if os.path.exists(self.save_path):
@@ -140,9 +145,15 @@ class ExtrinsicCalibrationManager:
     def _callback(self, det_msg, rad_msg):
         if self.K is None or self.is_calibrating: return
         
+        # 1. 수집 시작 시간 기록 (최초 1회)
+        if self.collection_start_time is None:
+            self.collection_start_time = rospy.Time.now()
+            rospy.loginfo("[Autocal] Timer Started.")
+
         centroids = self._get_radar_centroids(rad_msg)
-        # 트래커 ID가 유효한 객체만 추출
-        valid_dets = [{'id': d.id, 'pt': ((d.bbox.xmin + d.bbox.xmax)/2.0, d.bbox.ymax)} 
+        
+        # 매칭 기준점: 박스 중앙
+        valid_dets = [{'id': d.id, 'pt': ((d.bbox.xmin + d.bbox.xmax)/2.0, (d.bbox.ymin + d.bbox.ymax)/2.0)} 
                       for d in det_msg.detections if d.id > 0]
 
         if not centroids or not valid_dets: return
@@ -153,7 +164,7 @@ class ExtrinsicCalibrationManager:
         # 버퍼에 저장
         for tid, img_pt, obj_pt in pairs:
             if tid not in self.track_buffer:
-                self.track_buffer[tid] = deque(maxlen=50) # 궤적 길이 충분히 확보
+                self.track_buffer[tid] = deque(maxlen=100) # 버퍼 크기 약간 증가
             self.track_buffer[tid].append((img_pt, obj_pt))
 
         # 데이터 수집 상태 확인
@@ -164,9 +175,15 @@ class ExtrinsicCalibrationManager:
                 total_samples += len(pts)
                 valid_tracks += 1
         
-        rospy.loginfo_throttle(2.0, f"[Autocal] Collecting: {total_samples}/{self.min_samples} points (Tracks: {valid_tracks})")
+        # 경과 시간 계산
+        elapsed = (rospy.Time.now() - self.collection_start_time).to_sec()
+        
+        # 상태 로그 출력 (2초마다)
+        rospy.loginfo_throttle(1.0, f"[Autocal] Collecting... Time: {elapsed:.1f}/{self.req_duration}s | Samples: {total_samples}/{self.min_samples} (Tracks: {valid_tracks})")
 
-        if total_samples >= self.min_samples:
+        # [핵심] 종료 조건 검사: (시간 > 15초) AND (샘플 > 600개)
+        if elapsed >= self.req_duration and total_samples >= self.min_samples:
+            rospy.loginfo(f"[Autocal] Threshold Reached! Starting Optimization with {total_samples} samples.")
             self.run_optimization()
 
     def _associate_angular(self, valid_dets, centroids):
@@ -180,10 +197,9 @@ class ExtrinsicCalibrationManager:
         for det in valid_dets:
             u, v = det['pt']
             # Pixel -> Normalized Camera Ray (x, y, 1)
-            # z=1 평면에서의 좌표
             nc = self.inv_K @ np.array([u, v, 1.0])
             cam_az = np.arctan2(nc[0], nc[2])
-            cam_el = np.arctan2(nc[1], nc[2]) # y축이 아래쪽이므로 주의 (일단 기하학적 각도만 비교)
+            cam_el = np.arctan2(nc[1], nc[2])
 
             best_idx = None
             min_diff = float('inf')
@@ -212,57 +228,49 @@ class ExtrinsicCalibrationManager:
     def run_optimization(self):
         """
         [핵심 알고리즘] Kabsch Algorithm (SVD) for Rotation Alignment
-        1. 모든 매칭된 쌍을 Unit Vector(방향 벡터)로 변환.
-        2. t=0이라 가정하고 두 벡터 집합 간의 회전 행렬 R을 SVD로 구함.
-        3. 구한 R을 적용한 뒤, 남은 잔차를 최소화하는 미세 t를 구하거나 고정함.
         """
         self.is_calibrating = True
         rospy.loginfo("[Autocal] Running Optimization...")
 
-        # 1. 데이터 준비 (Flatten all points)
+        # 1. 데이터 준비
         radar_vecs = []
         cam_vecs = []
         
-        # 궤적별로 순회하며 데이터 수집
         for tid, points in self.track_buffer.items():
             if len(points) < self.min_track_len: continue
             
             for (u, v), (rx, ry, rz) in points:
-                # Camera Vector (Normalized, Unit Length)
                 nc = self.inv_K @ np.array([u, v, 1.0])
                 nc /= np.linalg.norm(nc)
                 cam_vecs.append(nc)
                 
-                # Radar Vector (Unit Length, t 무시)
-                # t가 작다고 가정하고(육교 환경), 원점 기준 방향만 봄
                 rv = np.array([rx, ry, rz])
                 rv /= np.linalg.norm(rv)
                 radar_vecs.append(rv)
 
+        # 안전장치: 혹시라도 샘플이 부족하면 취소
         if len(radar_vecs) < self.min_samples:
-            rospy.logwarn("[Autocal] Not enough valid points after filtering.")
+            rospy.logwarn("[Autocal] Not enough valid points (Wait longer next time).")
             self.is_calibrating = False
+            # 다시 모으기 위해 리셋
+            self.collection_start_time = None 
             return
 
-        A = np.array(radar_vecs).T # (3, N)
-        B = np.array(cam_vecs).T   # (3, N)
+        A = np.array(radar_vecs).T 
+        B = np.array(cam_vecs).T   
 
-        # 2. SVD를 이용한 최적 회전 행렬 산출 (Kabsch Algorithm)
-        # H = A @ B.T (Correlation Matrix)
+        # 2. SVD를 이용한 최적 회전 행렬 산출
         H = A @ B.T
         U, S, Vt = np.linalg.svd(H)
-        
-        # R = V @ U.T
         R_opt = Vt.T @ U.T
 
-        # Reflection Case 처리 (Determinant가 -1이면 반전 필요)
         if np.linalg.det(R_opt) < 0:
             Vt[2, :] *= -1
             R_opt = Vt.T @ U.T
 
         rospy.loginfo(f"[Autocal] Rotation Optimized.\n{R_opt}")
 
-        # 3. Translation은 기존 값 유지
+        # 3. Translation은 기존 값 유지 (회전만 보정하는 것이 안전함)
         t_opt = self.curr_t 
         
         # 4. 결과 저장
@@ -271,11 +279,10 @@ class ExtrinsicCalibrationManager:
         
         self._save_result(self.curr_R, self.curr_t)
         
-        # 메모리 정리 및 종료 처리
         self.track_buffer.clear()
         rospy.loginfo("[Autocal] Calibration Finished & Saved.")
         
-        # [수정] 완료 후 노드를 종료하여 GUI가 완료됨을 알 수 있게 함
+        # 캘리브레이션 완료 후 노드 종료
         self.is_calibrating = False
         rospy.signal_shutdown("Calibration Done") 
 
@@ -286,7 +293,7 @@ class ExtrinsicCalibrationManager:
         }
         with open(self.save_path, 'w') as f:
             json.dump(data, f, indent=4)
-
+            
 if __name__ == '__main__':
     try: ExtrinsicCalibrationManager()
     except: pass

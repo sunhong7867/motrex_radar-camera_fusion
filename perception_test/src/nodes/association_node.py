@@ -161,6 +161,9 @@ class AssociationNode:
         self.use_power_weighted = bool(rospy.get_param("~association/use_power_weighted_speed", True))
         self.use_abs_speed = bool(rospy.get_param("~association/use_abs_speed", True))
 
+        # [NEW] BBox 상단(높이의 N%) 영역의 레이더 점만 사용할지 여부 (Tailgating 대응)
+        self.bbox_top_h_ratio = float(rospy.get_param("~association/bbox_top_height_ratio", 0.3))
+
         # -------------------------------------------------
         # Tracking-based speed (ground-plane) parameters
         # - Doppler(LOS 성분)이 작아지거나 0으로 뭉개지는 상황(멀어짐/측면/저 SNR)에서
@@ -443,7 +446,30 @@ class AssociationNode:
 
             # 박스 내부 점 찾기
             inside = (uu >= x1) & (uu <= x2) & (vv >= y1) & (vv <= y2)
-            sel = pts_valid[inside]
+            
+            # [NEW] Tailgating 방지: BBox 상단 영역(Top N%)의 포인트만 우선적으로 선택
+            # 뒤차의 포인트는 앞차 박스의 하단부에 걸칠 확률이 높으므로 이를 배제함.
+            h_box = y2 - y1
+            if h_box > 0:
+                # 이미지 좌표계(v)는 위쪽이 0이므로, top 영역은 y1 ~ (y1 + h*ratio)
+                v_limit = y1 + (h_box * self.bbox_top_h_ratio)
+                inside_top = (vv <= v_limit)
+                
+                # 상단 영역 필터 적용
+                # 만약 상단에 점이 하나도 없다면? -> fallback: 전체 box 사용?
+                # 아니면 그냥 매칭 실패로? -> tailgating 방지가 우선이므로 엄격하게 적용 권장.
+                mask_final = inside & inside_top
+                
+                # 안전장치: 상단에 점이 너무 없으면(0개), 그냥 전체 박스를 쓸 수도 있지만,
+                # "뒤차 간섭 배제"가 목적이므로 여기서는 엄격하게 필터링된 결과만 씁니다.
+                sel = pts_valid[mask_final]
+                
+                # 만약 상단 필터로 점이 다 사라졌다면, 전체 박스로 fallback 할지 선택.
+                # (옵션) 아래 주석 해제 시 fallback 동작
+                # if sel.shape[0] == 0:
+                #     sel = pts_valid[inside]
+            else:
+                sel = pts_valid[inside]
 
             assoc = Association()
             assoc.id = int(det.id)
@@ -467,10 +493,6 @@ class AssociationNode:
 
             # -------------------------------------------------
             # Tracking-based speed (ground-plane)
-            # - 같은 track_id(det.id)로 매칭된 레이더 점들의 중심(cx,cy)이
-            #   시간에 따라 얼마나 이동했는지로 속도(m/s)를 추정합니다.
-            # - 레이더 프레임 (x,y) 평면에서의 이동량이므로,
-            #   멀어지는 차량에서 Doppler가 0에 가까워져도 속도를 유지할 수 있습니다.
             # -------------------------------------------------
             track_speed_mps = float("nan")
             if self.track_speed_enable:
@@ -479,8 +501,7 @@ class AssociationNode:
                 cx_pix = 0.5 * (x1 + x2)
                 bucket = int(cx_pix / max(1.0, self.track_speed_key_bucket_px))
                 track_key = f"{track_id}:{bucket}"
-                # 시간 소스: 기본은 최신 레이더 프레임의 stamp를 사용(레이더 속도 추정에 더 자연스럽고,
-                # rosbag 재생 시 카메라 stamp가 불연속/중복될 때의 리스크도 줄임).
+                
                 if (not self.track_speed_use_camera_stamp) and (latest_radar_header is not None) and (latest_radar_header.stamp.to_sec() > 0):
                     t_sec = latest_radar_header.stamp.to_sec()
                 elif self.track_speed_use_camera_stamp and (msg.header.stamp.to_sec() > 0):
@@ -488,13 +509,19 @@ class AssociationNode:
                 else:
                     t_sec = (latest_radar_header.stamp.to_sec() if latest_radar_header is not None else rospy.Time.now().to_sec())
 
-                # (x,y) 중심 계산에 사용할 점 집합 선택
-                # - 기본: 최신 레이더 프레임만 사용(시간 섞임 방지)
-                # - 옵션 off: 기존처럼 스택된 sel_xyz 사용
                 xy_src = sel_xyz
                 if self.track_speed_use_latest_radar_only and (latest_pts_valid is not None) and (latest_uu is not None):
                     l_inside = (latest_uu >= x1) & (latest_uu <= x2) & (latest_vv >= y1) & (latest_vv <= y2)
-                    l_sel = latest_pts_valid[l_inside]
+                    
+                    # [NEW] Track-speed 용 최신 프레임에도 동일한 상단 필터 적용
+                    if h_box > 0:
+                        l_v_limit = y1 + (h_box * self.bbox_top_h_ratio)
+                        l_inside_top = (latest_vv <= l_v_limit)
+                        l_mask = l_inside & l_inside_top
+                    else:
+                        l_mask = l_inside
+                    
+                    l_sel = latest_pts_valid[l_mask]
                     if l_sel is not None and l_sel.shape[0] > 0:
                         xy_src = l_sel[:, :3]
 
@@ -517,8 +544,6 @@ class AssociationNode:
                                 track_speed_mps = float(a * v + (1.0 - a) * ema_prev)
                                 self._track_speed_ema[track_key] = track_speed_mps
 
-                # 동일 timestamp로 last_xy가 덮여써지면 dt=0 문제가 생길 수 있어,
-                # 시간 값이 실제로 증가할 때만 업데이트합니다.
                 if (prev is None) or (t_sec > prev[0] + 1e-6):
                     self._track_last_xy[track_key] = (t_sec, cx, cy)
 
@@ -558,34 +583,27 @@ class AssociationNode:
                     xyz_m = xyz_m[idx]
 
                 # 6-4. [중요] 기하학적 보정 (Cosine Correction)
-                # CARLA 시뮬레이션 고정밀도의 핵심 로직
                 if dop_m.size > 0:
                     corrected_dops = []
                     valid_pwrs = []
                     
                     for i in range(dop_m.size):
                         v_raw = dop_m[i]
-                        # 레이더 좌표계 기준 좌표
                         px = xyz_m[i, 0] # 전방
                         py = xyz_m[i, 1] # 좌우
                         pz = xyz_m[i, 2] # 상하
                         dist = np.sqrt(px**2 + py**2 + pz**2)
 
-                        # cos_theta = x / dist (전방 주행 방향과의 각도)
-                        # v_real = v_measured / cos_theta
                         if dist > 0.001:
                             cos_theta = abs(px) / dist
                             
-                            # 너무 측면(90도 근처)이면 보정이 불안정하므로 제외
                             if cos_theta > 0.1: 
                                 v_corr = v_raw / cos_theta
                                 corrected_dops.append(v_corr)
                                 valid_pwrs.append(pwr_m[i])
                             else:
-                                # 측면 데이터는 신뢰도가 낮음 -> 사용 안함
                                 pass
                         else:
-                            # 거리가 0에 가까우면 보정 불가
                             corrected_dops.append(v_raw)
                             valid_pwrs.append(pwr_m[i])
 
@@ -603,11 +621,7 @@ class AssociationNode:
                     else:
                         speed_mps = float("nan")
 
-            # -------------------------------------------------
             # Final speed selection: Doppler vs Track-speed fallback
-            # - Doppler 기반 속도가 NaN이거나, abs(speed_mps)가 너무 작을 때(LOS 성분이 거의 없음)
-            #   track_speed_mps가 유효하면 이를 사용합니다.
-            # -------------------------------------------------
             doppler_speed_mps = float(speed_mps)
             used_track_fallback = False
             if self.track_speed_enable and np.isfinite(track_speed_mps):
@@ -617,7 +631,6 @@ class AssociationNode:
                     if self.use_abs_speed and np.isfinite(speed_mps):
                         speed_mps = float(abs(speed_mps))
 
-            # 진행 상태 확인용: 1초에 1번만 출력
             if used_track_fallback:
                 dop_kph = doppler_speed_mps * 3.6 if np.isfinite(doppler_speed_mps) else float('nan')
                 trk_kph = track_speed_mps * 3.6
@@ -633,7 +646,7 @@ class AssociationNode:
 
             # 마커 추가 (시각화)
             if self.publish_markers and marker_pack is not None and sel.shape[0] > 0:
-                # 너무 많으면 샘플링
+                # [수정] 대표성을 띄는 점들(상단 필터링된 점들)만 마커로 표시하여 Rviz에서도 확인 가능하게 함
                 draw_xyz = sel_xyz
                 if draw_xyz.shape[0] > self.max_points_drawn:
                     idx = np.linspace(0, draw_xyz.shape[0]-1, self.max_points_drawn).astype(np.int32)
