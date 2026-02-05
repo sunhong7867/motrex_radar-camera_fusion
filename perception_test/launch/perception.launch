@@ -2,7 +2,7 @@
     <arg name="detector_yaml" default="$(find perception_test)/config/detector.yaml" />
     <arg name="roi_lanes_yaml" default="$(find perception_test)/config/roi_lanes.yaml" />
     
-    <node pkg="perception_test" type="offline_provider.py" name="offline_provider" output="screen">
+    <node pkg="perception_test" type="offline_provider_node.py" name="offline_provider" output="screen">
         <param name="bag_path" value="$(find perception_test)/models/my_test_data.bag" />
         
         <param name="intrinsic_path" value="$(find perception_test)/config/camera_intrinsic.yaml" />

@@ -20,18 +20,23 @@ rosrun perception_test real_gui.py
    - If permission denied:
 chmod +x src/perception_test/src/nodes/*.py
 
-
+chmod +x ~/motrex/catkin_ws/src/perception_test/src/nodes/radar_cluster_bbox_viz.py
+rosrun perception_test radar_cluster_bbox_viz.py _frame_id:=retina_link _point_scale:=0.8 _bbox_width:=0.15
+rosrun perception_test radar_cluster_bbox_viz.py _frame_id:=retina_link _draw_text:=true _text_size:=3
+___________________________________________________________________________
 cd ~/motrex/catkin_ws/src/perception_test/models
 rosparam set use_sim_time true
 rosbag play --clock my_test_data.bag
 
-chmod +x radar_metrics_node.py
-rosrun perception_test radar_metrics_node.py
-
-chmod +x ~/motrex/catkin_ws/src/perception_test/src/nodes/radar_cluster_bbox_viz.py
-rosrun perception_test radar_cluster_bbox_viz.py _frame_id:=retina_link _point_scale:=0.8 _bbox_width:=0.15
-rosrun perception_test radar_cluster_bbox_viz.py _frame_id:=retina_link _draw_text:=true _text_size:=3
+RROR bag unindexed
+rosbag reindex /home/sh/motrex/catkin_ws/src/perception_test/models/my_test_data.bag
+rosbag info /home/sh/motrex/catkin_ws/src/perception_test/models/my_test_data.bag
+___________________________________________________________________________
 
 
 그래프 용
 rosrun plotjuggler plotjuggler
+
+
+판다스 업그레이드
+pip3 install --upgrade pandas

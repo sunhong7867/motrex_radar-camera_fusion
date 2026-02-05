@@ -16,6 +16,11 @@ real_gui.py (Updated)
    - Magnet Line: BBox 상단 중앙(노란 점) <-> 레이더 대표 점 연결 (초록~빨강)
    - Representative Point: 상단 30% 영역의 중앙값 사용 (Single Point 모드)
    - Accuracy Gauge: 오차율 기반 실시간 점수 표시
+
+3. 데이터 저장 (Data Logging) 수정:
+   - update_loop 내 record_buffer 채우기 로직 추가
+   - 차선/ID별 고유 키 생성 (IN1->IN2 등 경로 반영)
+   - 거리별/ID별 통계 CSV 저장 기능 구현
 """
 
 import sys
@@ -23,13 +28,17 @@ import os
 import json
 import time
 import traceback
+import csv          # CSV 저장을 위해 필수
+import datetime     # 파일명 날짜 표기를 위해 필수
 import numpy as np
+import pandas as pd # 데이터 분석 및 카를라 스타일 저장을 위해 필수
 import cv2
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
 from collections import deque
 
 os.environ["QT_LOGGING_RULES"] = "qt.gui.painting=false"
+LOG_BASE_DIR = os.path.expanduser("~/motrex/catkin_ws/src/perception_test/calibration_logs")
 
 # ==============================================================================
 # [PARAMETER SETTINGS] 사용자 설정
@@ -470,347 +479,233 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         self._click_callback(int(img_x), int(img_y))
 
 # ==============================================================================
-# ManualCalibWindow (Rviz-Style Visuals)
+# ManualCalibWindow
 # ==============================================================================
 class ManualCalibWindow(QtWidgets.QDialog):
     def __init__(self, gui: 'RealWorldGUI'):
-        super().__init__(gui)
+        # 메인창 전체화면 유지 및 독립 이동을 위한 윈도우 플래그 설정
+        super().__init__(gui, QtCore.Qt.Window | QtCore.Qt.WindowMinMaxButtonsHint | QtCore.Qt.WindowCloseButtonHint)
         self.gui = gui
-        self.setWindowTitle("Manual Calibration (Center Matching)")
-        self.setModal(True)
-        self.resize(1600, 900)
+        self.setWindowTitle("Manual Calibration - Independent Tool")
+        
+        # 비모달 설정: 창이 떠 있어도 메인 GUI 조작 가능
+        self.setModal(False) 
+        
+        # 창 위치 및 크기 설정 (메인창 중앙을 가리지 않게 오프셋 부여)
+        main_geo = self.gui.geometry()
+        self.resize(2500, 1300) 
+        self.move(main_geo.x()+500, main_geo.y()+250) 
 
-        # ---------------------------------------------------------
-        # 1. 초기값 및 설정
-        # ---------------------------------------------------------
+        # 물리 파라미터 초기화
         self.T_init = np.eye(4, dtype=np.float64)
-        if self.gui.Extr_R is not None:
+        if self.gui.Extr_R is not None: 
             self.T_init[:3, :3] = np.array(self.gui.Extr_R, dtype=np.float64)
-        if self.gui.Extr_t is not None:
+        if self.gui.Extr_t is not None: 
             self.T_init[:3, 3]  = np.array(self.gui.Extr_t, dtype=np.float64).flatten()
         
         self.T_current = self.T_init.copy()
+        
+        # 조작 단위 설정
+        self.FIXED_DEG = 0.5   
+        self.FIXED_MOV = 0.1   
+        self.radar_zoom = 1.0
 
-        # 조작 감도
-        self.deg_step     = 0.5
-        self.trans_step   = 0.1
-        self.radar_zoom   = 1.0
-        self.is_fine_mode = False
+        # 실시간 진단 변수 (수동 조작값 기반 테스트용)
+        self.is_diagnosing = False
+        self.diag_start_time = 0
+        self.diag_duration = 3.0 
+        self.diag_data = [] 
 
-        # 화면 표시용 누적값
-        self.acc_rot   = np.zeros(3, dtype=np.float64)
-        self.acc_trans = np.zeros(3, dtype=np.float64)
+        self.init_ui()
 
-        # ---------------------------------------------------------
-        # 2. UI 패널 구성
-        # ---------------------------------------------------------
+    def init_ui(self):
+        """UI 구성 (마그넷 라인 및 저장 관련 기능 제거)"""
+        main_layout = QtWidgets.QHBoxLayout(self)
+        
+        # [좌측] 이미지 뷰어
+        self.img_view = ImageCanvasViewer(self)
+        main_layout.addWidget(self.img_view, stretch=1)
+
+        # [우측] 컨트롤 패널
         ctrl_panel = QtWidgets.QWidget()
-        ctrl_panel.setFixedWidth(420)
+        ctrl_panel.setFixedWidth(400)
+        vbox = QtWidgets.QVBoxLayout(ctrl_panel)
+        vbox.setAlignment(QtCore.Qt.AlignTop)
+
         ctrl_panel.setStyleSheet("""
-        QWidget { font-family: Segoe UI, Arial; font-size: 20px; }
-        QGroupBox { font-weight: 800; color:#222; border: 2px solid #d9d9d9; border-radius:10px; margin-top: 30px; background:#f7f7f7; padding-top: 15px; }
-        QGroupBox::title { subcontrol-origin: margin; left: 15px; top: 0px; padding: 0 5px; }
-        QPushButton { min-height:40px; border-radius:8px; font-weight:700; background:#e0e0e0; }
+            QWidget { font-family: 'Segoe UI', Arial; font-size: 16px; }
+            QGroupBox { 
+                font-weight: 800; border: 2px solid #b0b0b0; border-radius:8px; 
+                margin-top: 20px; padding-top: 15px; background-color: #f9f9f9;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; top: 0px; padding: 0 5px; }
+            QPushButton { min-height:45px; border-radius:8px; font-weight:bold; border: 1px solid #999; background:#eee; }
+            QPushButton:pressed { background:#ccc; }
         """)
 
-        vbox = QtWidgets.QVBoxLayout(ctrl_panel)
-
-        # (1) Visual Options
+        # (1) Visual Options (마그넷 라인 제거)
         gb_vis = QtWidgets.QGroupBox("1. Visual Options")
-        g_vis = QtWidgets.QGridLayout()
+        g_vis = QtWidgets.QGridLayout(gb_vis)
+        self.chk_grid = QtWidgets.QCheckBox("Purple Grid"); self.chk_grid.setChecked(True)
+        self.chk_bbox = QtWidgets.QCheckBox("Vehicle Box"); self.chk_bbox.setChecked(True)
+        self.chk_raw = QtWidgets.QCheckBox("Raw Radar Pts"); self.chk_raw.setChecked(True)
+        self.chk_noise_filter = QtWidgets.QCheckBox("Noise Filter (<5km/h)"); self.chk_noise_filter.setChecked(True)
         
-        self.chk_grid = QtWidgets.QCheckBox("Mint Grid (1m)")
-        self.chk_grid.setChecked(True)
-        
-        self.chk_bbox = QtWidgets.QCheckBox("Vehicle Box")
-        self.chk_bbox.setChecked(True)
-        
-        self.chk_magnet = QtWidgets.QCheckBox("Magnet Line")
-        self.chk_magnet.setChecked(True)
-        self.chk_magnet.setStyleSheet("color: blue; font-weight: bold;")
-        
-        self.chk_raw = QtWidgets.QCheckBox("Raw Radar Points")
-        self.chk_raw.setChecked(True)
-
-        g_vis.addWidget(self.chk_grid, 0, 0)
-        g_vis.addWidget(self.chk_bbox, 0, 1)
-        g_vis.addWidget(self.chk_magnet, 1, 0)
-        g_vis.addWidget(self.chk_raw, 1, 1)
-        gb_vis.setLayout(g_vis)
+        g_vis.addWidget(self.chk_grid, 0, 0); g_vis.addWidget(self.chk_bbox, 0, 1)
+        g_vis.addWidget(self.chk_raw, 1, 0); g_vis.addWidget(self.chk_noise_filter, 1, 1)
         vbox.addWidget(gb_vis)
 
-        # (2) Step Size
-        gb_step = QtWidgets.QGroupBox("2. Step Size")
-        g_step = QtWidgets.QGridLayout()
-        
-        self.s_deg = QtWidgets.QDoubleSpinBox(); self.s_deg.setValue(0.5)
-        self.s_trans = QtWidgets.QDoubleSpinBox(); self.s_trans.setValue(0.1)
-        self.s_zoom = QtWidgets.QDoubleSpinBox(); self.s_zoom.setValue(1.0)
-        
-        self.s_deg.valueChanged.connect(lambda v: setattr(self, 'deg_step', v))
-        self.s_trans.valueChanged.connect(lambda v: setattr(self, 'trans_step', v))
-        self.s_zoom.valueChanged.connect(lambda v: self._on_zoom_change(v))
+        # (2) Diagnostic Tool (수치 확인용)
+        gb_diag = QtWidgets.QGroupBox("2. Diagnostic")
+        v_diag = QtWidgets.QVBoxLayout(gb_diag)
+        self.btn_diag = QtWidgets.QPushButton("🔍 RUN DIAGNOSTIC (3s)")
+        self.btn_diag.setStyleSheet("background-color: #3498db; color: white;")
+        self.btn_diag.clicked.connect(self._start_diagnostic)
+        self.txt_log = QtWidgets.QPlainTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setStyleSheet("background:#222; color:#0f0; font-family:Consolas; font-size:14px;")
+        self.txt_log.setMinimumHeight(180)
+        v_diag.addWidget(self.btn_diag); v_diag.addWidget(self.txt_log)
+        vbox.addWidget(gb_diag)
 
-        g_step.addWidget(QtWidgets.QLabel("Rot(°)"), 0, 0); g_step.addWidget(self.s_deg, 0, 1)
-        g_step.addWidget(QtWidgets.QLabel("Move(m)"), 1, 0); g_step.addWidget(self.s_trans, 1, 1)
-        g_step.addWidget(QtWidgets.QLabel("Zoom"), 2, 0); g_step.addWidget(self.s_zoom, 2, 1)
-        gb_step.setLayout(g_step)
-        vbox.addWidget(gb_step)
+        L_GRAY, D_GRAY = "#e0e0e0", "#757575"
 
-        # (3) Guide
-        gb_guide = QtWidgets.QGroupBox("Key Guide")
-        l_guide = QtWidgets.QLabel(
-            "ROTATION:\n  Q/A: X-axis (Pitch)\n  W/S: Y-axis (Yaw)\n  E/D: Z-axis (Roll)\n\n"
-            "TRANSLATION:\n  R/F: X-axis (Left/Right)\n  T/G: Y-axis (Fwd/Back)\n  Y/H: Z-axis (Up/Down)\n\n"
-            "Shift + Key: Fine Tuning"
-        )
-        l_guide.setStyleSheet("font-size: 16px; font-family: Consolas;")
-        v_guide = QtWidgets.QVBoxLayout()
-        v_guide.addWidget(l_guide)
-        gb_guide.setLayout(v_guide)
-        vbox.addWidget(gb_guide)
+        # (3) Translation Pad
+        gb_trans = QtWidgets.QGroupBox("3. Translation (0.1m)")
+        t_grid = QtWidgets.QGridLayout(gb_trans)
+        t_grid.addWidget(self._create_btn("FWD ▲ (T)", L_GRAY, lambda: self._move(1, 1)), 0, 1)
+        t_grid.addWidget(self._create_btn("LEFT ◀ (R)", L_GRAY, lambda: self._move(0, 1)), 1, 0)
+        t_grid.addWidget(self._create_btn("RIGHT ▶ (F)", L_GRAY, lambda: self._move(0, -1)), 1, 2)
+        t_grid.addWidget(self._create_btn("BWD ▼ (G)", L_GRAY, lambda: self._move(1, -1)), 2, 1)
+        t_grid.addWidget(self._create_btn("UP ⤒ (Y)", D_GRAY, lambda: self._move(2, 1), "white"), 0, 2)
+        t_grid.addWidget(self._create_btn("DOWN ⤓ (H)", D_GRAY, lambda: self._move(2, -1), "white"), 2, 2)
+        vbox.addWidget(gb_trans)
 
-        # Buttons
-        btn_save = QtWidgets.QPushButton("💾 SAVE Extrinsic")
-        btn_save.setStyleSheet("background-color: #4CAF50; color: white;")
-        btn_save.clicked.connect(self._save_extrinsic)
-        
-        btn_reset = QtWidgets.QPushButton("↺ RESET")
-        btn_reset.setStyleSheet("background-color: #f44336; color: white;")
-        btn_reset.clicked.connect(self._reset_T)
+        # (4) Rotation Pad
+        gb_rot = QtWidgets.QGroupBox("4. Rotation (0.5°)")
+        r_grid = QtWidgets.QGridLayout(gb_rot)
+        r_grid.addWidget(self._create_btn("Pitch+ ⇈ (Q)", L_GRAY, lambda: self._rotate(0, 1)), 0, 1)
+        r_grid.addWidget(self._create_btn("Yaw+ ↶ (W)", L_GRAY, lambda: self._rotate(1, -1)), 1, 0)
+        r_grid.addWidget(self._create_btn("Yaw- ↷ (S)", L_GRAY, lambda: self._rotate(1, 1)), 1, 2)
+        r_grid.addWidget(self._create_btn("Pitch- ⇊ (A)", L_GRAY, lambda: self._rotate(0, -1)), 2, 1)
+        r_grid.addWidget(self._create_btn("Roll+ ↺ (E)", D_GRAY, lambda: self._rotate(2, 1), "white"), 0, 0)
+        r_grid.addWidget(self._create_btn("Roll- ↻ (D)", D_GRAY, lambda: self._rotate(2, -1), "white"), 0, 2)
+        vbox.addWidget(gb_rot)
 
-        vbox.addStretch()
-        vbox.addWidget(btn_save)
-        vbox.addWidget(btn_reset)
+        # (5) Bottom Buttons
+        self.btn_save = QtWidgets.QPushButton("💾 APPLY & SAVE EXTRINSIC")
+        self.btn_save.setStyleSheet("background-color: #4CAF50; color: white; min-height: 50px;")
+        self.btn_save.clicked.connect(self._save_extrinsic)
+        self.btn_reset = QtWidgets.QPushButton("↺ RESET TO INITIAL")
+        self.btn_reset.setStyleSheet("background-color: #f44336; color: white; min-height: 40px;")
+        self.btn_reset.clicked.connect(self._reset_T)
 
-        # ---------------------------------------------------------
-        # 3. Layout & Timer
-        # ---------------------------------------------------------
-        self.img_view = ImageCanvasViewer(self)
-        main_layout = QtWidgets.QHBoxLayout(self)
-        main_layout.addWidget(self.img_view, stretch=1)
-        main_layout.addWidget(ctrl_panel, stretch=0)
+        vbox.addStretch(); vbox.addWidget(self.btn_save); vbox.addWidget(self.btn_reset)
 
-        self._timer = QtCore.QTimer(self)
-        self._timer.timeout.connect(self.update_view)
-        self._timer.start(33)
+        main_layout.addWidget(ctrl_panel)
+        self._timer = QtCore.QTimer(self); self._timer.timeout.connect(self.update_view); self._timer.start(33)
 
+    def _create_btn(self, text, bg_color, func, text_color="black"):
+        btn = QtWidgets.QPushButton(text)
+        btn.setStyleSheet(f"background-color: {bg_color}; color: {text_color}; font-size: 12px;")
+        btn.clicked.connect(func); return btn
+
+    def _move(self, axis, sign):
+        move_vec = np.zeros(3); move_vec[axis] = sign * self.FIXED_MOV
+        self.T_current[:3, 3] += self.T_current[:3, :3] @ move_vec
         self.update_view()
 
-    # -------------------------------------------------------------
-    # [핵심 로직] 박스 중앙(Center) 기준 매칭
-    # -------------------------------------------------------------
+    def _rotate(self, axis, sign):
+        rad = np.deg2rad(sign * self.FIXED_DEG)
+        c, s = np.cos(rad), np.sin(rad)
+        if axis == 0: R_inc = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+        elif axis == 1: R_inc = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+        else: R_inc = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        self.T_current[:3, :3] = self.T_current[:3, :3] @ R_inc
+        self.update_view()
+
+    def keyPressEvent(self, event):
+        k = event.key()
+        if k == QtCore.Qt.Key_Q: self._rotate(0, 1)
+        elif k == QtCore.Qt.Key_A: self._rotate(0, -1)
+        elif k == QtCore.Qt.Key_W: self._rotate(1, -1)
+        elif k == QtCore.Qt.Key_S: self._rotate(1, 1)
+        elif k == QtCore.Qt.Key_E: self._rotate(2, 1)
+        elif k == QtCore.Qt.Key_D: self._rotate(2, -1)
+        elif k == QtCore.Qt.Key_R: self._move(0, 1)
+        elif k == QtCore.Qt.Key_F: self._move(0, -1)
+        elif k == QtCore.Qt.Key_T: self._move(1, 1)
+        elif k == QtCore.Qt.Key_G: self._move(1, -1)
+        event.accept()
+
     def update_view(self):
+        """수동창 시각화 (마그넷 라인 제거)"""
         try:
-            # 1. 데이터 가져오기 (latest_frame 사용)
-            if self.gui.latest_frame is None: return
-            raw_img = self.gui.latest_frame.get("cv_image")
+            if self.gui.latest_frame is None or self.gui.cam_K is None: return
+            raw_img, pts_r, dops = self.gui.latest_frame.get("cv_image"), self.gui.latest_frame.get("radar_points"), self.gui.latest_frame.get("radar_doppler")
             if raw_img is None: return
 
-            # 레이더 데이터
-            pts_r = self.gui.latest_frame.get("radar_points")
-            dops  = self.gui.latest_frame.get("radar_doppler")
-
             disp = raw_img.copy()
-            h, w = disp.shape[:2]
-            
             K = self.gui.cam_K
-            if K is None: return
-            cx, cy = K[0, 2], K[1, 2]
 
-            # 2. 재투영 (T_current 반영)
-            uvs_man, valid_man = None, None
-            num_points = 0
+            # 수동 조작값 기반 투영
+            uvs_man, valid_man = project_points(K, self.T_current[:3, :3], self.T_current[:3, 3], pts_r)
 
-            if pts_r is not None and len(pts_r) > 0:
-                num_points = len(pts_r)
-                uvs_man, valid_man = project_points(K, self.T_current[:3, :3], self.T_current[:3, 3], pts_r)
-
-            # 3. 그리드 (민트색, 1m)
             if self.chk_grid.isChecked():
-                self._draw_grid_and_axis(disp, K, cx, cy)
+                self._draw_grid_and_axis(disp, K, K[0, 2], K[1, 2])
 
-            # 4. 차량 박스 & 대표점 매칭 (중앙 기준)
             if self.chk_bbox.isChecked() and self.gui.vis_objects:
                 for obj in self.gui.vis_objects:
                     x1, y1, x2, y2 = obj['bbox']
-                    # 차량 박스 (녹색)
                     cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    
-                    # [수정됨] 타겟 포인트: 박스 정중앙 (Center)
-                    # 기존 상단(y1)에서 중앙((y1+y2)/2)으로 변경
-                    target_pt = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
-                    
-                    rep_pt = None
-                    
-                    if uvs_man is not None:
-                        # 1) 박스 내부 점 필터링
-                        in_box = (valid_man & 
-                                  (uvs_man[:, 0] >= x1) & (uvs_man[:, 0] <= x2) & 
-                                  (uvs_man[:, 1] >= y1) & (uvs_man[:, 1] <= y2))
-                        idxs = np.where(in_box)[0]
 
-                        if idxs.size > 0:
-                            curr_pts = uvs_man[idxs]
-                            
-                            # 2) [핵심] 중앙점(target_pt)과 레이더 점들 사이의 거리 계산
-                            dists = np.hypot(curr_pts[:, 0] - target_pt[0], curr_pts[:, 1] - target_pt[1])
-                            
-                            # 3) 중앙에 가장 가까운 상위 K개 점만 선택 (K=3)
-                            # 이렇게 하면 "중앙"에 뭉쳐있는 레이더 점을 대표점으로 사용하게 됨
-                            k = min(len(dists), 3)
-                            sorted_indices = np.argsort(dists)
-                            closest_indices = sorted_indices[:k]
-                            
-                            # 4) 선택된 점들의 평균 좌표 -> 대표점(노란점)
-                            best_pts = curr_pts[closest_indices]
-                            u_mean = np.mean(best_pts[:, 0])
-                            v_mean = np.mean(best_pts[:, 1])
-                            
-                            rep_pt = (int(u_mean), int(v_mean))
-
-                    # 시각화
-                    if rep_pt is not None:
-                        tgt_pt_int = (int(target_pt[0]), int(target_pt[1]))
-                        
-                        # 노란점(레이더), 하늘색점(영상 타겟)
-                        cv2.circle(disp, rep_pt, 5, (0, 255, 255), -1) 
-                        cv2.circle(disp, tgt_pt_int, 4, (255, 255, 0), -1)
-                        
-                        # 마그넷 라인 (중앙 <-> 레이더 중앙)
-                        if self.chk_magnet.isChecked():
-                            err = np.hypot(rep_pt[0]-tgt_pt_int[0], rep_pt[1]-tgt_pt_int[1])
-                            # 가까우면 초록, 멀면 빨강
-                            col = (0, 0, 255) if err > 20 else (0, 255, 0)
-                            cv2.line(disp, tgt_pt_int, rep_pt, col, 2)
-
-            # 5. Raw Points 표시
             if self.chk_raw.isChecked() and uvs_man is not None:
                 for i in range(len(uvs_man)):
                     if not valid_man[i]: continue
-                    u = (uvs_man[i, 0] - cx) * self.radar_zoom + cx
-                    v = (uvs_man[i, 1] - cy) * self.radar_zoom + cy
-                    
-                    if not (0 <= u < w and 0 <= v < h): continue
-                    
                     vel = dops[i] if (dops is not None and i < len(dops)) else 0.0
-                    # 접근(빨강), 이탈(파랑), 정지(초록)
-                    if vel < -0.5: c = (0, 0, 255)
-                    elif vel > 0.5: c = (255, 0, 0)
-                    else: c = (0, 255, 0)
+                    if self.chk_noise_filter.isChecked() and abs(vel) < 1.4: continue
+                    color = (0, 0, 255) if vel < -0.5 else (255, 0, 0) if vel > 0.5 else (0, 255, 0)
+                    cv2.circle(disp, (int(uvs_man[i, 0]), int(uvs_man[i, 1])), 3, color, -1)
 
-                    cv2.circle(disp, (int(u), int(v)), 4, c, -1)
-
-            # 디버그 텍스트
-            cv2.putText(disp, f"Radar Pts: {num_points}", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
+            if self.is_diagnosing and (time.time() - self.diag_start_time > 3.0): self._finish_diagnostic()
             self.img_view.update_image(disp)
+        except Exception: pass
 
-        except Exception as e:
-            print(f"[ManualCalib] Error: {e}")
-
-    # -------------------------------------------------------------
-    # Grid & Axis
-    # -------------------------------------------------------------
     def _draw_grid_and_axis(self, img, K, cx, cy):
-        # Axis
-        pts_axis = np.array([[0,0,0], [3,0,0], [0,3,0], [0,0,3]])
-        uvs, valid = project_points(K, self.T_current[:3,:3], self.T_current[:3,3], pts_axis)
-        
-        if valid[0]:
-            o = (int((uvs[0,0]-cx)*self.radar_zoom+cx), int((uvs[0,1]-cy)*self.radar_zoom+cy))
-            cols = [(0,0,255), (0,255,0), (255,0,0)]
-            for i in range(1, 4):
-                if valid[i]:
-                    p = (int((uvs[i,0]-cx)*self.radar_zoom+cx), int((uvs[i,1]-cy)*self.radar_zoom+cy))
-                    cv2.arrowedLine(img, o, p, cols[i-1], 3)
+        grid_z = -1.5; purple = (255, 0, 255)
+        for x in np.arange(-15, 16, 3): self._draw_safe_line(img, [x, 0, grid_z], [x, 100, grid_z], K, cx, cy, purple)
+        for y in range(0, 101, 10): self._draw_safe_line(img, [-15, y, grid_z], [15, y, grid_z], K, cx, cy, purple)
 
-        # Mint Grid (1m)
-        grid_z = -1.5
-        lines = []
-        for x in range(-20, 21, 1):
-            lines.append([[x, 0, grid_z], [x, 80, grid_z]])
-        for y in range(0, 81, 1):
-            lines.append([[-20, y, grid_z], [20, y, grid_z]])
-            
-        mint_color = (180, 255, 180)
-        
-        for p_start, p_end in lines:
-            pts = np.array([p_start, p_end])
-            uvs, valid = project_points(K, self.T_current[:3,:3], self.T_current[:3,3], pts)
-            if valid[0] and valid[1]:
-                p1 = (int((uvs[0,0]-cx)*self.radar_zoom+cx), int((uvs[0,1]-cy)*self.radar_zoom+cy))
-                p2 = (int((uvs[1,0]-cx)*self.radar_zoom+cx), int((uvs[1,1]-cy)*self.radar_zoom+cy))
-                cv2.line(img, p1, p2, mint_color, 1)
-
-    # -------------------------------------------------------------
-    # Keyboard Controls
-    # -------------------------------------------------------------
-    def keyPressEvent(self, event):
-        k = event.key()
-        mod = event.modifiers()
-        self.is_fine_mode = (mod & Qt.ShiftModifier)
-        d_deg = 0.1 if self.is_fine_mode else self.deg_step
-        d_mov = 0.01 if self.is_fine_mode else self.trans_step
-
-        if k == Qt.Key_Q: self._adjust_rot(0, 1, d_deg)
-        elif k == Qt.Key_A: self._adjust_rot(0, -1, d_deg)
-        elif k == Qt.Key_W: self._adjust_rot(1, 1, d_deg)
-        elif k == Qt.Key_S: self._adjust_rot(1, -1, d_deg)
-        elif k == Qt.Key_E: self._adjust_rot(2, 1, d_deg)
-        elif k == Qt.Key_D: self._adjust_rot(2, -1, d_deg)
-        elif k == Qt.Key_R: self._adjust_trans(0, 1, d_mov)
-        elif k == Qt.Key_F: self._adjust_trans(0, -1, d_mov)
-        elif k == Qt.Key_T: self._adjust_trans(1, 1, d_mov)
-        elif k == Qt.Key_G: self._adjust_trans(1, -1, d_mov)
-        elif k == Qt.Key_Y: self._adjust_trans(2, 1, d_mov)
-        elif k == Qt.Key_H: self._adjust_trans(2, -1, d_mov)
-        elif k == Qt.Key_Z: self._on_zoom_change(self.radar_zoom - 0.1)
-        elif k == Qt.Key_X: self._on_zoom_change(self.radar_zoom + 0.1)
-        
-        self.update_view()
-
-    def _adjust_rot(self, axis, sign, step):
-        rad = np.deg2rad(sign * step)
-        c, s = np.cos(rad), np.sin(rad)
-        if axis == 0: R_inc = np.array([[1,0,0],[0,c,-s],[0,s,c]])
-        elif axis == 1: R_inc = np.array([[c,0,s],[0,1,0],[-s,0,c]])
-        else: R_inc = np.array([[c,-s,0],[s,c,0],[0,0,1]])
-        self.T_current[:3, :3] = self.T_current[:3, :3] @ R_inc
-        self.acc_rot[axis] += sign * step
-
-    def _adjust_trans(self, axis, sign, step):
-        move_vec = np.zeros(3); move_vec[axis] = sign * step
-        d_cam = self.T_current[:3, :3] @ move_vec
-        self.T_current[:3, 3] += d_cam
-        self.acc_trans[axis] += sign * step
-
-    def _on_zoom_change(self, val):
-        self.radar_zoom = max(0.1, min(5.0, val))
-        self.s_zoom.blockSignals(True)
-        self.s_zoom.setValue(self.radar_zoom)
-        self.s_zoom.blockSignals(False)
-
-    def _reset_T(self):
-        self.T_current = self.T_init.copy()
-        self.acc_rot[:] = 0; self.acc_trans[:] = 0
-        self.update_view()
+    def _draw_safe_line(self, img, p1, p2, K, cx, cy, color):
+        pts = np.vstack([p1, p2]); uv, v = project_points(K, self.T_current[:3,:3], self.T_current[:3,3], pts)
+        if v[0] and v[1]: cv2.line(img, (int(uv[0,0]), int(uv[0,1])), (int(uv[1,0]), int(uv[1,1])), color, 1)
 
     def _save_extrinsic(self):
         data = { "R": self.T_current[:3, :3].tolist(), "t": self.T_current[:3, 3].flatten().tolist() }
-        try:
-            with open(self.gui.extrinsic_path, 'w') as f:
-                json.dump(data, f, indent=4)
-            QtWidgets.QMessageBox.information(self, "Success", "Extrinsic parameters saved!")
-            self.gui.load_extrinsic()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", str(e))
+        with open(self.gui.extrinsic_path, 'w') as f: json.dump(data, f, indent=4)
+        self.gui.load_extrinsic(); self.close()
 
-    def closeEvent(self, e):
-        self._timer.stop()
-        super().closeEvent(e)
-        
+    def _reset_T(self): 
+        self.T_current = self.T_init.copy(); self.update_view()
+        self.txt_log.appendPlainText(">>> Reset to initial values.")
+
+    def _start_diagnostic(self):
+        self.is_diagnosing, self.diag_start_time, self.diag_data = True, time.time(), []
+        self.btn_diag.setEnabled(False); self.txt_log.setPlainText("Analyzing manual adjustment (3s)...")
+
+    def _finish_diagnostic(self):
+        self.is_diagnosing = False; self.btn_diag.setEnabled(True)
+        if not self.diag_data: self.txt_log.setPlainText("No data captured."); return
+        far = [d for d in self.diag_data if d['dist'] >= 40.0]
+        if len(far) > 3:
+            au, av = np.mean([d['err_u'] for d in far]), np.mean([d['err_v'] for d in far])
+            cp, cy = int(round(av/15.0)), int(round(au/12.0))
+            self.txt_log.setPlainText(f"📋 [Diagnostic]\nPitch: {'Q' if cp>0 else 'A'} x{abs(cp)}\nYaw: {'S' if cy>0 else 'W'} x{abs(cy)}")
+        else: self.txt_log.setPlainText("Increase distance data (>40m).")
+
+    def closeEvent(self, e): self._timer.stop(); super().closeEvent(e)
+
+
 # ==============================================================================
 # Main GUI - [수정됨: 우측 패널 상단 세로 로고 배치, 전체화면]
 # ==============================================================================
@@ -833,6 +728,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.cv_image = None
         self.radar_points = None
         self.radar_doppler = None
+        self.last_radar_pts = None
+        self.last_radar_dop = None
+        self.last_radar_ts = 0.0
+        self.radar_hold_threshold = 0.06
         self.cam_K = None
         self.lane_polys = {}
         self.Extr_R = np.eye(3)
@@ -842,13 +741,17 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.assoc_last_update_time = 0.0
         self.lane_counters = {name: 0 for name in ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]}
         self.global_to_local_ids = {}
+        self.vehicle_lane_paths = {}
         self.extrinsic_mtime = None
         self.extrinsic_last_loaded = None
         self.rep_pt_mem = {} 
+        self.track_confirmed_cnt = {}
         self.pt_alpha = 0.15
         self.vel_gate_mps = 1.5 
         self.spatial_weight_sigma = 30.0 
         self.min_pts_for_rep = 2
+        self.kf_vel = {}  # 차량 ID별 속도 칼만 필터 딕셔너리
+        self.kf_score = {} # 차량 ID별 점수 칼만 필터 (점수 급락 방지용)
 
         # ---------------- Speed estimation memory / smoothing ----------------
         self.vel_memory = {}
@@ -862,6 +765,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self._speed_frame_counter = 0
         self.speed_hard_max_kmh = 280.0
         self.speed_soft_max_kmh = 100.0
+
+        # Data Recording Buffer
+        self.is_recording = False
+        self.record_buffer = []
 
         # Buffer for the latest synchronized frame
         self.latest_frame = None
@@ -1059,8 +966,37 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_lane.setLayout(v_l)
         vbox.addWidget(gb_lane)
 
-        # 4. View Options
-        gb_vis = QtWidgets.QGroupBox("4. View Options")
+        # 4. Data Logging
+        gb_logging = QtWidgets.QGroupBox("4. Data Logging")
+        v_log = QtWidgets.QVBoxLayout()
+        v_log.setSpacing(10)
+
+        self.btn_main_record = QtWidgets.QPushButton("🔴 START MAIN RECORDING")
+        self.btn_main_record.setCheckable(True)
+        # 연한 초록색(#CCFFCC) 기본 스타일 설정
+        self.btn_main_record.setStyleSheet("""
+            QPushButton { 
+                min-height: 50px; font-size: 20px; 
+                background-color: #CCFFCC; border: 1px solid #999; 
+            }
+            QPushButton:checked { 
+                background-color: #FFCCCC; color: red; border: 2px solid red; 
+            }
+        """)
+        self.btn_main_record.clicked.connect(self._toggle_recording)
+
+        self.lbl_record_status = QtWidgets.QLabel("Status: Ready")
+        self.lbl_record_status.setAlignment(Qt.AlignCenter)
+        self.lbl_record_status.setStyleSheet("font-size: 16px; color: #555; font-weight: bold;")
+
+        v_log.addWidget(self.btn_main_record)
+        v_log.addWidget(self.lbl_record_status)
+        gb_logging.setLayout(v_log)
+        
+        vbox.addWidget(gb_logging) # 4번 섹션으로 추가
+
+        # 5. View Options
+        gb_vis = QtWidgets.QGroupBox("5. View Options")
         v_vis = QtWidgets.QVBoxLayout()
         self.chk_show_poly = QtWidgets.QCheckBox("Show Lane Polygons"); self.chk_show_poly.setChecked(False)
         
@@ -1092,8 +1028,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_vis.setLayout(v_vis)
         vbox.addWidget(gb_vis)
 
-        # 5. Radar Speed Filters
-        gb_radar_f = QtWidgets.QGroupBox("5. Radar Speed Filters")
+        # 6. Radar Speed Filters
+        gb_radar_f = QtWidgets.QGroupBox("6. Radar Speed Filters")
         v_rf = QtWidgets.QVBoxLayout()
         self.chk_show_approach = QtWidgets.QCheckBox("Approaching (+)")
         self.chk_show_approach.setChecked(True)
@@ -1126,8 +1062,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_radar_f.setLayout(v_rf)
         vbox.addWidget(gb_radar_f)
 
-        # 6. Image Brightness
-        gb_brightness = QtWidgets.QGroupBox("6. Image Brightness")
+        # 7. Image Brightness
+        gb_brightness = QtWidgets.QGroupBox("7. Image Brightness")
         v_b = QtWidgets.QVBoxLayout()
         self.chk_brightness = QtWidgets.QCheckBox("Enable Brightness Gain")
         self.chk_brightness.setChecked(False)
@@ -1160,6 +1096,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
     def reset_ids(self):
         self.lane_counters = {name: 0 for name in self.lane_counters.keys()}
         self.global_to_local_ids = {}
+        self.vehicle_lane_paths = {}
 
     def _update_brightness_params(self):
         if not hasattr(self, "chk_brightness") or not hasattr(self, "spin_brightness_gain"):
@@ -1171,6 +1108,103 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             rospy.set_param(BRIGHTNESS_PARAM_GAIN, gain)
         except Exception as e:
             print(f"Brightness Param Error: {e}")
+
+    def _toggle_recording(self):
+        """기록 시작/중단 토글 및 스타일 제어"""
+        if self.btn_main_record.isChecked():
+            # 저장 중 상태 (연한 빨간색은 QSS에서 처리됨)
+            self.is_recording = True
+            self.record_buffer = [] 
+            self.btn_main_record.setText("⏹ STOP & SAVE DATA")
+            self.lbl_record_status.setText("Status: Recording...")
+        else:
+            # 저장 대기 상태 (연한 초록색은 QSS에서 처리됨)
+            self.is_recording = False
+            self.btn_main_record.setText("🔴 START MAIN RECORDING")
+            self._save_sequential_data()
+
+    def _save_sequential_data(self):
+        """순차적 폴더(1, 2, 3...) 생성 및 데이터 저장 (수정됨)"""
+        if not self.record_buffer:
+            self.lbl_record_status.setText("Status: No Data Collected")
+            return
+
+        try:
+            # 1. 상위 로그 폴더 확인 및 생성
+            if not os.path.exists(LOG_BASE_DIR):
+                os.makedirs(LOG_BASE_DIR)
+            
+            # 2. 숫자 폴더 중 가장 큰 값 찾아 다음 번호 결정
+            existing = [d for d in os.listdir(LOG_BASE_DIR) if d.isdigit()]
+            if existing:
+                next_num = max([int(d) for d in existing]) + 1
+            else:
+                next_num = 1
+            
+            target_dir = os.path.join(LOG_BASE_DIR, str(next_num))
+            os.makedirs(target_dir, exist_ok=True)
+
+            df = pd.DataFrame(self.record_buffer)
+            
+            # [저장 1] Raw 데이터 저장
+            # 모든 프레임 단위 데이터를 저장합니다.
+            raw_path = os.path.join(target_dir, "raw_main.csv")
+            df.to_csv(raw_path, index=False)
+            
+            # [저장 2] ID별 분석 데이터 (Local_No와 Lane_Path 조합)
+            # - 요구사항: 같은 ID라도 차선 경로(IN1->IN2)가 다르면 구분해야 함.
+            # - Unique_Key 컬럼을 기준으로 그룹핑하여 통계 산출
+            if "Unique_Key" in df.columns:
+                stats_id = df.groupby("Unique_Key").agg({
+                    "Local_ID": "first",
+                    "Lane_Path": "first",
+                    "Final_Lane": "last",
+                    "Radar_Dist": ["count", "mean", "min", "max"],
+                    "Radar_Vel": "mean",
+                    "Track_Vel": "mean",
+                    "Score": "mean"
+                }).reset_index()
+                
+                # 컬럼명 정리 (MultiIndex 해제)
+                stats_id.columns = [
+                    'Unique_Key', 'Local_ID', 'Lane_Path', 'Final_Lane', 
+                    'Count', 'Mean_Dist', 'Min_Dist', 'Max_Dist', 
+                    'Mean_Radar_Vel', 'Mean_Track_Vel', 'Mean_Score'
+                ]
+                
+                id_path = os.path.join(target_dir, "id_analysis.csv")
+                stats_id.to_csv(id_path, index=False)
+
+            # [저장 3] 거리별 오차 분석용 데이터 (Binning)
+            # - 10m 단위로 거리를 구간화하여 통계 저장
+            # - GT가 없으므로 Radar 속도와 Track 속도 분포를 확인
+            if "Radar_Dist" in df.columns:
+                df["Dist_Bin"] = (df["Radar_Dist"] // 10) * 10
+                stats_dist = df.groupby("Dist_Bin").agg({
+                    "Radar_Vel": ["count", "mean", "std"],
+                    "Track_Vel": ["mean", "std"],
+                    "Score": "mean"
+                }).reset_index()
+                
+                stats_dist.columns = [
+                    'Dist_Bin_m', 
+                    'Count', 'Radar_Vel_Mean', 'Radar_Vel_Std',
+                    'Track_Vel_Mean', 'Track_Vel_Std', 
+                    'Score_Mean'
+                ]
+                
+                dist_path = os.path.join(target_dir, "dist_analysis.csv")
+                stats_dist.to_csv(dist_path, index=False)
+
+            self.lbl_record_status.setText(f"Status: Saved in Folder {next_num}")
+            print(f"[Data Log] Saved to {target_dir}")
+            
+            self.record_buffer = [] # 버퍼 초기화
+            
+        except Exception as e:
+            self.lbl_record_status.setText("Status: Error")
+            print(f"Save failed: {e}")
+            traceback.print_exc()
 
     # ------------------ Callback (Synchronized) ------------------
     def cb_sync(self, img_msg, radar_msg):
@@ -1290,6 +1324,21 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             dop_raw = self.latest_frame.get("radar_doppler")
             if dop_raw is None: dop_raw = self.latest_frame.get("dop")
 
+            now = time.time()
+            if pts_raw is not None and len(pts_raw) > 0:
+                # 1. 새로운 유효 데이터가 들어온 경우 -> 메모리 업데이트
+                self.last_radar_pts = pts_raw
+                self.last_radar_dop = dop_raw
+                self.last_radar_ts = now
+            else:
+                # 2. 데이터가 없는 경우 -> 60ms 이내의 최신 데이터가 있다면 복구
+                if self.last_radar_pts is not None:
+                    time_elapsed = now - self.last_radar_ts
+                    if time_elapsed < self.radar_hold_threshold:
+                        pts_raw = self.last_radar_pts
+                        dop_raw = self.last_radar_dop
+                        # print(f"[Hold] Using cached radar data ({time_elapsed*1000:.1f}ms old)")
+
             if self.cv_image is None: return
 
             disp = self.cv_image.copy()
@@ -1325,11 +1374,26 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             now_ts = time.time()
 
             # 4. 객체별 데이터 처리 루프
+            confirmed_objects = [] # 실제로 2초 이상 검증된 객체들만 담을 리스트
+            
             for obj in self.vis_objects:
+                g_id = obj['id']
+                
+                # 연속 감지 카운트 업데이트
+                self.track_confirmed_cnt[g_id] = self.track_confirmed_cnt.get(g_id, 0) + 1
+                
+                # 2초(30 FPS * 2 = 60프레임) 미만으로 감지된 객체는 무시 (반사광 박스 제거)
+                if self.track_confirmed_cnt[g_id] < 20:
+                    continue
+                
+                confirmed_objects.append(obj)
+                
+            # 검증된 객체들로 다시 루프 수행
+            for obj in confirmed_objects:
                 g_id = obj['id']
                 x1, y1, x2, y2 = obj['bbox']
                 
-                # 차선 필터링
+                # 1. 차선 필터링 (기존 로직 유지)
                 cx, cy = (x1 + x2) // 2, y2
                 target_lane = None
                 if has_lane_filter:
@@ -1340,12 +1404,42 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     if target_lane is None:
                         continue
 
-                # ID 관리
+                # 차선 변경 경로 추적 로직 (IN1 -> IN1->IN2)
+                curr_lane_str = str(target_lane) if target_lane else 'None'
+                
+                if g_id not in self.vehicle_lane_paths:
+                    # 처음 발견된 차량인 경우 현재 차선 기록
+                    self.vehicle_lane_paths[g_id] = curr_lane_str
+                else:
+                    # 기존 차량의 마지막 기록된 차선 추출
+                    path_parts = self.vehicle_lane_paths[g_id].split("->")
+                    last_lane = path_parts[-1]
+                    
+                    # 차선이 변경되었고, 유효한 차선인 경우에만 경로 업데이트
+                    if curr_lane_str != last_lane and curr_lane_str != 'None':
+                        self.vehicle_lane_paths[g_id] += f"->{curr_lane_str}"
+                
+                # 현재 차량 객체에 전체 경로 정보 저장 (수동창 저장 시 사용)
+                lane_path = self.vehicle_lane_paths[g_id]
+                obj['lane_path'] = lane_path
+                obj['lane'] = curr_lane_str # 현재 시점의 차선 정보 명시
+
+                # 2. ID 관리 및 라벨 생성
                 if target_lane and g_id not in self.global_to_local_ids:
+                    # 해당 차선에 처음 진입한 순서대로 번호 부여
                     self.lane_counters[target_lane] += 1
                     self.global_to_local_ids[g_id] = self.lane_counters[target_lane]
-                label = f"No: {self.global_to_local_ids.get(g_id, g_id)} ({target_lane})" if target_lane else f"ID: {g_id}"
                 
+                local_no = self.global_to_local_ids.get(g_id, g_id)
+                
+                # 라벨 표시: 번호와 경로를 함께 보여주어 식별 용이하게 수정
+                if "->" in lane_path:
+                    # 차선 변경 이력이 있는 경우 경로 전체 표시
+                    label = f"No: {local_no} ({lane_path})"
+                else:
+                    # 변경 이력이 없는 경우 현재 차선만 표시
+                    label = f"No: {local_no} ({target_lane})" if target_lane else f"ID: {g_id}"
+
                 # =============================================================
                 # [수정 포인트 1] 타겟 포인트를 '박스 정중앙'으로 변경
                 # (가려짐 발생 시 BBox가 줄어들므로, 줄어든 박스의 중앙 = 지붕 중앙)
@@ -1356,6 +1450,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 rep_pt = None
                 rep_vel_raw = None
                 score = 0
+                radar_dist = -1.0 # 거리 저장용 변수 초기화
 
                 # --- 속도 추정 ---
                 if proj_uvs is not None and dop_raw is not None:
@@ -1393,6 +1488,17 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                             best_pts = current_pts[closest_indices]
                             meas_u = np.mean(best_pts[:, 0])
                             meas_v = np.mean(best_pts[:, 1])
+
+                            # [거리 계산 추가]
+                            # 선택된 레이더 포인트들의 3D 거리 평균 (Camera 기준 Distance)
+                            if pts_raw is not None:
+                                best_3d_indices = target_idxs[closest_indices]
+                                best_3d_pts = pts_raw[best_3d_indices]
+                                # 원점(0,0,0)에서의 거리 (레이더 좌표계 기준)
+                                # Extr_t가 있다면 카메라 좌표계로 변환해야 하지만, 
+                                # 일반적으로 레이더 원점 거리나 카메라 원점 거리는 비슷하므로 레이더 점 자체 Norm 사용
+                                best_dists_3d = np.linalg.norm(best_3d_pts, axis=1)
+                                radar_dist = np.mean(best_dists_3d)
                             
                             # 속도는 해당 점들의 중앙값 사용
                             rep_vel_raw = np.median(dop_raw[target_idxs[closest_indices]]) * 3.6
@@ -1421,76 +1527,115 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                             score = max(0, min(100, 100 - (err_ratio * 200)))
                             acc_scores.append(score)
 
-                # --- [강화된 속도 필터링 v2] ---
-                # 1) Hard Limit Filter: 상한선을 120km/h로 낮춤 (130, 127 차단)
+                # --- [강화된 속도 필터링 v3: 정지 대응 및 Jitter 억제] ---
+                # 1) Hard Limit Filter: 상한선 120km/h
                 if meas_kmh is not None:
                     if abs(meas_kmh) > 120.0:  
                         meas_kmh = None
 
                 mem = self.vel_memory.get(g_id, {})
-                last_vel = mem.get("vel_kmh")
-                last_ts = mem.get("ts", -1.0)
-                fail_cnt = mem.get("fail_count", 0) # 연속 실패 횟수 가져오기
+                last_vel = mem.get("vel_kmh", 0.0)
+                last_ts = mem.get("ts", now_ts)
+                fail_cnt = mem.get("fail_count", 0)
                 
-                # 2) Jump Filter with Recovery (락다운 방지 로직)
-                JUMP_THRESHOLD = 10.0  # 사용자 설정 (10km/h 차이)
-                
-                if meas_kmh is not None and last_vel is not None:
+                # 2) Jump Filter with Recovery (락다운 방지)
+                JUMP_THRESHOLD = 15.0 # 반응성을 위해 임계값 약간 상향
+                if meas_kmh is not None and last_vel > 5.0: # 어느 정도 속도가 있을 때만 점프 체크
                     diff = abs(meas_kmh - last_vel)
-                    
                     if diff > JUMP_THRESHOLD:
-                        # 차이가 크면 일단 카운트 증가
                         fail_cnt += 1
-                        
-                        # [핵심] 연속으로 5번 이상(약 0.15초) 차이가 난다면?
-                        # -> "내 메모리가 틀렸거나 차가 급가감속 중이다" -> 새로운 값 수용
-                        if fail_cnt > 5:
-                            # print(f"Recovering ID:{g_id} {last_vel}->{meas_kmh}")
-                            fail_cnt = 0 # 리셋하고 현재 값(meas_kmh) 허용
+                        if fail_cnt > 5: # 5회 이상 지속되면 실제 가감속으로 판단
+                            fail_cnt = 0 
                         else:
-                            # 아직은 노이즈로 간주하고 무시
                             meas_kmh = None 
                     else:
-                        # 정상 범위 내라면 카운트 초기화
                         fail_cnt = 0
                 else:
-                    # 비교 대상이 없으면 카운트 0
                     fail_cnt = 0
 
-                # --- 스무딩 (EMA) ---
-                vel_out = None
-                
-                if meas_kmh is not None:
-                    # 정상 업데이트
-                    alpha = self.spin_ema_alpha.value()
-                    prev = mem.get("ema", meas_kmh)
-                    vel_out = (alpha * meas_kmh) + ((1.0 - alpha) * prev)
-                    
-                    mem["ema"] = vel_out
-                    mem["vel_kmh"] = vel_out
-                    mem["ts"] = now_ts
-                    mem["fail_count"] = 0 # 성공했으므로 실패 카운트 0 저장
-                    self.vel_memory[g_id] = mem
-                    
-                elif last_vel is not None and (now_ts - last_ts) <= 2.0:
-                    # 데이터가 튀어서(None) 들어왔을 때, 이전 값 유지
-                    # 단, 실패 카운트는 저장해둬야 다음 루프에서 누적됨
-                    mem["fail_count"] = fail_cnt 
-                    self.vel_memory[g_id] = mem
-                    vel_out = last_vel
+                # --- 칼만 필터 기반 추정 (성격 분리) ---
+                # 1) 필터 생성/초기화
+                if g_id not in self.kf_vel:
+                    # 속도 필터: 기민한 반응을 위해 Q를 높이고 R을 낮게 설정
+                    self.kf_vel[g_id] = ScalarKalman(x0=meas_kmh if meas_kmh is not None else 0.0, Q=0.8, R=5.0)
+                    # 점수 필터: 매끄러운 곡선을 위해 R을 극단적으로 높이고 Q를 낮게 설정
+                    self.kf_score[g_id] = ScalarKalman(x0=score if score > 0 else 80.0, Q=0.001, R=500.0)
 
-                if meas_kmh is not None:
-                    alpha = self.spin_ema_alpha.value()
-                    prev = mem.get("ema", meas_kmh)
-                    vel_out = (alpha * meas_kmh) + ((1.0 - alpha) * prev)
-                    mem["ema"] = vel_out
-                    mem["vel_kmh"] = vel_out
-                    mem["ts"] = now_ts
-                    self.vel_memory[g_id] = mem
-                elif last_vel is not None and (now_ts - last_ts) <= 5.0:
-                    vel_out = last_vel
+                kf_v = self.kf_vel[g_id]
+                kf_s = self.kf_score[g_id]
 
+                # 2) 예측(Predict) 단계
+                v_pred = kf_v.predict()
+                s_pred = kf_s.predict()
+
+                # 3) 업데이트(Update) 및 정지 대응 로직
+                if meas_kmh is not None:
+                    # [추가] 저속 구간 강제 정지: 4km/h 미만은 노이즈로 보고 0으로 처리
+                    if abs(meas_kmh) < 4.0:
+                        meas_kmh = 0.0
+                        
+                    vel_out = kf_v.update(meas_kmh)
+                    score_out = kf_s.update(score)
+                    
+                    self.vel_memory[g_id] = {
+                        "vel_kmh": vel_out, 
+                        "ts": now_ts, 
+                        "fail_count": fail_cnt,
+                        "score": score_out
+                    }
+                else:
+                    # 레이더 수신 실패 (Coasting 구간)
+                    time_gap = now_ts - last_ts
+                    
+                    if time_gap > 0.5:
+                        # 0.5초 이상 데이터가 없으면 레이더가 놓친 것이 아니라 멈춘 것으로 판단
+                        vel_out = 0.0
+                    elif time_gap > 0.1:
+                        # [공격적 감쇄] 0.75를 곱해 이전보다 훨씬 빠르게 0으로 수렴시킴
+                        vel_out = v_pred * 0.75 
+                    else:
+                        vel_out = v_pred
+
+                    # 최종 컷오프: 감쇄 중에도 5km/h 이하로 떨어지면 즉시 0
+                    if vel_out < 5.0: 
+                        vel_out = 0.0
+                        
+                    score_out = s_pred * 0.998 # 점수는 끊김 없이 아주 부드럽게 유지
+                    
+                    # 메모리 유지 (실패 카운트만 업데이트)
+                    mem["fail_count"] = fail_cnt
+                    self.vel_memory[g_id] = mem
+
+                # 점수가 바닥나면(차량이 사라지면) 0점 처리
+                if score_out < 10: 
+                    score_out = 0
+                    vel_out = None
+
+                # 최종 결과 반영
                 obj['vel'] = round(vel_out, 1) if vel_out is not None else float('nan')
+                score = score_out # 로깅을 위해 score 변수 최신화
+
+                # 최종 결과 반영
+                obj['vel'] = round(vel_out, 1) if vel_out is not None else float('nan')
+                score = score_out # UI 표시 및 로깅용 점수 갱신
+                
+                # --- [DATA LOGGING] ---
+                # 기록 모드일 때만 버퍼에 추가
+                if self.is_recording:
+                    data_row = {
+                        "Time": now_ts,
+                        "Global_ID": g_id,
+                        "Local_ID": local_no,
+                        "Lane_Path": lane_path,   # e.g., "IN1->IN2"
+                        "Final_Lane": curr_lane_str,
+                        # 고유 키: ID와 Lane Path를 조합 (IN1->IN2 차량과 IN2 차량 구분)
+                        "Unique_Key": f"{local_no}({lane_path})",
+                        "Radar_Dist": radar_dist,
+                        "Radar_Vel": meas_kmh if meas_kmh is not None else np.nan,
+                        "Track_Vel": vel_out if vel_out is not None else np.nan,
+                        "Score": score
+                    }
+                    self.record_buffer.append(data_row)
 
                 draw_items.append({
                     "obj": obj, "bbox": (x1, y1, x2, y2), "label": label,
@@ -1502,6 +1647,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 avg = sum(acc_scores) / len(acc_scores)
                 self.bar_acc.setValue(int(avg))
                 self.lbl_emoji.setText("😊" if avg >= 80 else "😐" if avg >= 50 else "😟")
+            
+            # 레코딩 상태 라벨 업데이트
+            if self.is_recording:
+                 self.lbl_record_status.setText(f"Recording... [{len(self.record_buffer)} pts]")
 
             # 6. 그리기 (Draw)
             if not self.chk_single_point.isChecked() and proj_uvs is not None:
@@ -1561,6 +1710,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 for pts in self.lane_polys.values():
                     if pts is not None and len(pts) > 0:
                         cv2.polylines(disp, [pts], True, (0, 255, 255), 2)
+
+            current_ids = {o['id'] for o in self.vis_objects}
+            self.track_confirmed_cnt = {k: v for k, v in self.track_confirmed_cnt.items() if k in current_ids}
 
             self.viewer.update_image(disp)
 

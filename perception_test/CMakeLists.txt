@@ -57,8 +57,8 @@ catkin_install_python(PROGRAMS
   src/nodes/association_node.py
   src/nodes/lane_detector_node.py
   src/nodes/object_detector_node.py
-  src/nodes/offline_provider.py
-  src/nodes/radar_cluster_bbox_viz.py
+  src/nodes/offline_provider_node.py
+  src/nodes/radar_cluster_bbox_node.py
   src/nodes/radar_metrics_node.py
   src/nodes/speed_estimator_node.py
   src/nodes/tracker_node.py

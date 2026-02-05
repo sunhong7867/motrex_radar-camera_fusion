@@ -632,9 +632,7 @@ class AssociationNode:
                         speed_mps = float(abs(speed_mps))
 
             if used_track_fallback:
-                dop_kph = doppler_speed_mps * 3.6 if np.isfinite(doppler_speed_mps) else float('nan')
-                trk_kph = track_speed_mps * 3.6
-                rospy.loginfo_throttle(1.0, f"[association] track-speed fallback key={track_key} | dop={dop_kph:.2f} km/h -> track={trk_kph:.2f} km/h")
+                pass
 
             speed_kph = speed_mps * 3.6 if np.isfinite(speed_mps) else float("nan")
 
