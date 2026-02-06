@@ -28,11 +28,43 @@ import os
 import json
 import time
 import traceback
-import numpy as np
+from collections import deque
+
 import cv2
+import numpy as np
+
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
-from collections import deque
+import message_filters
+import rospy
+import rospkg
+from sensor_msgs.msg import Image, PointCloud2, CameraInfo
+from cv_bridge import CvBridge
+
+# ==============================================================================
+# Setup & Imports
+# ==============================================================================
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.append(CURRENT_DIR)
+NODES_DIR = os.path.join(CURRENT_DIR, "nodes")
+if NODES_DIR in sys.path:
+    sys.path.remove(NODES_DIR)
+sys.path.insert(0, NODES_DIR)
+from log_saver_node import save_sequential_data
+from perception_lib.speed_utils import (
+    build_record_row,
+    find_target_lane,
+    parse_radar_pointcloud,
+    project_points,
+    select_representative_point,
+    update_lane_tracking,
+    update_speed_estimate,
+)
+
+from perception_test.msg import AssociationArray, DetectionArray
+from perception_lib import perception_utils
+from perception_lib import lane_utils
 
 os.environ["QT_LOGGING_RULES"] = "qt.gui.painting=false"
 
@@ -73,54 +105,6 @@ BRIGHTNESS_PARAM_ENABLE = "/object_detector/runtime/brightness_enable"
 BRIGHTNESS_PARAM_GAIN = "/object_detector/runtime/brightness_gain"
 
 START_ACTIVE_LANES = ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]
-
-# ==============================================================================
-# Setup & Imports
-# ==============================================================================
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-if CURRENT_DIR not in sys.path:
-    sys.path.append(CURRENT_DIR)
-NODES_DIR = os.path.join(CURRENT_DIR, "nodes")
-if NODES_DIR in sys.path:
-    sys.path.remove(NODES_DIR)
-sys.path.insert(0, NODES_DIR)
-from log_saver_node import save_sequential_data
-from perception_lib.gui_math_utils import project_points, cluster_1d_by_gap, select_best_forward_cluster
-
-from PySide6 import QtWidgets, QtGui, QtCore
-import rospy
-import rospkg
-import message_filters
-from sensor_msgs.msg import Image, PointCloud2, CameraInfo
-from cv_bridge import CvBridge
-import sensor_msgs.point_cloud2 as pc2
-
-from perception_test.msg import AssociationArray, DetectionArray
-from perception_lib import perception_utils
-from perception_lib import lane_utils
-
-# ==============================================================================
-# Helper Functions (Clustering & Math)
-# ==============================================================================
-class ScalarKalman:
-    '''속도(스칼라)만 필터링하는 간단한 칼만 필터.'''
-    def __init__(self, x0=0.0, P0=25.0, Q=2.0, R=9.0):
-        self.x = float(x0)
-        self.P = float(P0)
-        self.Q = float(Q)
-        self.R = float(R)
-
-    def predict(self):
-        self.P = self.P + self.Q
-        return self.x
-
-    def update(self, z: float):
-        z = float(z)
-        K = self.P / (self.P + self.R)
-        self.x = self.x + K * (z - self.x)
-        self.P = (1.0 - K) * self.P
-        return self.x
-
 
 # ==============================================================================
 # UI Classes
@@ -402,8 +386,8 @@ class ManualCalibWindow(QtWidgets.QDialog):
         gb_trans = QtWidgets.QGroupBox("3. Translation (0.1m)")
         t_grid = QtWidgets.QGridLayout(gb_trans)
         t_grid.addWidget(self._create_btn("FWD ▲ (T)", L_GRAY, lambda: self._move(1, 1)), 0, 1)
-        t_grid.addWidget(self._create_btn("LEFT ◀ (R)", L_GRAY, lambda: self._move(0, 1)), 1, 0)
-        t_grid.addWidget(self._create_btn("RIGHT ▶ (F)", L_GRAY, lambda: self._move(0, -1)), 1, 2)
+        t_grid.addWidget(self._create_btn("LEFT ◀ (R)", L_GRAY, lambda: self._move(0, -1)), 1, 0)
+        t_grid.addWidget(self._create_btn("RIGHT ▶ (F)", L_GRAY, lambda: self._move(0, 1)), 1, 2)
         t_grid.addWidget(self._create_btn("BWD ▼ (G)", L_GRAY, lambda: self._move(1, -1)), 2, 1)
         t_grid.addWidget(self._create_btn("UP ⤒ (Y)", D_GRAY, lambda: self._move(2, 1), "white"), 0, 2)
         t_grid.addWidget(self._create_btn("DOWN ⤓ (H)", D_GRAY, lambda: self._move(2, -1), "white"), 2, 2)
@@ -460,10 +444,12 @@ class ManualCalibWindow(QtWidgets.QDialog):
         elif k == QtCore.Qt.Key_S: self._rotate(1, 1)
         elif k == QtCore.Qt.Key_E: self._rotate(2, 1)
         elif k == QtCore.Qt.Key_D: self._rotate(2, -1)
-        elif k == QtCore.Qt.Key_R: self._move(0, 1)
-        elif k == QtCore.Qt.Key_F: self._move(0, -1)
+        elif k == QtCore.Qt.Key_R: self._move(0, -1)
+        elif k == QtCore.Qt.Key_F: self._move(0, 1)
         elif k == QtCore.Qt.Key_T: self._move(1, 1)
         elif k == QtCore.Qt.Key_G: self._move(1, -1)
+        elif k == QtCore.Qt.Key_Y: self._move(2, 1)
+        elif k == QtCore.Qt.Key_H: self._move(2, -1)
         event.accept()
 
     def update_view(self):
@@ -974,38 +960,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             return
 
         # 2) 레이더
-        try:
-            field_names = [f.name for f in radar_msg.fields]
-            if not {"x", "y", "z"}.issubset(field_names):
-                return
-
-            doppler_candidates = ("doppler", "doppler_mps", "velocity", "vel", "radial_velocity")
-            power_candidates = ("power", "intensity", "rcs")
-
-            doppler_field = next((f for f in doppler_candidates if f in field_names), None)
-            power_field = next((f for f in power_candidates if f in field_names), None)
-
-            target_fields = ["x", "y", "z"]
-            if power_field:
-                target_fields.append(power_field)
-            if doppler_field:
-                target_fields.append(doppler_field)
-
-            g = pc2.read_points(radar_msg, field_names=tuple(target_fields), skip_nans=True)
-            radar_points_all = np.array(list(g))
-
-            if radar_points_all.shape[0] > 0:
-                radar_points = radar_points_all[:, :3]
-                col_idx = 3
-                radar_doppler = None
-
-                if power_field:
-                    col_idx += 1
-                if doppler_field:
-                    radar_doppler = radar_points_all[:, col_idx]
-            else:
-                radar_points, radar_doppler = None, None
-        except:
+        radar_points, radar_doppler = parse_radar_pointcloud(radar_msg)
+        if radar_points is None and radar_doppler is None:
             return
 
         frame = {
@@ -1156,53 +1112,21 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 cx, cy = (x1 + x2) // 2, y2
                 target_lane = None
                 if has_lane_filter:
-                    for name, poly in active_lane_polys.items():
-                        if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
-                            target_lane = name
-                            break
+                    target_lane = find_target_lane((cx, cy), active_lane_polys)
                     if target_lane is None:
                         continue
 
-                # 차선 변경 경로 추적 로직 (IN1 -> IN1->IN2)
-                curr_lane_str = str(target_lane) if target_lane else 'None'
-                
-                if g_id not in self.vehicle_lane_paths:
-                    # 처음 발견된 차량인 경우 현재 차선 기록
-                    self.vehicle_lane_paths[g_id] = curr_lane_str
-                else:
-                    # 기존 차량의 마지막 기록된 차선 추출
-                    path_parts = self.vehicle_lane_paths[g_id].split("->")
-                    last_lane = path_parts[-1]
-                    
-                    # 차선이 변경되었고, 유효한 차선인 경우에만 경로 업데이트
-                    if curr_lane_str != last_lane and curr_lane_str != 'None':
-                        self.vehicle_lane_paths[g_id] += f"->{curr_lane_str}"
-                
-                # 현재 차량 객체에 전체 경로 정보 저장 (수동창 저장 시 사용)
-                lane_path = self.vehicle_lane_paths[g_id]
+                curr_lane_str, lane_path, local_no, label = update_lane_tracking(
+                    g_id,
+                    target_lane,
+                    self.vehicle_lane_paths,
+                    self.lane_counters,
+                    self.global_to_local_ids,
+                )
+
                 obj['lane_path'] = lane_path
-                obj['lane'] = curr_lane_str # 현재 시점의 차선 정보 명시
+                obj['lane'] = curr_lane_str
 
-                # 2. ID 관리 및 라벨 생성
-                if target_lane and g_id not in self.global_to_local_ids:
-                    # 해당 차선에 처음 진입한 순서대로 번호 부여
-                    self.lane_counters[target_lane] += 1
-                    self.global_to_local_ids[g_id] = self.lane_counters[target_lane]
-                
-                local_no = self.global_to_local_ids.get(g_id, g_id)
-                
-                # 라벨 표시: 번호와 경로를 함께 보여주어 식별 용이하게 수정
-                if "->" in lane_path:
-                    # 차선 변경 이력이 있는 경우 경로 전체 표시
-                    label = f"No: {local_no} ({lane_path})"
-                else:
-                    # 변경 이력이 없는 경우 현재 차선만 표시
-                    label = f"No: {local_no} ({target_lane})" if target_lane else f"ID: {g_id}"
-
-                # =============================================================
-                # [수정 포인트 1] 타겟 포인트를 '박스 정중앙'으로 변경
-                # (가려짐 발생 시 BBox가 줄어들므로, 줄어든 박스의 중앙 = 지붕 중앙)
-                # =============================================================
                 target_pt = (int((x1+x2)/2), int((y1+y2)/2)) 
                 
                 meas_kmh = None
@@ -1213,187 +1137,49 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
                 # --- 속도 추정 ---
                 if proj_uvs is not None and dop_raw is not None:
-                    # 1) BBox 내부에 있는 레이더 점 인덱스 추출
-                    in_box = (proj_valid & (proj_uvs[:, 0] >= x1) & (proj_uvs[:, 0] <= x2) & (proj_uvs[:, 1] >= y1) & (proj_uvs[:, 1] <= y2))
-                    idxs = np.where(in_box)[0]
-                    
-                    if idxs.size > 0:
-                        # =============================================================
-                        # [수정 포인트 2] 도플러 속도 필터 (뒷차량 가려짐 해결의 핵심)
-                        # - 앞뒤 차량이 겹쳐 보여도 속도가 다르면 분리해냅니다.
-                        # - 박스 내 주된 속도(Median)와 다른 점들은 노이즈로 간주하고 버립니다.
-                        # =============================================================
-                        med_dop = np.median(dop_raw[idxs])
-                        vel_mask = np.abs(dop_raw[idxs] - med_dop) < self.vel_gate_mps
-                        valid_idxs = idxs[vel_mask] if np.any(vel_mask) else idxs
-                        
-                        # [수정] 상단 필터 제거 -> 전체 영역 사용
-                        target_idxs = valid_idxs 
-                        
-                        # 3) 중앙 추종 로직 (K-Nearest to Center)
-                        # 타겟 지점: BBox 정중앙
-                        t_u, t_v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                        
-                        if len(target_idxs) > 0:
-                            current_pts = proj_uvs[target_idxs]
-                            # 타겟 지점(중앙)과 레이더 점들 간의 거리 계산
-                            dists = np.hypot(current_pts[:, 0] - t_u, current_pts[:, 1] - t_v)
-                            
-                            # 가장 가까운 3개 점 선택 (밀도 무시하고 중앙 점 선택)
-                            k = min(len(dists), 3)
-                            sorted_indices = np.argsort(dists)
-                            closest_indices = sorted_indices[:k]
-                            
-                            best_pts = current_pts[closest_indices]
-                            meas_u = np.mean(best_pts[:, 0])
-                            meas_v = np.mean(best_pts[:, 1])
+                    meas_kmh, rep_pt, rep_vel_raw, score, radar_dist = select_representative_point(
+                        proj_uvs,
+                        proj_valid,
+                        dop_raw,
+                        (x1, y1, x2, y2),
+                        pts_raw,
+                        self.vel_gate_mps,
+                        self.rep_pt_mem,
+                        self.pt_alpha,
+                        now_ts,
+                        g_id,
+                        self.spin_min_speed_kmh.value(),
+                    )
+                    if rep_pt is not None:
+                        acc_scores.append(score)
 
-                            # [거리 계산 추가]
-                            # 선택된 레이더 포인트들의 3D 거리 평균 (Camera 기준 Distance)
-                            if pts_raw is not None:
-                                best_3d_indices = target_idxs[closest_indices]
-                                best_3d_pts = pts_raw[best_3d_indices]
-                                # 원점(0,0,0)에서의 거리 (레이더 좌표계 기준)
-                                # Extr_t가 있다면 카메라 좌표계로 변환해야 하지만, 
-                                # 일반적으로 레이더 원점 거리나 카메라 원점 거리는 비슷하므로 레이더 점 자체 Norm 사용
-                                best_dists_3d = np.linalg.norm(best_3d_pts, axis=1)
-                                radar_dist = np.mean(best_dists_3d)
-                            
-                            # 속도는 해당 점들의 중앙값 사용
-                            rep_vel_raw = np.median(dop_raw[target_idxs[closest_indices]]) * 3.6
+                vel_out, score_out = update_speed_estimate(
+                    g_id,
+                    meas_kmh,
+                    score,
+                    now_ts,
+                    self.vel_memory,
+                    self.kf_vel,
+                    self.kf_score,
+                )
 
-                            # 4) 시계열 스무딩 (EMA)
-                            if g_id in self.rep_pt_mem:
-                                prev_u, prev_v, last_ts = self.rep_pt_mem[g_id]
-                                if now_ts - last_ts < 1.0:
-                                    smooth_u = self.pt_alpha * meas_u + (1.0 - self.pt_alpha) * prev_u
-                                    smooth_v = self.pt_alpha * meas_v + (1.0 - self.pt_alpha) * prev_v
-                                else:
-                                    smooth_u, smooth_v = meas_u, meas_v
-                            else:
-                                smooth_u, smooth_v = meas_u, meas_v
-
-                            self.rep_pt_mem[g_id] = [smooth_u, smooth_v, now_ts]
-                            rep_pt = (int(smooth_u), int(smooth_v))
-                            
-                            if abs(rep_vel_raw) >= self.spin_min_speed_kmh.value():
-                                meas_kmh = abs(rep_vel_raw)
-
-                            # 정확도 점수 (중앙 기준)
-                            dist_px = np.hypot(target_pt[0]-rep_pt[0], target_pt[1]-rep_pt[1])
-                            diag_len = np.hypot(x2-x1, y2-y1)
-                            err_ratio = dist_px / max(1, diag_len)
-                            score = max(0, min(100, 100 - (err_ratio * 200)))
-                            acc_scores.append(score)
-
-                # --- [강화된 속도 필터링 v3: 정지 대응 및 Jitter 억제] ---
-                # 1) Hard Limit Filter: 상한선 120km/h
-                if meas_kmh is not None:
-                    if abs(meas_kmh) > 120.0:  
-                        meas_kmh = None
-
-                mem = self.vel_memory.get(g_id, {})
-                last_vel = mem.get("vel_kmh", 0.0)
-                last_ts = mem.get("ts", now_ts)
-                fail_cnt = mem.get("fail_count", 0)
-                
-                # 2) Jump Filter with Recovery (락다운 방지)
-                JUMP_THRESHOLD = 15.0 # 반응성을 위해 임계값 약간 상향
-                if meas_kmh is not None and last_vel > 5.0: # 어느 정도 속도가 있을 때만 점프 체크
-                    diff = abs(meas_kmh - last_vel)
-                    if diff > JUMP_THRESHOLD:
-                        fail_cnt += 1
-                        if fail_cnt > 5: # 5회 이상 지속되면 실제 가감속으로 판단
-                            fail_cnt = 0 
-                        else:
-                            meas_kmh = None 
-                    else:
-                        fail_cnt = 0
-                else:
-                    fail_cnt = 0
-
-                # --- 칼만 필터 기반 추정 (성격 분리) ---
-                # 1) 필터 생성/초기화
-                if g_id not in self.kf_vel:
-                    # 속도 필터: 기민한 반응을 위해 Q를 높이고 R을 낮게 설정
-                    self.kf_vel[g_id] = ScalarKalman(x0=meas_kmh if meas_kmh is not None else 0.0, Q=0.8, R=5.0)
-                    # 점수 필터: 매끄러운 곡선을 위해 R을 극단적으로 높이고 Q를 낮게 설정
-                    self.kf_score[g_id] = ScalarKalman(x0=score if score > 0 else 80.0, Q=0.001, R=500.0)
-
-                kf_v = self.kf_vel[g_id]
-                kf_s = self.kf_score[g_id]
-
-                # 2) 예측(Predict) 단계
-                v_pred = kf_v.predict()
-                s_pred = kf_s.predict()
-
-                # 3) 업데이트(Update) 및 정지 대응 로직
-                if meas_kmh is not None:
-                    # [추가] 저속 구간 강제 정지: 4km/h 미만은 노이즈로 보고 0으로 처리
-                    if abs(meas_kmh) < 4.0:
-                        meas_kmh = 0.0
-                        
-                    vel_out = kf_v.update(meas_kmh)
-                    score_out = kf_s.update(score)
-                    
-                    self.vel_memory[g_id] = {
-                        "vel_kmh": vel_out, 
-                        "ts": now_ts, 
-                        "fail_count": fail_cnt,
-                        "score": score_out
-                    }
-                else:
-                    # 레이더 수신 실패 (Coasting 구간)
-                    time_gap = now_ts - last_ts
-                    
-                    if time_gap > 0.5:
-                        # 0.5초 이상 데이터가 없으면 레이더가 놓친 것이 아니라 멈춘 것으로 판단
-                        vel_out = 0.0
-                    elif time_gap > 0.1:
-                        # [공격적 감쇄] 0.75를 곱해 이전보다 훨씬 빠르게 0으로 수렴시킴
-                        vel_out = v_pred * 0.75 
-                    else:
-                        vel_out = v_pred
-
-                    # 최종 컷오프: 감쇄 중에도 5km/h 이하로 떨어지면 즉시 0
-                    if vel_out < 5.0: 
-                        vel_out = 0.0
-                        
-                    score_out = s_pred * 0.998 # 점수는 끊김 없이 아주 부드럽게 유지
-                    
-                    # 메모리 유지 (실패 카운트만 업데이트)
-                    mem["fail_count"] = fail_cnt
-                    self.vel_memory[g_id] = mem
-
-                # 점수가 바닥나면(차량이 사라지면) 0점 처리
-                if score_out < 10: 
-                    score_out = 0
-                    vel_out = None
-
-                # 최종 결과 반영
                 obj['vel'] = round(vel_out, 1) if vel_out is not None else float('nan')
-                score = score_out # 로깅을 위해 score 변수 최신화
+                score = score_out
 
-                # 최종 결과 반영
-                obj['vel'] = round(vel_out, 1) if vel_out is not None else float('nan')
-                score = score_out # UI 표시 및 로깅용 점수 갱신
-                
                 # --- [DATA LOGGING] ---
                 # 기록 모드일 때만 버퍼에 추가
                 if self.is_recording:
-                    data_row = {
-                        "Time": now_ts,
-                        "Global_ID": g_id,
-                        "Local_ID": local_no,
-                        "Lane_Path": lane_path,   # e.g., "IN1->IN2"
-                        "Final_Lane": curr_lane_str,
-                        # 고유 키: ID와 Lane Path를 조합 (IN1->IN2 차량과 IN2 차량 구분)
-                        "Unique_Key": f"{local_no}({lane_path})",
-                        "Radar_Dist": radar_dist,
-                        "Radar_Vel": meas_kmh if meas_kmh is not None else np.nan,
-                        "Track_Vel": vel_out if vel_out is not None else np.nan,
-                        "Score": score
-                    }
+                    data_row = build_record_row(
+                        now_ts,
+                        g_id,
+                        local_no,
+                        lane_path,
+                        curr_lane_str,
+                        radar_dist,
+                        meas_kmh,
+                        vel_out,
+                        score,
+                    )
                     self.record_buffer.append(data_row)
 
                 draw_items.append({
