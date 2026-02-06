@@ -85,6 +85,7 @@ if NODES_DIR in sys.path:
     sys.path.remove(NODES_DIR)
 sys.path.insert(0, NODES_DIR)
 from log_saver_node import save_sequential_data
+from perception_lib.gui_math_utils import project_points, cluster_1d_by_gap, select_best_forward_cluster
 
 from PySide6 import QtWidgets, QtGui, QtCore
 import rospy
@@ -93,6 +94,7 @@ import message_filters
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from cv_bridge import CvBridge
 import sensor_msgs.point_cloud2 as pc2
+
 from perception_test.msg import AssociationArray, DetectionArray
 from perception_lib import perception_utils
 from perception_lib import lane_utils
@@ -100,175 +102,6 @@ from perception_lib import lane_utils
 # ==============================================================================
 # Helper Functions (Clustering & Math)
 # ==============================================================================
-
-def _robust_mean_velocity(vs: np.ndarray, trim_ratio: float = 0.2) -> float:
-    """클러스터 속도 요약: 상/하위 trim_ratio 제거 후 평균(노이즈 완화)."""
-    if vs is None or len(vs) == 0:
-        return 0.0
-    vs = np.asarray(vs, dtype=np.float64)
-    if vs.size < 5:
-        return float(np.mean(vs))
-    vs_sorted = np.sort(vs)
-    k = int(np.floor(vs_sorted.size * trim_ratio))
-    if k*2 >= vs_sorted.size:
-        return float(np.mean(vs_sorted))
-    vs_trim = vs_sorted[k: vs_sorted.size - k]
-    return float(np.mean(vs_trim))
-
-def cluster_radar_points(points_xyz, points_vel, max_dist=2.0, min_pts=3, vel_gate_mps=None):
-    """
-    간단한 유클리드 거리 기반 클러스터링 (BFS)
-    points_xyz: (N, 3) array
-    points_vel: (N, ) array (Doppler)
-    return: list of dict {'center':(x,y,z), 'min':..., 'max':..., 'vel':..., 'pts':...}
-    """
-    n = points_xyz.shape[0]
-    if n == 0:
-        return []
-
-    # XY 평면 거리만 사용하여 클러스터링 (Z는 무시)
-    pts_xy = points_xyz[:, :2]
-
-    if points_vel is None:
-        points_vel = np.zeros(n, dtype=np.float64)
-    if vel_gate_mps is None:
-        vel_gate_mps = CLUSTER_VEL_GATE_MPS
-
-    visited = np.zeros(n, dtype=bool)
-    clusters = []
-
-    for i in range(n):
-        if visited[i]:
-            continue
-
-        # BFS
-        queue = [i]
-        visited[i] = True
-        cluster_indices = []
-
-        while queue:
-            idx = queue.pop()
-            cluster_indices.append(idx)
-
-            # 현재 점과 다른 모든 점 사이의 거리 계산 (Vectorized)
-            dists = np.linalg.norm(pts_xy - pts_xy[idx], axis=1)
-            vel_d = np.abs(points_vel - points_vel[idx])
-            neighbors = np.where((dists <= max_dist) & (vel_d <= vel_gate_mps) & (~visited))[0]
-
-            for nb in neighbors:
-                visited[nb] = True
-                queue.append(nb)
-
-        if len(cluster_indices) >= min_pts:
-            indices = np.array(cluster_indices)
-            c_pts = points_xyz[indices]
-            c_vels = points_vel[indices]
-            
-            # BBox Info extraction
-            min_xyz = np.min(c_pts, axis=0)
-            max_xyz = np.max(c_pts, axis=0)
-            center = (min_xyz + max_xyz) / 2.0
-            mean_vel = _robust_mean_velocity(c_vels)
-
-            clusters.append({
-                'center': center,
-                'min': min_xyz,
-                'max': max_xyz,
-                'vel': mean_vel,
-                'indices': indices
-            })
-
-    return clusters
-
-def project_points(K, R, t, points_3d):
-    """
-    3D Points (N,3) -> 2D Pixels (N,2) projection
-    """
-    if points_3d.shape[0] == 0:
-        return np.zeros((0, 2)), np.zeros(0, dtype=bool)
-
-    # T: Radar -> Camera
-    # P_cam = R * P_rad + t
-    pts_h = np.hstack((points_3d, np.ones((points_3d.shape[0], 1)))) # (N, 4)
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = t.flatten()
-    
-    pts_cam = (T @ pts_h.T).T # (N, 4)
-    
-    # Valid check (Z > 0.5m)
-    valid = pts_cam[:, 2] > 0.5
-    
-    uvs = np.zeros((points_3d.shape[0], 2))
-    
-    if np.any(valid):
-        p_valid = pts_cam[valid, :3].T # (3, N_valid)
-        uv_homo = K @ p_valid
-        uv_homo /= uv_homo[2, :] # Normalize by Z
-        uvs[valid] = uv_homo[:2, :].T
-
-    return uvs, valid
-
-# ==============================================================================
-# Speed Estimation Helpers
-# ==============================================================================
-
-def cluster_1d_by_gap(values: np.ndarray, max_gap: float):
-    '''
-    1D 클러스터링: 정렬 후 인접 값 차이가 max_gap 이하인 구간을 같은 클러스터로 묶음.
-    values: (N,) float
-    return: list of index arrays (original indices)
-    '''
-    if values is None:
-        return []
-    values = np.asarray(values, dtype=np.float64)
-    if values.size == 0:
-        return []
-    order = np.argsort(values)
-    clusters = []
-    start = 0
-    for i in range(1, order.size):
-        if (values[order[i]] - values[order[i-1]]) > max_gap:
-            clusters.append(order[start:i])
-            start = i
-    clusters.append(order[start:order.size])
-    return clusters
-
-def select_best_forward_cluster(forward_vals: np.ndarray, dopplers: np.ndarray, max_gap_m: float = 2.0):
-    '''
-    bbox 내부 포인트 중 forward축(기본 y)으로 1D clustering 후, '가장 그럴듯한 차량' 클러스터 선택.
-    - 우선순위: 포인트 개수 많은 클러스터
-    - 동률이면: forward 중앙값이 더 작은(더 가까운) 클러스터
-    return: selected doppler array (m/s)
-    '''
-    if forward_vals is None or dopplers is None:
-        return np.asarray([], dtype=np.float64)
-    forward_vals = np.asarray(forward_vals, dtype=np.float64)
-    dopplers = np.asarray(dopplers, dtype=np.float64)
-    if forward_vals.size == 0:
-        return np.asarray([], dtype=np.float64)
-
-    clusters = cluster_1d_by_gap(forward_vals, max_gap=max_gap_m)
-    if not clusters:
-        return np.asarray([], dtype=np.float64)
-
-    best = None
-    best_score = None
-    for c in clusters:
-        c = np.asarray(c, dtype=int)
-        if c.size == 0:
-            continue
-        cnt = int(c.size)
-        med_f = float(np.median(forward_vals[c]))
-        score = (cnt, -med_f)
-        if best is None or score > best_score:
-            best = c
-            best_score = score
-
-    if best is None:
-        return np.asarray([], dtype=np.float64)
-    return dopplers[best]
-
 class ScalarKalman:
     '''속도(스칼라)만 필터링하는 간단한 칼만 필터.'''
     def __init__(self, x0=0.0, P0=25.0, Q=2.0, R=9.0):
