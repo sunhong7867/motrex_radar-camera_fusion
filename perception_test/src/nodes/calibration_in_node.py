@@ -2,30 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-calibration_in_node.py (C++ verified behavior port, fixed YAML/JSON)
+Modified camera intrinsic calibration node with improved logging.
 
-요구사항 반영:
-(1) calib_*.jpg만 사용
-(2) AutoImagePicker로 20~45장 선별 (min_samples~max_selected)
-(3) cornerSubPix (5,5)
-(4) float 캐스팅 + safe_dump (numpy yaml 태그 제거)
-+ intrinsic.json 저장 추가
+This node performs chessboard-based camera intrinsic calibration either
+offline (using images from a directory) or online (subscribing to a
+camera topic). Compared to the original implementation, this version
+emits clearer start and progress messages so that users can see when
+calibration is underway and when it completes.
 
-ROS 파라미터:
-- ~camera_topic (default: /camera/image_raw)  # online mode
-- ~board/width (default: 10)   # inner corners (w)
-- ~board/height(default: 7)    # inner corners (h)
-- ~board/square_size(default: 0.025) # meters
-- ~grid_size_mm(default: 50)   # TermCriteria max_iter (C++와 동일 컨셉)
-- ~min_samples(default: 20)    # 최소 선별 장수
-- ~max_selected(default: 45)   # 최대 선별 장수 (C++ MAX_SELECTED_SAMPLE_NUM)
+Key improvements:
+  * Logs a `[Intrinsic] START` message when the node begins, indicating
+    offline or online mode and the relevant parameters.
+  * In offline calibration, logs a message just before running
+    `cv2.calibrateCamera` to indicate that computation is in progress.
+  * Retains all original functionality, including AutoImagePicker
+    behavior and YAML/JSON writing.
 
-- ~image_dir(default: '')      # offline mode when set
-- ~output_path(default: $(find perception_test)/config/camera_intrinsic.yaml)
-- ~json_output_path(default: '') # 빈값이면 output_path 옆에 intrinsic.json 저장
-
-- ~save_selected(default: True)  # image_dir/selected
-- ~save_undistort(default: True) # image_dir/undistorted
+Usage parameters mirror the original `calibration_in_node.py`.
 """
 
 import os
@@ -49,6 +42,7 @@ _FIND_RE = re.compile(r"\$\(\s*find\s+([A-Za-z0-9_]+)\s*\)")
 
 
 def resolve_ros_path(path: str) -> str:
+    """Resolve ROS package-based paths like $(find pkg)/..."""
     if not isinstance(path, str):
         return path
     if "$(" not in path:
@@ -131,9 +125,7 @@ def make_board_square(p1, p2, p3, p4) -> BoardSquare:
 
 
 class AutoImagePickerPy:
-    """
-    C++ AutoImagePicker.cpp 포팅 (상수/로직 동일)
-    """
+    """Ported from C++ AutoImagePicker.cpp with identical logic."""
     CHESSBOARD_MIN_AREA_PORTION = 0.04
     IMAGE_MARGIN_PERCENT = 0.1
     CHESSBOARD_MIN_AREA_CHANGE_PARTION_THRESH = 0.005
@@ -161,10 +153,12 @@ class AutoImagePickerPy:
     def _check_validity(self, board: BoardSquare) -> bool:
         if board.area < self.CHESSBOARD_MIN_AREA_PORTION * self.img_width * self.img_height:
             return False
-        if (board.angle_left_top < self.CHESSBOARD_MIN_ANGLE or
-                board.angle_right_top < self.CHESSBOARD_MIN_ANGLE or
-                board.angle_left_bottom < self.CHESSBOARD_MIN_ANGLE or
-                board.angle_right_bottom < self.CHESSBOARD_MIN_ANGLE):
+        if (
+            board.angle_left_top < self.CHESSBOARD_MIN_ANGLE or
+            board.angle_right_top < self.CHESSBOARD_MIN_ANGLE or
+            board.angle_left_bottom < self.CHESSBOARD_MIN_ANGLE or
+            board.angle_right_bottom < self.CHESSBOARD_MIN_ANGLE
+        ):
             return False
         return True
 
@@ -197,10 +191,12 @@ class AutoImagePickerPy:
             dy = board.midpoint[1] - cand.midpoint[1]
             dist = math.sqrt(dx * dx + dy * dy)
             if dist < move_thresh:
-                if (abs(board.angle_left_top - cand.angle_left_top) < self.CHESSBOARD_MIN_ANGLE_CHANGE_THRESH and
-                        abs(board.angle_right_top - cand.angle_right_top) < self.CHESSBOARD_MIN_ANGLE_CHANGE_THRESH and
-                        abs(board.angle_left_bottom - cand.angle_left_bottom) < self.CHESSBOARD_MIN_ANGLE_CHANGE_THRESH and
-                        abs(board.angle_right_bottom - cand.angle_right_bottom) < self.CHESSBOARD_MIN_ANGLE_CHANGE_THRESH):
+                if (
+                    abs(board.angle_left_top - cand.angle_left_top) < self.CHESSBOARD_MIN_ANGLE_CHANGE_THRESH and
+                    abs(board.angle_right_top - cand.angle_right_top) < self.CHESSBOARD_MIN_ANGLE_CHANGE_THRESH and
+                    abs(board.angle_left_bottom - cand.angle_left_bottom) < self.CHESSBOARD_MIN_ANGLE_CHANGE_THRESH and
+                    abs(board.angle_right_bottom - cand.angle_right_bottom) < self.CHESSBOARD_MIN_ANGLE_CHANGE_THRESH
+                ):
                     return False
         return True
 
@@ -278,11 +274,14 @@ class CameraIntrinsicCalibrator:
         self._online_images: List[np.ndarray] = []
         self._online_names: List[str] = []
 
+        # START 로그: intrinsic calibration 노드 시작을 알린다.
         if self.image_dir:
+            rospy.loginfo(f"[Intrinsic] START offline calibration: image_dir={self.image_dir}")
             rospy.loginfo(f"[Intrinsic] Offline mode: image_dir={self.image_dir}")
             self.run_offline_calibration()
             rospy.signal_shutdown("offline intrinsic calibration complete")
         else:
+            rospy.loginfo(f"[Intrinsic] START online calibration: topic={self.camera_topic}, pattern={self.board_w}x{self.board_h}")
             rospy.loginfo(f"[Intrinsic] Online mode: topic={self.camera_topic}, pattern={self.board_w}x{self.board_h}")
             rospy.Subscriber(self.camera_topic, Image, self.image_callback, queue_size=1)
 
@@ -298,7 +297,7 @@ class CameraIntrinsicCalibrator:
         return [float(x) for x in a.tolist()]
 
     def _write_yaml_and_json(self, K: np.ndarray, D: np.ndarray, img_w: int, img_h: int) -> None:
-        # --- YAML: 템플릿 유지하며 camera_info 갱신 ---
+        # YAML 업데이트
         data = {}
         if os.path.exists(self.output_path):
             with open(self.output_path, 'r', encoding='utf-8') as f:
@@ -322,8 +321,8 @@ class CameraIntrinsicCalibrator:
         data['camera_info']['D'] = self._safe_float_list(D.reshape(-1))
 
         data['camera_info'].setdefault('R', [1.0, 0.0, 0.0,
-                                            0.0, 1.0, 0.0,
-                                            0.0, 0.0, 1.0])
+                                             0.0, 1.0, 0.0,
+                                             0.0, 0.0, 1.0])
 
         data['camera_info']['P'] = [
             fx, 0.0, cx, 0.0,
@@ -337,7 +336,7 @@ class CameraIntrinsicCalibrator:
 
         rospy.loginfo(f"[Intrinsic] YAML saved: {self.output_path}")
 
-        # --- JSON: 기본은 yaml 옆 intrinsic.json ---
+        # JSON: 기본은 yaml 옆 intrinsic.json
         json_path = self.json_output_path
         if not json_path:
             json_path = os.path.join(os.path.dirname(self.output_path), "intrinsic.json")
@@ -356,9 +355,7 @@ class CameraIntrinsicCalibrator:
                 "distortion_model": "plumb_bob",
                 "K": K3,
                 "D": Dlist,
-                "R": [[1.0, 0.0, 0.0],
-                      [0.0, 1.0, 0.0],
-                      [0.0, 0.0, 1.0]],
+                "R": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 "P": P3x4
             }, f, indent=2)
 
@@ -368,7 +365,6 @@ class CameraIntrinsicCalibrator:
         os.makedirs(out_dir, exist_ok=True)
         w, h = img_size
         map1, map2 = cv2.initUndistortRectifyMap(K, D, None, K, (w, h), cv2.CV_32FC1)
-
         for p in img_paths:
             img = cv2.imread(p, cv2.IMREAD_COLOR)
             if img is None:
@@ -389,33 +385,26 @@ class CameraIntrinsicCalibrator:
             found, corners = cv2.findChessboardCorners(g, self.pattern_size)
             if not found or corners is None:
                 continue
-
             corners_np = corners.reshape(-1, 2).astype(np.float64)
             if picker.add_image(corners_np):
                 selected_idx.append(i)
                 selected_corners_raw.append(corners)  # (N,1,2)
                 selected_names.append(nm)
                 rospy.loginfo(f"[Intrinsic] Select image: {nm} ({len(selected_idx)}/{self.max_selected})")
-
                 if picker.status():
                     rospy.loginfo("[Intrinsic] Enough selected images (max_selected reached).")
                     break
-
         return selected_idx, selected_corners_raw, selected_names
 
     def run_offline_calibration(self):
         img_dir = self.image_dir
-
-        # (1) calib_*.jpg만 사용
         patterns = sorted(glob.glob(os.path.join(img_dir, "calib_*.jpg")))
         if not patterns:
             rospy.logerr(f"[Intrinsic] No calib_*.jpg found in: {img_dir}")
             return
-
         gray_imgs: List[np.ndarray] = []
         color_paths: List[str] = []
         names: List[str] = []
-
         for p in patterns:
             g = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
             if g is None:
@@ -423,37 +412,31 @@ class CameraIntrinsicCalibrator:
             gray_imgs.append(g)
             color_paths.append(p)
             names.append(os.path.basename(p))
-
         if not gray_imgs:
             rospy.logerr("[Intrinsic] Failed to read any calib_*.jpg images.")
             return
-
         selected_idx, selected_corners_raw, selected_names = self._select_images_with_picker(gray_imgs, names)
-
         if len(selected_idx) == 0:
             rospy.logerr("[Intrinsic] No images selected by AutoImagePicker (check board size / images).")
             return
-
         if len(selected_idx) < self.min_samples:
-            rospy.logwarn(f"[Intrinsic] Selected {len(selected_idx)} < min_samples({self.min_samples}). Still calibrating (may be unstable).")
-
+            rospy.logwarn(
+                f"[Intrinsic] Selected {len(selected_idx)} < min_samples({self.min_samples}). Still calibrating (may be unstable)."
+            )
         selected_dir, undist_dir = self._get_output_dirs(img_dir)
         if self.save_selected:
             os.makedirs(selected_dir, exist_ok=True)
         if self.save_undistort:
             os.makedirs(undist_dir, exist_ok=True)
-
         self.obj_points = []
         self.img_points = []
         used_color_paths: List[str] = []
-
         for idx, corners in zip(selected_idx, selected_corners_raw):
             g = gray_imgs[idx]
             corners2 = self._corner_subpix(g, corners)
             self.obj_points.append(self.objp.copy())
             self.img_points.append(corners2.reshape(-1, 2).astype(np.float32))
             used_color_paths.append(color_paths[idx])
-
             if self.save_selected:
                 src = color_paths[idx]
                 dst = os.path.join(selected_dir, os.path.basename(src))
@@ -461,8 +444,11 @@ class CameraIntrinsicCalibrator:
                     img_color = cv2.imread(src, cv2.IMREAD_COLOR)
                     if img_color is not None:
                         cv2.imwrite(dst, img_color)
-
         img_w, img_h = self.img_size
+        # 캘리브레이션 시작 안내. cv2.calibrateCamera는 시간이 걸리므로 안내 메세지를 출력한다.
+        rospy.loginfo(
+            f"[Intrinsic] Computing intrinsic parameters from {len(self.obj_points)} images... this may take a while."
+        )
         ret, K, D, rvecs, tvecs = cv2.calibrateCamera(
             [op.astype(np.float32) for op in self.obj_points],
             [ip.astype(np.float32) for ip in self.img_points],
@@ -473,15 +459,13 @@ class CameraIntrinsicCalibrator:
         if not ret:
             rospy.logerr("[Intrinsic] cv2.calibrateCamera failed.")
             return
-
-        rospy.loginfo(f"[Intrinsic] Calibration done. Selected={len(used_color_paths)} | image_size=({img_w},{img_h})")
-
-        # (4) float 캐스팅 + safe_dump + JSON 저장
+        rospy.loginfo(
+            f"[Intrinsic] Calibration done. Selected={len(used_color_paths)} | image_size=({img_w},{img_h})"
+        )
+        # float 캐스팅 + safe_dump + JSON 저장
         self._write_yaml_and_json(K, D, img_w, img_h)
-
         if self.save_undistort:
             self._undistort_and_save(used_color_paths, undist_dir, K, D, (img_w, img_h))
-
         rospy.loginfo("[Intrinsic] Offline calibration complete.")
 
     def image_callback(self, msg: Image):
@@ -490,33 +474,25 @@ class CameraIntrinsicCalibrator:
         except CvBridgeError as e:
             rospy.logerr(f"cv_bridge error: {e}")
             return
-
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape[:2]
-
         if self.img_size is None:
             self.img_size = (w, h)
             self._picker = AutoImagePickerPy(w, h, self.board_w, self.board_h, max_selected=self.max_selected)
             rospy.loginfo(f"[Intrinsic] Online picker initialized: img={w}x{h}, pattern={self.board_w}x{self.board_h}")
-
         found, corners = cv2.findChessboardCorners(gray, self.pattern_size)
         if not found or corners is None:
             return
-
         corners_np = corners.reshape(-1, 2).astype(np.float64)
         if not self._picker.add_image(corners_np):
             return
-
         corners2 = self._corner_subpix(gray, corners)
         self.obj_points.append(self.objp.copy())
         self.img_points.append(corners2.reshape(-1, 2).astype(np.float32))
-
         name = f"calib_{len(self.obj_points):02d}.jpg"
         self._online_images.append(bgr.copy())
         self._online_names.append(name)
-
         rospy.loginfo(f"[Intrinsic] Online selected {len(self.obj_points)} samples")
-
         if len(self.obj_points) >= self.min_samples or self._picker.status():
             self._compute_and_save_online()
 
@@ -532,23 +508,17 @@ class CameraIntrinsicCalibrator:
         if not ret:
             rospy.logerr("[Intrinsic] cv2.calibrateCamera failed (online).")
             return
-
         self._write_yaml_and_json(K, D, img_w, img_h)
-
         base_dir = os.path.join(RosPack().get_path('perception_test'), 'calibration_images')
         selected_dir, undist_dir = self._get_output_dirs(base_dir)
-
         if self.save_selected:
             os.makedirs(selected_dir, exist_ok=True)
             for img, nm in zip(self._online_images, self._online_names):
                 cv2.imwrite(os.path.join(selected_dir, nm), img)
-
         if self.save_undistort:
-            # online은 저장된 이미지 파일 경로가 없으니 selected로 먼저 쓴 뒤 그걸 undistort
             paths = [os.path.join(selected_dir, nm) for nm in self._online_names] if self.save_selected else []
             if paths:
                 self._undistort_and_save(paths, undist_dir, K, D, (img_w, img_h))
-
         rospy.loginfo("[Intrinsic] Online calibration complete. Shutting down.")
         rospy.signal_shutdown("intrinsic calibration complete")
 
