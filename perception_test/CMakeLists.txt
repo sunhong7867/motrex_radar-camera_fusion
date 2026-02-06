@@ -63,6 +63,7 @@ catkin_install_python(PROGRAMS
   src/nodes/log_saver_node.py
   src/nodes/speed_estimator_node.py
   src/nodes/tracker_node.py
+  src/nodes/calibration_diagnosis_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

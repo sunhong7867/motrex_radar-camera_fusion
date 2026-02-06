@@ -34,12 +34,13 @@ import cv2
 import numpy as np
 
 from PySide6 import QtWidgets, QtCore, QtGui
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal, Slot
 import message_filters
 import rospy
 import rospkg
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from cv_bridge import CvBridge
+from std_msgs.msg import Bool, String
 
 # ==============================================================================
 # Setup & Imports
@@ -170,19 +171,18 @@ class ImageCanvasViewer(QtWidgets.QWidget):
 # ManualCalibWindow
 # ==============================================================================
 class ManualCalibWindow(QtWidgets.QDialog):
+    # ROS 메시지를 GUI 스레드로 안전하게 넘기기 위한 시그널
+    diag_signal = Signal(str)
+
     def __init__(self, gui: 'RealWorldGUI'):
-        # 메인창 전체화면 유지 및 독립 이동을 위한 윈도우 플래그 설정
         super().__init__(gui, QtCore.Qt.Window | QtCore.Qt.WindowMinMaxButtonsHint | QtCore.Qt.WindowCloseButtonHint)
         self.gui = gui
         self.setWindowTitle("Manual Calibration - Independent Tool")
         
-        # 비모달 설정: 창이 떠 있어도 메인 GUI 조작 가능
         self.setModal(False) 
-        
-        # 창 위치 및 크기 설정 (메인창 중앙을 가리지 않게 오프셋 부여)
         main_geo = self.gui.geometry()
-        self.resize(2500, 1300) 
-        self.move(main_geo.x()+500, main_geo.y()+250) 
+        self.resize(1600, 900) 
+        self.move(main_geo.x()+100, main_geo.y()+100) 
 
         # 물리 파라미터 초기화
         self.T_init = np.eye(4, dtype=np.float64)
@@ -193,28 +193,23 @@ class ManualCalibWindow(QtWidgets.QDialog):
         
         self.T_current = self.T_init.copy()
         
-        # 조작 단위 설정
         self.FIXED_DEG = 0.5   
         self.FIXED_MOV = 0.1   
-        self.radar_zoom = 1.0
 
-        # 실시간 진단 변수 (수동 조작값 기반 테스트용)
-        self.is_diagnosing = False
-        self.diag_start_time = 0
-        self.diag_duration = 3.0 
-        self.diag_data = [] 
+        # ROS 통신 설정
+        self.pub_diag_start = rospy.Publisher("/perception_test/diagnosis/start", Bool, queue_size=1)
+        self.sub_diag_result = rospy.Subscriber("/perception_test/diagnosis/result", String, self._on_diag_msg)
+        self.diag_signal.connect(self._update_log_ui)
 
         self.init_ui()
+        self._timer = QtCore.QTimer(self); self._timer.timeout.connect(self.update_view); self._timer.start(33)
 
     def init_ui(self):
-        """UI 구성 (마그넷 라인 및 저장 관련 기능 제거)"""
         main_layout = QtWidgets.QHBoxLayout(self)
         
-        # [좌측] 이미지 뷰어
         self.img_view = ImageCanvasViewer(self)
         main_layout.addWidget(self.img_view, stretch=1)
 
-        # [우측] 컨트롤 패널
         ctrl_panel = QtWidgets.QWidget()
         ctrl_panel.setFixedWidth(400)
         vbox = QtWidgets.QVBoxLayout(ctrl_panel)
@@ -231,7 +226,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
             QPushButton:pressed { background:#ccc; }
         """)
 
-        # (1) Visual Options (마그넷 라인 제거)
+        # (1) Visual Options
         gb_vis = QtWidgets.QGroupBox("1. Visual Options")
         g_vis = QtWidgets.QGridLayout(gb_vis)
         self.chk_grid = QtWidgets.QCheckBox("Purple Grid"); self.chk_grid.setChecked(True)
@@ -243,14 +238,16 @@ class ManualCalibWindow(QtWidgets.QDialog):
         g_vis.addWidget(self.chk_raw, 1, 0); g_vis.addWidget(self.chk_noise_filter, 1, 1)
         vbox.addWidget(gb_vis)
 
-        # (2) Diagnostic Tool (수치 확인용)
-        gb_diag = QtWidgets.QGroupBox("2. Diagnostic")
+        # (2) Diagnostic Tool
+        gb_diag = QtWidgets.QGroupBox("2. Diagnostic Tool")
         v_diag = QtWidgets.QVBoxLayout(gb_diag)
-        self.btn_diag = QtWidgets.QPushButton("🔍 RUN DIAGNOSTIC (3s)")
+        self.btn_diag = QtWidgets.QPushButton("🔍 START DIAGNOSIS (Check Error)")
         self.btn_diag.setStyleSheet("background-color: #3498db; color: white;")
-        self.btn_diag.clicked.connect(self._start_diagnostic)
+        self.btn_diag.clicked.connect(self._start_diagnostic_ros)
+        
         self.txt_log = QtWidgets.QPlainTextEdit()
         self.txt_log.setReadOnly(True)
+        self.txt_log.setPlaceholderText("Ready. Press button to analyze traffic.")
         self.txt_log.setStyleSheet("background:#222; color:#0f0; font-family:Consolas; font-size:14px;")
         self.txt_log.setMinimumHeight(180)
         v_diag.addWidget(self.btn_diag); v_diag.addWidget(self.txt_log)
@@ -289,9 +286,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.btn_reset.clicked.connect(self._reset_T)
 
         vbox.addStretch(); vbox.addWidget(self.btn_save); vbox.addWidget(self.btn_reset)
-
         main_layout.addWidget(ctrl_panel)
-        self._timer = QtCore.QTimer(self); self._timer.timeout.connect(self.update_view); self._timer.start(33)
 
     def _create_btn(self, text, bg_color, func, text_color="black"):
         btn = QtWidgets.QPushButton(text)
@@ -329,26 +324,23 @@ class ManualCalibWindow(QtWidgets.QDialog):
         event.accept()
 
     def update_view(self):
-        """수동창 시각화 (마그넷 라인 제거)"""
         try:
             if self.gui.latest_frame is None or self.gui.cam_K is None: return
-            raw_img, pts_r, dops = self.gui.latest_frame.get("cv_image"), self.gui.latest_frame.get("radar_points"), self.gui.latest_frame.get("radar_doppler")
+            raw_img = self.gui.latest_frame.get("cv_image")
+            pts_r = self.gui.latest_frame.get("radar_points")
+            dops = self.gui.latest_frame.get("radar_doppler")
             if raw_img is None: return
 
             disp = raw_img.copy()
             K = self.gui.cam_K
-
-            # 수동 조작값 기반 투영
             uvs_man, valid_man = project_points(K, self.T_current[:3, :3], self.T_current[:3, 3], pts_r)
 
             if self.chk_grid.isChecked():
                 self._draw_grid_and_axis(disp, K, K[0, 2], K[1, 2])
-
             if self.chk_bbox.isChecked() and self.gui.vis_objects:
                 for obj in self.gui.vis_objects:
                     x1, y1, x2, y2 = obj['bbox']
                     cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
             if self.chk_raw.isChecked() and uvs_man is not None:
                 for i in range(len(uvs_man)):
                     if not valid_man[i]: continue
@@ -356,8 +348,6 @@ class ManualCalibWindow(QtWidgets.QDialog):
                     if self.chk_noise_filter.isChecked() and abs(vel) < 1.4: continue
                     color = (0, 0, 255) if vel < -0.5 else (255, 0, 0) if vel > 0.5 else (0, 255, 0)
                     cv2.circle(disp, (int(uvs_man[i, 0]), int(uvs_man[i, 1])), 3, color, -1)
-
-            if self.is_diagnosing and (time.time() - self.diag_start_time > 3.0): self._finish_diagnostic()
             self.img_view.update_image(disp)
         except Exception: pass
 
@@ -379,23 +369,28 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.T_current = self.T_init.copy(); self.update_view()
         self.txt_log.appendPlainText(">>> Reset to initial values.")
 
-    def _start_diagnostic(self):
-        self.is_diagnosing, self.diag_start_time, self.diag_data = True, time.time(), []
-        self.btn_diag.setEnabled(False); self.txt_log.setPlainText("Analyzing manual adjustment (3s)...")
+    def _start_diagnostic_ros(self):
+        """ROS 노드에게 진단 시작 요청 (고정 시점용 멘트)"""
+        self.btn_diag.setEnabled(False)
+        # [수정] 육교 고정 시점이므로 '운전' 지시 제거
+        self.txt_log.setPlainText(">> [REQUEST] Starting 30s Diagnosis...\n>> Collecting traffic data (50m+)...")
+        self.pub_diag_start.publish(True)
 
-    def _finish_diagnostic(self):
-        self.is_diagnosing = False; self.btn_diag.setEnabled(True)
-        if not self.diag_data: self.txt_log.setPlainText("No data captured."); return
-        far = [d for d in self.diag_data if d['dist'] >= 40.0]
-        if len(far) > 3:
-            au, av = np.mean([d['err_u'] for d in far]), np.mean([d['err_v'] for d in far])
-            cp, cy = int(round(av/15.0)), int(round(au/12.0))
-            self.txt_log.setPlainText(f"📋 [Diagnostic]\nPitch: {'Q' if cp>0 else 'A'} x{abs(cp)}\nYaw: {'S' if cy>0 else 'W'} x{abs(cy)}")
-        else: self.txt_log.setPlainText("Increase distance data (>40m).")
+    def _on_diag_msg(self, msg):
+        self.diag_signal.emit(msg.data)
 
-    def closeEvent(self, e): self._timer.stop(); super().closeEvent(e)
+    @Slot(str)
+    def _update_log_ui(self, text):
+        self.btn_diag.setEnabled(True)
+        self.txt_log.appendPlainText("\n" + "="*30)
+        self.txt_log.appendPlainText(text)
+        self.txt_log.appendPlainText("="*30)
+        self.txt_log.verticalScrollBar().setValue(self.txt_log.verticalScrollBar().maximum())
 
-    
+    def closeEvent(self, e): 
+        self._timer.stop() 
+        super().closeEvent(e)
+
 # ==============================================================================
 # Main GUI - [수정됨: 우측 패널 상단 세로 로고 배치, 전체화면]
 # ==============================================================================
