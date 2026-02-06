@@ -395,7 +395,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
 
     def closeEvent(self, e): self._timer.stop(); super().closeEvent(e)
 
-
+    
 # ==============================================================================
 # Main GUI - [수정됨: 우측 패널 상단 세로 로고 배치, 전체화면]
 # ==============================================================================
@@ -1178,12 +1178,16 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     print("[Extrinsic] already running...")
                     return
 
-            self.extrinsic_proc = QtCore.QProcess(self)
+            self.extrinsic_proc = QtCore.QProcess()
+            env = QtCore.QProcessEnvironment.systemEnvironment()
+            env.insert("QT_QPA_PLATFORM", "offscreen")  # Qt가 화면을 그리지 않고 백그라운드에서만 돌게 함
+            env.remove("DISPLAY")                       # 디스플레이 접근 차단
+            self.extrinsic_proc.setProcessEnvironment(env)
             self.extrinsic_proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
 
             self.txt_extrinsic_log.clear()
             self.txt_extrinsic_log.appendPlainText("[Extrinsic] START")
-            self.pbar_extrinsic.setVisible(True)
+            self.pbar_extrinsic.setVisible(False)
             self.pbar_extrinsic.setRange(0, 0)
 
             ws = os.path.expanduser("~/motrex/catkin_ws")
@@ -1195,7 +1199,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 f"rosrun perception_test calibration_ex_node.py "
                 f"_extrinsic_path:={self.extrinsic_path}"
             )
-            args = ["-lc", ros_cmd]
+            args = ["-c", ros_cmd]
             self.extrinsic_proc.readyReadStandardOutput.connect(self._on_extrinsic_stdout)
             self.extrinsic_proc.readyReadStandardError.connect(self._on_extrinsic_stderr)
             self.extrinsic_proc.finished.connect(self._on_extrinsic_finished)
@@ -1250,10 +1254,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
             self.txt_intrinsic_log.clear()
             self.txt_intrinsic_log.appendPlainText("[Intrinsic] START")
-            self.pbar_intrinsic.setVisible(True)
+            self.pbar_intrinsic.setVisible(False)
             self.pbar_intrinsic.setRange(0, 0)
 
-            self.intrinsic_proc = QtCore.QProcess(self)
+            self.intrinsic_proc = QtCore.QProcess() 
+            env = QtCore.QProcessEnvironment.systemEnvironment()
+            env.insert("QT_QPA_PLATFORM", "offscreen")
+            env.remove("DISPLAY")
+            self.intrinsic_proc.setProcessEnvironment(env)
             self.intrinsic_proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
 
             ws = os.path.expanduser("~/motrex/catkin_ws")
@@ -1270,7 +1278,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 f"_save_selected:=true _save_undistort:=true"
             )
 
-            args = ["-lc", ros_cmd]
+            args = ["-c", ros_cmd]
             self.intrinsic_proc.readyReadStandardOutput.connect(self._on_intrinsic_stdout)
             self.intrinsic_proc.readyReadStandardError.connect(self._on_intrinsic_stderr)
             self.intrinsic_proc.finished.connect(self._on_intrinsic_finished)
