@@ -64,7 +64,7 @@ from perception_lib.speed_utils import (
 )
 
 from perception_test.msg import AssociationArray, DetectionArray
-from perception_lib import perception_utils
+from perception_lib import calibration_utils
 from perception_lib import lane_utils
 
 os.environ["QT_LOGGING_RULES"] = "qt.gui.painting=false"
@@ -687,15 +687,25 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         # 5. View Options
         gb_vis = QtWidgets.QGroupBox("5. View Options")
         v_vis = QtWidgets.QVBoxLayout()
-        self.chk_show_poly = QtWidgets.QCheckBox("Show Lane Polygons"); self.chk_show_poly.setChecked(False)
         
-        # [수정] 아이디와 속도 체크박스 분리
-        self.chk_show_id = QtWidgets.QCheckBox("Show ID Text"); self.chk_show_id.setChecked(True)
-        self.chk_show_speed = QtWidgets.QCheckBox("Show Speed Text"); self.chk_show_speed.setChecked(True)
+        self.chk_show_poly = QtWidgets.QCheckBox("Show Lane Polygons")
+        self.chk_show_poly.setChecked(False)
+        
+        # [수정] 아이디와 속도 체크박스
+        self.chk_show_id = QtWidgets.QCheckBox("Show ID Text")
+        self.chk_show_id.setChecked(True)
+        self.chk_show_speed = QtWidgets.QCheckBox("Show Speed Text")
+        self.chk_show_speed.setChecked(True)
+
+        # [추가] 6번에서 가져온 레이더 포인트 토글 (검정색, 진하게)
+        self.chk_show_radar = QtWidgets.QCheckBox("Show Radar Points")
+        self.chk_show_radar.setChecked(True)
+        self.chk_show_radar.setStyleSheet("color: black; font-weight: bold;")
         
         v_vis.addWidget(self.chk_show_poly)
         v_vis.addWidget(self.chk_show_id)
         v_vis.addWidget(self.chk_show_speed)
+        v_vis.addWidget(self.chk_show_radar)
 
         self.chk_lanes = {}
         display_order = ["IN1", "OUT1", "IN2", "OUT2", "IN3", "OUT3"]
@@ -705,7 +715,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             chk = QtWidgets.QCheckBox(name)
             is_active = name in START_ACTIVE_LANES
             chk.setChecked(is_active)
-
             self.chk_lanes[name] = chk
             g_vis.addWidget(chk, i // 2, i % 2)
 
@@ -714,45 +723,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         btn_reset_id = QtWidgets.QPushButton("Reset Local IDs")
         btn_reset_id.clicked.connect(self.reset_ids)
         v_vis.addWidget(btn_reset_id)
+        
         gb_vis.setLayout(v_vis)
         vbox.addWidget(gb_vis)
 
-        # 6. Radar Speed Filters
-        gb_radar_f = QtWidgets.QGroupBox("6. Radar Speed Filters")
-        v_rf = QtWidgets.QVBoxLayout()
-        self.chk_show_approach = QtWidgets.QCheckBox("Approaching (+)")
-        self.chk_show_approach.setChecked(True)
-        self.chk_show_recede = QtWidgets.QCheckBox("Receding (-)")
-        self.chk_show_recede.setChecked(True)
-        
-        # New Toggle for Single Point
-        self.chk_single_point = QtWidgets.QCheckBox("Show Representative Point Only")
-        self.chk_single_point.setChecked(True)
-        self.chk_single_point.setStyleSheet("color: blue; font-weight: bold;")
+        # [삭제] 6. Radar Speed Filters 섹션 전체 삭제됨
 
-        self.chk_filter_low_speed = QtWidgets.QCheckBox("Low-Speed Noise Filter")
-        self.chk_filter_low_speed.setChecked(True)
-
-        row_thr = QtWidgets.QHBoxLayout()
-        row_thr.addWidget(QtWidgets.QLabel("Min Speed (km/h):"))
-        self.spin_min_speed_kmh = QtWidgets.QDoubleSpinBox()
-        self.spin_min_speed_kmh.setDecimals(1)
-        self.spin_min_speed_kmh.setRange(0.0, 80.0)
-        self.spin_min_speed_kmh.setSingleStep(0.5)
-        self.spin_min_speed_kmh.setValue(NOISE_MIN_SPEED_KMH)
-        row_thr.addWidget(self.spin_min_speed_kmh, stretch=1)
-
-        v_rf.addWidget(self.chk_show_approach)
-        v_rf.addWidget(self.chk_show_recede)
-        v_rf.addWidget(self.chk_filter_low_speed)
-        v_rf.addWidget(self.chk_single_point)
-        v_rf.addLayout(row_thr)
-
-        gb_radar_f.setLayout(v_rf)
-        vbox.addWidget(gb_radar_f)
-
-        # 7. Image Brightness
-        gb_brightness = QtWidgets.QGroupBox("7. Image Brightness")
+        # 6. Image Brightness (번호 7 -> 6으로 변경)
+        gb_brightness = QtWidgets.QGroupBox("6. Image Brightness")
         v_b = QtWidgets.QVBoxLayout()
         self.chk_brightness = QtWidgets.QCheckBox("Enable Brightness Gain")
         self.chk_brightness.setChecked(False)
@@ -768,10 +746,11 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v_b.addLayout(row_b)
         gb_brightness.setLayout(v_b)
         vbox.addWidget(gb_brightness)
+        
         self.chk_brightness.toggled.connect(self._update_brightness_params)
         self.spin_brightness_gain.valueChanged.connect(self._update_brightness_params)
 
-        # 하단 여백 추가 (패널 아래쪽)
+        # 하단 여백 추가
         vbox.addStretch()
         layout.addWidget(panel, stretch=0)
         
@@ -1007,7 +986,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 score = 0
                 radar_dist = -1.0 # 거리 저장용 변수 초기화
 
-                # --- 속도 추정 ---
                 if proj_uvs is not None and dop_raw is not None:
                     meas_kmh, rep_pt, rep_vel_raw, score, radar_dist = select_representative_point(
                         proj_uvs,
@@ -1020,7 +998,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                         self.pt_alpha,
                         now_ts,
                         g_id,
-                        self.spin_min_speed_kmh.value(),
+                        NOISE_MIN_SPEED_KMH,  # [수정] UI 변수 대신 고정값(5.0) 사용
                     )
                     if rep_pt is not None:
                         acc_scores.append(score)
@@ -1039,7 +1017,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 score = score_out
 
                 # --- [DATA LOGGING] ---
-                # 기록 모드일 때만 버퍼에 추가
                 if self.data_logger.is_recording:
                     data_row = build_record_row(
                         now_ts,
@@ -1065,25 +1042,26 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 self.bar_acc.setValue(int(avg))
                 self.lbl_emoji.setText("😊" if avg >= 80 else "😐" if avg >= 50 else "😟")
             
-            # 레코딩 상태 라벨 업데이트
             if self.data_logger.is_recording:
                  self.lbl_record_status.setText(f"Recording... [{self.data_logger.record_count} pts]")
 
             # 6. 그리기 (Draw)
-            if not self.chk_single_point.isChecked() and proj_uvs is not None:
+            # [수정] "Show Radar Points"가 켜져 있을 때만 노이즈 필터링된 점들을 그림
+            if self.chk_show_radar.isChecked() and proj_uvs is not None:
                 for i in range(len(proj_uvs)):
                     if not proj_valid[i]: continue
                     u, v = int(proj_uvs[i, 0]), int(proj_uvs[i, 1])
                     spd = dop_raw[i] * 3.6
-                    if abs(spd) < self.spin_min_speed_kmh.value(): continue
+                    
+                    # [수정] UI 변수 대신 고정값 사용
+                    if abs(spd) < NOISE_MIN_SPEED_KMH: continue
+                    
                     col = (0, 0, 255) if spd < -0.5 else (255, 0, 0) if spd > 0.5 else (0, 255, 0)
                     cv2.circle(disp, (u, v), 2, col, -1)
 
             for it in draw_items:
                 x1, y1, x2, y2 = it["bbox"]
                 cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                # [수정] 노란 타겟 점 (중앙)
                 cv2.circle(disp, it["target_pt"], 4, (0, 255, 255), -1) 
 
                 if it["rep_pt"] is not None:
@@ -1091,12 +1069,12 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                         lc = (0, 255, 0) if it["score"] > 50 else (0, 0, 255)
                         cv2.line(disp, it["target_pt"], it["rep_pt"], lc, 2)
                     
-                    if self.chk_single_point.isChecked():
-                        rv = it["rep_vel"]
-                        if rv is not None and abs(rv) >= self.spin_min_speed_kmh.value():
-                            col = (0, 0, 255) if rv < -0.5 else (255, 0, 0) if rv > 0.5 else (0, 255, 0)
-                            cv2.circle(disp, it["rep_pt"], 5, col, -1)
-                            cv2.circle(disp, it["rep_pt"], 6, (255, 255, 255), 1)
+                    # [수정] 대표점은 체크박스 없이 항상 그림 (단, 속도가 노이즈 이상일 때)
+                    rv = it["rep_vel"]
+                    if rv is not None and abs(rv) >= NOISE_MIN_SPEED_KMH:
+                        col = (0, 0, 255) if rv < -0.5 else (255, 0, 0) if rv > 0.5 else (0, 255, 0)
+                        cv2.circle(disp, it["rep_pt"], 5, col, -1)
+                        cv2.circle(disp, it["rep_pt"], 6, (255, 255, 255), 1)
 
                 lines = []
                 if self.chk_show_id.isChecked(): lines.append(it['label'])
@@ -1152,61 +1130,17 @@ class RealWorldGUI(QtWidgets.QMainWindow):
     def load_lane_polys(self):
         try:
             self.lane_polys = lane_utils.load_lane_polys(self.lane_json_path)
-        except:
+        except Exception:
             self.lane_polys = {}
 
     def load_extrinsic(self):
-        if os.path.exists(self.extrinsic_path):
-            try:
-                with open(self.extrinsic_path, 'r') as f:
-                    data = json.load(f)
-                self.Extr_R = np.array(data['R'])
-                self.Extr_t = np.array(data['t'])
-                self.extrinsic_mtime = os.path.getmtime(self.extrinsic_path)
-                self.extrinsic_last_loaded = time.time()
-            except:
-                pass
+        calibration_utils.load_extrinsic(self)
 
     def run_calibration(self):
-        dlg = ManualCalibWindow(self)
-        dlg.exec()
+        calibration_utils.run_calibration(self, ManualCalibWindow)
 
     def run_autocalibration(self):
-        try:
-            if hasattr(self, "extrinsic_proc") and self.extrinsic_proc is not None:
-                if self.extrinsic_proc.state() != QtCore.QProcess.NotRunning:
-                    print("[Extrinsic] already running...")
-                    return
-
-            self.extrinsic_proc = QtCore.QProcess()
-            env = QtCore.QProcessEnvironment.systemEnvironment()
-            env.insert("QT_QPA_PLATFORM", "offscreen")  # Qt가 화면을 그리지 않고 백그라운드에서만 돌게 함
-            env.remove("DISPLAY")                       # 디스플레이 접근 차단
-            self.extrinsic_proc.setProcessEnvironment(env)
-            self.extrinsic_proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
-
-            self.txt_extrinsic_log.clear()
-            self.txt_extrinsic_log.appendPlainText("[Extrinsic] START")
-            self.pbar_extrinsic.setVisible(False)
-            self.pbar_extrinsic.setRange(0, 0)
-
-            ws = os.path.expanduser("~/motrex/catkin_ws")
-            setup_bash = os.path.join(ws, "devel", "setup.bash")
-
-            cmd = "bash"
-            ros_cmd = (
-                f"source {setup_bash} && "
-                f"rosrun perception_test calibration_ex_node.py "
-                f"_extrinsic_path:={self.extrinsic_path}"
-            )
-            args = ["-c", ros_cmd]
-            self.extrinsic_proc.readyReadStandardOutput.connect(self._on_extrinsic_stdout)
-            self.extrinsic_proc.readyReadStandardError.connect(self._on_extrinsic_stderr)
-            self.extrinsic_proc.finished.connect(self._on_extrinsic_finished)
-            self.extrinsic_proc.start(cmd, args)
-        except Exception as e:
-            print(f"[Extrinsic] start error: {e}")
-            traceback.print_exc()
+        calibration_utils.run_autocalibration(self)
 
     def _on_extrinsic_stdout(self):
         if not hasattr(self, "extrinsic_proc") or self.extrinsic_proc is None:
@@ -1231,62 +1165,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.txt_extrinsic_log.appendPlainText("[Extrinsic] DONE.")
 
     def run_intrinsic_calibration(self):
-        try:
-            rp = rospkg.RosPack()
-            pkg_path = rp.get_path("perception_test")
-            image_dir = os.path.join(pkg_path, "image")
-            out_yaml = os.path.join(pkg_path, "config", "camera_intrinsic.yaml")
-
-            if not os.path.isdir(image_dir):
-                print(f"[Intrinsic] image dir not found: {image_dir}")
-                return
-
-            import glob
-            imgs = sorted(glob.glob(os.path.join(image_dir, "*.jpg")))
-            if len(imgs) == 0:
-                print(f"[Intrinsic] No .jpg in {image_dir}")
-                return
-
-            if hasattr(self, "intrinsic_proc") and self.intrinsic_proc is not None:
-                if self.intrinsic_proc.state() != QtCore.QProcess.NotRunning:
-                    print("[Intrinsic] already running...")
-                    return
-
-            self.txt_intrinsic_log.clear()
-            self.txt_intrinsic_log.appendPlainText("[Intrinsic] START")
-            self.pbar_intrinsic.setVisible(False)
-            self.pbar_intrinsic.setRange(0, 0)
-
-            self.intrinsic_proc = QtCore.QProcess() 
-            env = QtCore.QProcessEnvironment.systemEnvironment()
-            env.insert("QT_QPA_PLATFORM", "offscreen")
-            env.remove("DISPLAY")
-            self.intrinsic_proc.setProcessEnvironment(env)
-            self.intrinsic_proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
-
-            ws = os.path.expanduser("~/motrex/catkin_ws")
-            setup_bash = os.path.join(ws, "devel", "setup.bash")
-
-            cmd = "bash"
-            ros_cmd = (
-                f"source {setup_bash} && "
-                f"rosrun perception_test calibration_in_node.py "
-                f"_image_dir:={image_dir} "
-                f"_output_path:={out_yaml} "
-                f"_board/width:=10 _board/height:=7 _board/square_size:=0.025 "
-                f"_min_samples:=20 _max_selected:=45 _grid_size_mm:=50 "
-                f"_save_selected:=true _save_undistort:=true"
-            )
-
-            args = ["-c", ros_cmd]
-            self.intrinsic_proc.readyReadStandardOutput.connect(self._on_intrinsic_stdout)
-            self.intrinsic_proc.readyReadStandardError.connect(self._on_intrinsic_stderr)
-            self.intrinsic_proc.finished.connect(self._on_intrinsic_finished)
-            self.intrinsic_proc.start(cmd, args)
-
-        except Exception as e:
-            print(f"[Intrinsic] start error: {e}")
-            traceback.print_exc()
+        calibration_utils.run_intrinsic_calibration(self)
 
     def _on_intrinsic_stdout(self):
         if not hasattr(self, "intrinsic_proc") or self.intrinsic_proc is None:
