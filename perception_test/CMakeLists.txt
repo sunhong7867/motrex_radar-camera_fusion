@@ -60,6 +60,7 @@ catkin_install_python(PROGRAMS
   src/nodes/offline_provider_node.py
   src/nodes/radar_cluster_bbox_node.py
   src/nodes/radar_metrics_node.py
+  src/nodes/log_saver_node.py
   src/nodes/speed_estimator_node.py
   src/nodes/tracker_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

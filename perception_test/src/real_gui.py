@@ -28,17 +28,13 @@ import os
 import json
 import time
 import traceback
-import csv          # CSV 저장을 위해 필수
-import datetime     # 파일명 날짜 표기를 위해 필수
 import numpy as np
-import pandas as pd # 데이터 분석 및 카를라 스타일 저장을 위해 필수
 import cv2
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
 from collections import deque
 
 os.environ["QT_LOGGING_RULES"] = "qt.gui.painting=false"
-LOG_BASE_DIR = os.path.expanduser("~/motrex/catkin_ws/src/perception_test/calibration_logs")
 
 # ==============================================================================
 # [PARAMETER SETTINGS] 사용자 설정
@@ -84,23 +80,22 @@ START_ACTIVE_LANES = ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.append(CURRENT_DIR)
+NODES_DIR = os.path.join(CURRENT_DIR, "nodes")
+if NODES_DIR in sys.path:
+    sys.path.remove(NODES_DIR)
+sys.path.insert(0, NODES_DIR)
+from log_saver_node import save_sequential_data
 
-try:
-    from PySide6 import QtWidgets, QtGui, QtCore
-    import rospy
-    import rospkg
-    import message_filters
-    from sensor_msgs.msg import Image, PointCloud2, CameraInfo
-    from cv_bridge import CvBridge
-    import sensor_msgs.point_cloud2 as pc2
-
-    from perception_test.msg import AssociationArray, DetectionArray
-    from perception_lib import perception_utils
-    from perception_lib import lane_utils
-except ImportError as e:
-    print(f"\n[GUI Error] 필수 라이브러리 로드 실패: {e}")
-    sys.exit(1)
-
+from PySide6 import QtWidgets, QtGui, QtCore
+import rospy
+import rospkg
+import message_filters
+from sensor_msgs.msg import Image, PointCloud2, CameraInfo
+from cv_bridge import CvBridge
+import sensor_msgs.point_cloud2 as pc2
+from perception_test.msg import AssociationArray, DetectionArray
+from perception_lib import perception_utils
+from perception_lib import lane_utils
 
 # ==============================================================================
 # Helper Functions (Clustering & Math)
@@ -1125,86 +1120,17 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
     def _save_sequential_data(self):
         """순차적 폴더(1, 2, 3...) 생성 및 데이터 저장 (수정됨)"""
-        if not self.record_buffer:
+        result = save_sequential_data(self.record_buffer)
+        if result["status"] == "no_data":
             self.lbl_record_status.setText("Status: No Data Collected")
             return
 
-        try:
-            # 1. 상위 로그 폴더 확인 및 생성
-            if not os.path.exists(LOG_BASE_DIR):
-                os.makedirs(LOG_BASE_DIR)
-            
-            # 2. 숫자 폴더 중 가장 큰 값 찾아 다음 번호 결정
-            existing = [d for d in os.listdir(LOG_BASE_DIR) if d.isdigit()]
-            if existing:
-                next_num = max([int(d) for d in existing]) + 1
-            else:
-                next_num = 1
-            
-            target_dir = os.path.join(LOG_BASE_DIR, str(next_num))
-            os.makedirs(target_dir, exist_ok=True)
-
-            df = pd.DataFrame(self.record_buffer)
-            
-            # [저장 1] Raw 데이터 저장
-            # 모든 프레임 단위 데이터를 저장합니다.
-            raw_path = os.path.join(target_dir, "raw_main.csv")
-            df.to_csv(raw_path, index=False)
-            
-            # [저장 2] ID별 분석 데이터 (Local_No와 Lane_Path 조합)
-            # - 요구사항: 같은 ID라도 차선 경로(IN1->IN2)가 다르면 구분해야 함.
-            # - Unique_Key 컬럼을 기준으로 그룹핑하여 통계 산출
-            if "Unique_Key" in df.columns:
-                stats_id = df.groupby("Unique_Key").agg({
-                    "Local_ID": "first",
-                    "Lane_Path": "first",
-                    "Final_Lane": "last",
-                    "Radar_Dist": ["count", "mean", "min", "max"],
-                    "Radar_Vel": "mean",
-                    "Track_Vel": "mean",
-                    "Score": "mean"
-                }).reset_index()
-                
-                # 컬럼명 정리 (MultiIndex 해제)
-                stats_id.columns = [
-                    'Unique_Key', 'Local_ID', 'Lane_Path', 'Final_Lane', 
-                    'Count', 'Mean_Dist', 'Min_Dist', 'Max_Dist', 
-                    'Mean_Radar_Vel', 'Mean_Track_Vel', 'Mean_Score'
-                ]
-                
-                id_path = os.path.join(target_dir, "id_analysis.csv")
-                stats_id.to_csv(id_path, index=False)
-
-            # [저장 3] 거리별 오차 분석용 데이터 (Binning)
-            # - 10m 단위로 거리를 구간화하여 통계 저장
-            # - GT가 없으므로 Radar 속도와 Track 속도 분포를 확인
-            if "Radar_Dist" in df.columns:
-                df["Dist_Bin"] = (df["Radar_Dist"] // 10) * 10
-                stats_dist = df.groupby("Dist_Bin").agg({
-                    "Radar_Vel": ["count", "mean", "std"],
-                    "Track_Vel": ["mean", "std"],
-                    "Score": "mean"
-                }).reset_index()
-                
-                stats_dist.columns = [
-                    'Dist_Bin_m', 
-                    'Count', 'Radar_Vel_Mean', 'Radar_Vel_Std',
-                    'Track_Vel_Mean', 'Track_Vel_Std', 
-                    'Score_Mean'
-                ]
-                
-                dist_path = os.path.join(target_dir, "dist_analysis.csv")
-                stats_dist.to_csv(dist_path, index=False)
-
-            self.lbl_record_status.setText(f"Status: Saved in Folder {next_num}")
-            print(f"[Data Log] Saved to {target_dir}")
-            
-            self.record_buffer = [] # 버퍼 초기화
-            
-        except Exception as e:
-            self.lbl_record_status.setText("Status: Error")
-            print(f"Save failed: {e}")
-            traceback.print_exc()
+        if result["status"] == "saved":
+            self.lbl_record_status.setText(f"Status: Saved in Folder {result['folder']}")
+            print(f"[Data Log] Saved to {result['target_dir']}")
+            self.record_buffer = []
+            return
+        self.lbl_record_status.setText("Status: Error")
 
     # ------------------ Callback (Synchronized) ------------------
     def cb_sync(self, img_msg, radar_msg):
