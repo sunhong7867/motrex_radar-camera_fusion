@@ -13,9 +13,9 @@ real_gui.py (Updated)
    - (Speed Estimation 그룹 제거 -> 내부 기본값으로 동작 유지)
 
 2. 시각화 로직 개선:
-   - Magnet Line: BBox 상단 중앙(노란 점) <-> 레이더 대표 점 연결 (초록~빨강)
+   - Magnet Line: BBox 중앙 <-> 레이더 대표 점/클러스터 대표점 토글 연결
    - Representative Point: 상단 30% 영역의 중앙값 사용 (Single Point 모드)
-   - Accuracy Gauge: 오차율 기반 실시간 점수 표시
+   - Accuracy/Score: 캘리브레이션 정확도/트랙 속도 점수 분리 표시
 
 3. 데이터 저장 (Data Logging) 수정:
    - update_loop 내 record_buffer 채우기 로직 추가
@@ -29,6 +29,7 @@ import json
 import time
 import traceback
 from collections import deque
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -108,6 +109,70 @@ BRIGHTNESS_PARAM_GAIN = "/object_detector/runtime/brightness_gain"
 
 START_ACTIVE_LANES = ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]
 
+def cluster_radar_points(
+    points: np.ndarray,
+    doppler: Optional[np.ndarray],
+    max_dist: float,
+    min_pts: int,
+    min_speed_mps: float,
+) -> list:
+    if points is None or len(points) == 0:
+        return []
+
+    n = points.shape[0]
+    visited = np.zeros(n, dtype=bool)
+    clusters = []
+
+    for i in range(n):
+        if visited[i]:
+            continue
+        dist_sq = np.sum((points[:, :2] - points[i, :2]) ** 2, axis=1)
+        neighbors = np.where((dist_sq <= max_dist**2) & (~visited))[0]
+        if len(neighbors) < min_pts:
+            visited[i] = True
+            continue
+        visited[neighbors] = True
+        vel_med = None
+        if doppler is not None and doppler.size > 0:
+            vel_med = float(np.median(doppler[neighbors]))
+            if abs(vel_med) < min_speed_mps:
+                continue
+        centroid = np.median(points[neighbors], axis=0)
+        clusters.append((centroid, vel_med))
+
+    return clusters
+
+
+def score_point_to_bbox(target_pt: Tuple[int, int], ref_pt: Tuple[int, int], bbox: Tuple[int, int, int, int]) -> float:
+    if target_pt is None or ref_pt is None:
+        return 0.0
+    x1, y1, x2, y2 = bbox
+    dist_px = np.hypot(target_pt[0] - ref_pt[0], target_pt[1] - ref_pt[1])
+    diag_len = np.hypot(x2 - x1, y2 - y1)
+    err_ratio = dist_px / max(1, diag_len)
+    return float(max(0, min(100, 100 - (err_ratio * 200))))
+
+
+def select_cluster_point_for_bbox(
+    cluster_uvs: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+) -> Optional[Tuple[int, int]]:
+    if cluster_uvs is None or cluster_uvs.size == 0:
+        return None
+    x1, y1, x2, y2 = bbox
+    inside = (
+        (cluster_uvs[:, 0] >= x1)
+        & (cluster_uvs[:, 0] <= x2)
+        & (cluster_uvs[:, 1] >= y1)
+        & (cluster_uvs[:, 1] <= y2)
+    )
+    if not np.any(inside):
+        return None
+    candidates = cluster_uvs[inside]
+    target_pt = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
+    dists = np.hypot(candidates[:, 0] - target_pt[0], candidates[:, 1] - target_pt[1])
+    idx = int(np.argmin(dists))
+    return (int(candidates[idx, 0]), int(candidates[idx, 1]))
 # ==============================================================================
 # UI Classes
 # ==============================================================================
@@ -621,23 +686,45 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         vbox.addWidget(gb_calib)
 
         # 2. Calibration Accuracy (New)
-        gb2 = QtWidgets.QGroupBox("2. Calibration Accuracy")
+        gb2 = QtWidgets.QGroupBox("2. Accuracy / Score")
         v2 = QtWidgets.QVBoxLayout()
         
         h_acc = QtWidgets.QHBoxLayout()
-        self.bar_acc = QtWidgets.QProgressBar()
-        self.bar_acc.setRange(0, 100)
-        self.bar_acc.setValue(0)
-        self.bar_acc.setStyleSheet("QProgressBar::chunk { background-color: #4CAF50; }")
-        self.lbl_emoji = QtWidgets.QLabel("😐")
-        self.lbl_emoji.setStyleSheet("font-size: 30px;")
-        h_acc.addWidget(self.bar_acc); h_acc.addWidget(self.lbl_emoji)
+        lbl_calib = QtWidgets.QLabel("Calibration Accuracy")
+        self.bar_calib_acc = QtWidgets.QProgressBar()
+        self.bar_calib_acc.setRange(0, 100)
+        self.bar_calib_acc.setValue(0)
+        self.bar_calib_acc.setStyleSheet("QProgressBar::chunk { background-color: #4CAF50; }")
+        lbl_emoji = QtWidgets.QLabel("😐")
+        lbl_emoji.setStyleSheet("font-size: 30px;")
+        self.lbl_emoji = lbl_emoji
+        h_acc.addWidget(lbl_calib)
+        h_acc.addWidget(self.bar_calib_acc, stretch=1)
+        h_acc.addWidget(self.lbl_emoji)
+
+        h_score = QtWidgets.QHBoxLayout()
+        lbl_speed_score = QtWidgets.QLabel("Track Speed Score")
+        self.bar_speed_score = QtWidgets.QProgressBar()
+        self.bar_speed_score.setRange(0, 100)
+        self.bar_speed_score.setValue(0)
+        self.bar_speed_score.setStyleSheet("QProgressBar::chunk { background-color: #2196F3; }")
+        h_score.addWidget(lbl_speed_score)
+        h_score.addWidget(self.bar_speed_score, stretch=1)
+
         
         self.chk_magnet = QtWidgets.QCheckBox("Show Magnet Line (Validation)")
         self.chk_magnet.setChecked(True)
         
+        self.cmb_magnet_mode = QtWidgets.QComboBox()
+        self.cmb_magnet_mode.addItems([
+            "BBox Representative (Speed)",
+            "Cluster Center (Calibration)",
+        ])
+
         v2.addLayout(h_acc)
+        v2.addLayout(h_score)
         v2.addWidget(self.chk_magnet)
+        v2.addWidget(self.cmb_magnet_mode)
         gb2.setLayout(v2); vbox.addWidget(gb2)
 
         # 3. Lane Editor
@@ -914,12 +1001,29 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             proj_uvs = None
             proj_valid = None
             projected_count = 0 
+            cluster_uvs = None
+            cluster_valid = None
 
             if pts_raw is not None and self.cam_K is not None:
                 uvs, valid = project_points(self.cam_K, self.Extr_R, self.Extr_t, pts_raw)
                 proj_uvs = uvs
                 proj_valid = valid
                 projected_count = int(np.sum(valid))
+
+                if self.Extr_R is not None and self.Extr_t is not None:
+                    min_speed_mps = NOISE_MIN_SPEED_KMH / 3.6
+                    clusters = cluster_radar_points(
+                        pts_raw,
+                        dop_raw,
+                        CLUSTER_MAX_DIST,
+                        CLUSTER_MIN_PTS,
+                        min_speed_mps,
+                    )
+                    if clusters:
+                        centers = np.array([c[0] for c in clusters], dtype=np.float64)
+                        cuv, cvalid = project_points(self.cam_K, self.Extr_R, self.Extr_t, centers)
+                        cluster_uvs = cuv
+                        cluster_valid = cvalid
 
             # 3. 차선 필터 준비
             active_lane_polys = {}
@@ -931,7 +1035,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             has_lane_filter = bool(active_lane_polys)
 
             draw_items = []
-            acc_scores = []
+            calib_scores = []
+            speed_scores = []
             now_ts = time.time()
 
             # 4. 객체별 데이터 처리 루프
@@ -980,6 +1085,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 rep_vel_raw = None
                 score = 0
                 radar_dist = -1.0 # 거리 저장용 변수 초기화
+                cluster_pt = None
+                cluster_score = 0.0
 
                 if proj_uvs is not None and dop_raw is not None:
                     meas_kmh, rep_pt, rep_vel_raw, score, radar_dist = select_representative_point(
@@ -995,8 +1102,21 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                         g_id,
                         NOISE_MIN_SPEED_KMH,  # [수정] UI 변수 대신 고정값(5.0) 사용
                     )
-                    if rep_pt is not None:
-                        acc_scores.append(score)
+                if cluster_uvs is not None and cluster_valid is not None:
+                    valid_clusters = cluster_uvs[cluster_valid]
+                    cluster_pt = select_cluster_point_for_bbox(valid_clusters, (x1, y1, x2, y2))
+                    if cluster_pt is not None:
+                        cluster_score = score_point_to_bbox(target_pt, cluster_pt, (x1, y1, x2, y2))
+                        if cluster_score < 50:
+                            cluster_pt = None
+                            cluster_score = 0.0
+
+                if rep_vel_raw is None or abs(rep_vel_raw) < NOISE_MIN_SPEED_KMH:
+                    cluster_pt = None
+                    cluster_score = 0.0
+
+                if cluster_score > 0:
+                    calib_scores.append(cluster_score)
 
                 vel_out, score_out = update_speed_estimate(
                     g_id,
@@ -1010,6 +1130,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
                 obj['vel'] = round(vel_out, 1) if vel_out is not None else float('nan')
                 score = score_out
+                if score_out > 0:
+                    speed_scores.append(score_out)
 
                 # --- [DATA LOGGING] ---
                 if self.data_logger.is_recording:
@@ -1028,15 +1150,29 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
                 draw_items.append({
                     "obj": obj, "bbox": (x1, y1, x2, y2), "label": label,
-                    "rep_pt": rep_pt, "rep_vel": rep_vel_raw, "target_pt": target_pt, "score": score
+                    "rep_pt": rep_pt,
+                    "rep_vel": rep_vel_raw,
+                    "target_pt": target_pt,
+                    "score": score,
+                    "cluster_pt": cluster_pt,
+                    "cluster_score": cluster_score,
                 })
 
             # 5. 전역 UI 업데이트
-            if acc_scores:
-                avg = sum(acc_scores) / len(acc_scores)
-                self.bar_acc.setValue(int(avg))
+            if calib_scores:
+                avg = sum(calib_scores) / len(calib_scores)
+                self.bar_calib_acc.setValue(int(avg))
                 self.lbl_emoji.setText("😊" if avg >= 80 else "😐" if avg >= 50 else "😟")
-            
+            else:
+                self.bar_calib_acc.setValue(0)
+                self.lbl_emoji.setText("😐")
+
+            if speed_scores:
+                avg_speed = sum(speed_scores) / len(speed_scores)
+                self.bar_speed_score.setValue(int(avg_speed))
+            else:
+                self.bar_speed_score.setValue(0)
+
             if self.data_logger.is_recording:
                  self.lbl_record_status.setText(f"Recording... [{self.data_logger.record_count} pts]")
 
@@ -1059,11 +1195,25 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.circle(disp, it["target_pt"], 4, (0, 255, 255), -1) 
 
+                magnet_mode = self.cmb_magnet_mode.currentText()
+                magnet_pt = None
+                magnet_score = 0.0
+                if magnet_mode == "Cluster Center (Calibration)":
+                    magnet_pt = it["cluster_pt"]
+                    magnet_score = it["cluster_score"]
+                else:
+                    magnet_pt = it["rep_pt"]
+                    magnet_score = it["score"]
+
+                if magnet_pt is not None and self.chk_magnet.isChecked():
+                    lc = (0, 255, 0) if magnet_score > 50 else (0, 0, 255)
+                    cv2.line(disp, it["target_pt"], magnet_pt, lc, 2)
+
+                if it["cluster_pt"] is not None and magnet_mode == "Cluster Center (Calibration)":
+                    cv2.circle(disp, it["cluster_pt"], 5, (255, 0, 255), -1)
+                    cv2.circle(disp, it["cluster_pt"], 6, (255, 255, 255), 1)
+
                 if it["rep_pt"] is not None:
-                    if self.chk_magnet.isChecked():
-                        lc = (0, 255, 0) if it["score"] > 50 else (0, 0, 255)
-                        cv2.line(disp, it["target_pt"], it["rep_pt"], lc, 2)
-                    
                     # [수정] 대표점은 체크박스 없이 항상 그림 (단, 속도가 노이즈 이상일 때)
                     rv = it["rep_vel"]
                     if rv is not None and abs(rv) >= NOISE_MIN_SPEED_KMH:
