@@ -104,9 +104,6 @@ TOPIC_FINAL_OUT = "/perception_test/output"
 TOPIC_TRACKS = "/perception_test/tracks"
 TOPIC_ASSOCIATED = "/perception_test/associated"
 
-BRIGHTNESS_PARAM_ENABLE = "/object_detector/runtime/brightness_enable"
-BRIGHTNESS_PARAM_GAIN = "/object_detector/runtime/brightness_gain"
-
 START_ACTIVE_LANES = ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]
 
 def cluster_radar_points(
@@ -405,21 +402,22 @@ class ManualCalibWindow(QtWidgets.QDialog):
             if self.chk_bbox.isChecked() and self.gui.vis_objects:
                 for obj in self.gui.vis_objects:
                     x1, y1, x2, y2 = obj['bbox']
-                    cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 0, 255), 2)
             if self.chk_raw.isChecked() and uvs_man is not None:
                 for i in range(len(uvs_man)):
                     if not valid_man[i]: continue
                     vel = dops[i] if (dops is not None and i < len(dops)) else 0.0
                     if self.chk_noise_filter.isChecked() and abs(vel) < 1.4: continue
-                    color = (0, 0, 255) if vel < -0.5 else (255, 0, 0) if vel > 0.5 else (0, 255, 0)
-                    cv2.circle(disp, (int(uvs_man[i, 0]), int(uvs_man[i, 1])), 3, color, -1)
+                    color = (0, 255, 255)
+                    cv2.circle(disp, (int(uvs_man[i, 0]), int(uvs_man[i, 1])), 5, color, -1)
             self.img_view.update_image(disp)
         except Exception: pass
 
     def _draw_grid_and_axis(self, img, K, cx, cy):
-        grid_z = -1.5; purple = (255, 0, 255)
-        for x in np.arange(-15, 16, 3): self._draw_safe_line(img, [x, 0, grid_z], [x, 100, grid_z], K, cx, cy, purple)
-        for y in range(0, 101, 10): self._draw_safe_line(img, [-15, y, grid_z], [15, y, grid_z], K, cx, cy, purple)
+        grid_z = -1.5; grid_color = (0, 255, 0)
+        for x in np.arange(-15, 16, 3): self._draw_safe_line(img, [x, 0, grid_z], [x, 100, grid_z], K, cx, cy, grid_color)
+        for y in range(0, 101, 10): self._draw_safe_line(img, [-15, y, grid_z], [15, y, grid_z], K, cx, cy, grid_color)
+
 
     def _draw_safe_line(self, img, p1, p2, K, cx, cy, color):
         pts = np.vstack([p1, p2]); uv, v = project_points(K, self.T_current[:3,:3], self.T_current[:3,3], pts)
@@ -505,7 +503,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         # ---------------- Speed estimation memory / smoothing ----------------
         self.vel_memory = {}
-        self.vel_hold_sec_default = 10.0
+        self.vel_hold_sec = 0.6
+        self.vel_decay_sec = 0.8
+        self.vel_decay_floor_kmh = 5.0
+        self.vel_rate_limit_kmh_per_s = 12.0
         self.radar_frame_count = 0
         self.radar_warmup_frames = 8
         self.max_jump_kmh = 25.0
@@ -699,7 +700,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         lbl_emoji.setStyleSheet("font-size: 30px;")
         self.lbl_emoji = lbl_emoji
         h_acc.addWidget(lbl_calib)
-        h_acc.addWidget(self.bar_calib_acc, stretch=1)
+        h_acc.addStretch(1)
         h_acc.addWidget(self.lbl_emoji)
 
         h_score = QtWidgets.QHBoxLayout()
@@ -709,8 +710,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.bar_speed_score.setValue(0)
         self.bar_speed_score.setStyleSheet("QProgressBar::chunk { background-color: #2196F3; }")
         h_score.addWidget(lbl_speed_score)
-        h_score.addWidget(self.bar_speed_score, stretch=1)
-
         
         self.chk_magnet = QtWidgets.QCheckBox("Show Magnet Line (Validation)")
         self.chk_magnet.setChecked(True)
@@ -722,7 +721,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         ])
 
         v2.addLayout(h_acc)
+        v2.addWidget(self.bar_calib_acc)
         v2.addLayout(h_score)
+        v2.addWidget(self.bar_speed_score)
         v2.addWidget(self.chk_magnet)
         v2.addWidget(self.cmb_magnet_mode)
         gb2.setLayout(v2); vbox.addWidget(gb2)
@@ -809,35 +810,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_vis.setLayout(v_vis)
         vbox.addWidget(gb_vis)
 
-        # [삭제] 6. Radar Speed Filters 섹션 전체 삭제됨
-
-        # 6. Image Brightness (번호 7 -> 6으로 변경)
-        gb_brightness = QtWidgets.QGroupBox("6. Image Brightness")
-        v_b = QtWidgets.QVBoxLayout()
-        self.chk_brightness = QtWidgets.QCheckBox("Enable Brightness Gain")
-        self.chk_brightness.setChecked(False)
-        row_b = QtWidgets.QHBoxLayout()
-        row_b.addWidget(QtWidgets.QLabel("Gain (x):"))
-        self.spin_brightness_gain = QtWidgets.QDoubleSpinBox()
-        self.spin_brightness_gain.setDecimals(2)
-        self.spin_brightness_gain.setRange(0.3, 2.5)
-        self.spin_brightness_gain.setSingleStep(0.05)
-        self.spin_brightness_gain.setValue(1.0)
-        row_b.addWidget(self.spin_brightness_gain, stretch=1)
-        v_b.addWidget(self.chk_brightness)
-        v_b.addLayout(row_b)
-        gb_brightness.setLayout(v_b)
-        vbox.addWidget(gb_brightness)
-        
-        self.chk_brightness.toggled.connect(self._update_brightness_params)
-        self.spin_brightness_gain.valueChanged.connect(self._update_brightness_params)
-
         # 하단 여백 추가
         vbox.addStretch()
         layout.addWidget(panel, stretch=0)
-        
-        self._update_brightness_params()
-        
+                
         # 내부적으로 사용하는 speed parameter 들 (UI에는 없지만 로직 유지를 위해 필요)
         self.spin_hold_sec = type('obj', (object,), {'value': lambda: 10.0})
         self.cmb_smoothing = type('obj', (object,), {'currentText': lambda: "EMA"})
@@ -847,17 +823,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.lane_counters = {name: 0 for name in self.lane_counters.keys()}
         self.global_to_local_ids = {}
         self.vehicle_lane_paths = {}
-
-    def _update_brightness_params(self):
-        if not hasattr(self, "chk_brightness") or not hasattr(self, "spin_brightness_gain"):
-            return
-        enabled = bool(self.chk_brightness.isChecked())
-        gain = float(self.spin_brightness_gain.value())
-        try:
-            rospy.set_param(BRIGHTNESS_PARAM_ENABLE, enabled)
-            rospy.set_param(BRIGHTNESS_PARAM_GAIN, gain)
-        except Exception as e:
-            print(f"Brightness Param Error: {e}")
 
     def _toggle_recording(self):
         """기록 시작/중단 토글 및 스타일 제어"""
@@ -990,12 +955,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             if self.cv_image is None: return
 
             disp = self.cv_image.copy()
-            
-            # 밝기 조절
-            if hasattr(self, "chk_brightness") and self.chk_brightness.isChecked():
-                g = self.spin_brightness_gain.value()
-                if abs(g - 1.0) > 0.001:
-                    disp = cv2.convertScaleAbs(disp, alpha=g, beta=0)
 
             # 2. 레이더 투영
             proj_uvs = None
@@ -1126,6 +1085,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     self.vel_memory,
                     self.kf_vel,
                     self.kf_score,
+                    hold_sec=self.vel_hold_sec,
+                    decay_sec=self.vel_decay_sec,
+                    decay_floor_kmh=self.vel_decay_floor_kmh,
+                    rate_limit_kmh_per_s=self.vel_rate_limit_kmh_per_s,
                 )
 
                 obj['vel'] = round(vel_out, 1) if vel_out is not None else float('nan')
@@ -1187,13 +1150,13 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     # [수정] UI 변수 대신 고정값 사용
                     if abs(spd) < NOISE_MIN_SPEED_KMH: continue
                     
-                    col = (0, 0, 255) if spd < -0.5 else (255, 0, 0) if spd > 0.5 else (0, 255, 0)
-                    cv2.circle(disp, (u, v), 2, col, -1)
+                    col = (0, 255, 255)
+                    cv2.circle(disp, (u, v), 4, col, -1)
 
             for it in draw_items:
                 x1, y1, x2, y2 = it["bbox"]
-                cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.circle(disp, it["target_pt"], 4, (0, 255, 255), -1) 
+                cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 0, 255), 2)
+                cv2.circle(disp, it["target_pt"], 5, (0, 255, 255), -1) 
 
                 magnet_mode = self.cmb_magnet_mode.currentText()
                 magnet_pt = None
@@ -1217,15 +1180,15 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     # [수정] 대표점은 체크박스 없이 항상 그림 (단, 속도가 노이즈 이상일 때)
                     rv = it["rep_vel"]
                     if rv is not None and abs(rv) >= NOISE_MIN_SPEED_KMH:
-                        col = (0, 0, 255) if rv < -0.5 else (255, 0, 0) if rv > 0.5 else (0, 255, 0)
-                        cv2.circle(disp, it["rep_pt"], 5, col, -1)
-                        cv2.circle(disp, it["rep_pt"], 6, (255, 255, 255), 1)
+                        col = (0, 255, 255)
+                        cv2.circle(disp, it["rep_pt"], 6, col, -1)
+                        cv2.circle(disp, it["rep_pt"], 7, (255, 255, 255), 1)
 
                 lines = []
                 if self.chk_show_id.isChecked(): lines.append(it['label'])
                 if self.chk_show_speed.isChecked():
                     v = it["obj"].get("vel", float("nan"))
-                    lines.append(f"Vel: {v:.1f}km/h" if np.isfinite(v) else "Vel: --km/h")
+                    lines.append(f"Vel: {int(v)}km/h" if np.isfinite(v) else "Vel: --km/h")
 
                 if lines:
                     font, sc, th = cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
