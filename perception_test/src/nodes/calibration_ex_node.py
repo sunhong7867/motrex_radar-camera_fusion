@@ -553,6 +553,10 @@ class ExtrinsicCalibrationManager:
             json.dump(data, f, indent=4)
 
 if __name__ == '__main__':
-    try: ExtrinsicCalibrationManager()
-    except Exception as e: rospy.logerr(f"Manager Crash: {e}")
-    rospy.spin()
+    manager = None
+    try:
+        manager = ExtrinsicCalibrationManager()
+    except Exception as e:
+        rospy.logerr(f"Manager Crash: {e}")
+    if manager is not None:
+        rospy.spin()

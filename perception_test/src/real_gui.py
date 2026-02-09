@@ -159,21 +159,12 @@ def select_cluster_point_for_bbox(
     if cluster_uvs is None or cluster_uvs.size == 0:
         return None
     x1, y1, x2, y2 = bbox
-    inside = (
-        (cluster_uvs[:, 0] >= x1)
-        & (cluster_uvs[:, 0] <= x2)
-        & (cluster_uvs[:, 1] >= y1)
-        & (cluster_uvs[:, 1] <= y2)
-    )
-    if not np.any(inside):
-        return None
-    candidates = cluster_uvs[inside]
-    target_pt = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
     target_u, target_v = get_bbox_reference_point(bbox, ref_mode)
     target_pt = np.array([target_u, target_v], dtype=np.float64)
-    dists = np.hypot(candidates[:, 0] - target_pt[0], candidates[:, 1] - target_pt[1])
+    dists = np.hypot(cluster_uvs[:, 0] - target_pt[0], cluster_uvs[:, 1] - target_pt[1])
     idx = int(np.argmin(dists))
-    return (int(candidates[idx, 0]), int(candidates[idx, 1]))
+    return (int(cluster_uvs[idx, 0]), int(cluster_uvs[idx, 1]))
+
 # ==============================================================================
 # UI Classes
 # ==============================================================================
@@ -416,6 +407,40 @@ class ManualCalibWindow(QtWidgets.QDialog):
     def closeEvent(self, e): 
         self._timer.stop() 
         super().closeEvent(e)
+
+# ==============================================================================
+# View Options Dialog
+# ==============================================================================
+class ViewOptionsDialog(QtWidgets.QDialog):
+    def __init__(self, gui: 'RealWorldGUI'):
+        super().__init__(gui)
+        self.gui = gui
+        self.setWindowTitle("View Options")
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Window)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self._original_parent = gui.gb_vis.parentWidget()
+        self._original_layout = gui._gb_vis_parent_layout
+
+        gui.gb_vis.setParent(self)
+        gui.gb_vis.setVisible(True)
+        layout.addWidget(gui.gb_vis)
+
+        size = gui.gb_vis.sizeHint()
+        self.setFixedSize(size.width() + 20, size.height() + 20)
+        main_geo = gui.geometry()
+        x = main_geo.x() + main_geo.width() - self.width() - 20
+        y = main_geo.y() + main_geo.height() - self.height() - 60
+        self.move(max(main_geo.x(), x), max(main_geo.y(), y))
+
+    def closeEvent(self, event):
+        self.gui.gb_vis.setParent(self._original_parent)
+        if self._original_layout is not None:
+            self._original_layout.addWidget(self.gui.gb_vis)
+        self.gui.gb_vis.setVisible(False)
+        if hasattr(self.gui, "btn_toggle_vis"):
+            self.gui.btn_toggle_vis.setText("👁️ Show View Options")
+        super().closeEvent(event)
 
 # ==============================================================================
 # Main GUI - [수정됨: 우측 패널 상단 세로 로고 배치, 전체화면]
@@ -771,6 +796,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_vis = QtWidgets.QGroupBox("6. View Options")
         v_vis = QtWidgets.QVBoxLayout()
         gb_vis.setVisible(False)
+        self._gb_vis_parent_layout = vbox
         self.btn_toggle_vis = QtWidgets.QPushButton("👁️ Show View Options")
         self.btn_toggle_vis.clicked.connect(self._toggle_view_options)
         vbox.addWidget(self.btn_toggle_vis)
@@ -780,9 +806,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         
         # [수정] 아이디와 속도 체크박스
         self.chk_show_id = QtWidgets.QCheckBox("Show ID Text")
-        self.chk_show_id.setChecked(False)
+        self.chk_show_id.setChecked(True)
         self.chk_show_speed = QtWidgets.QCheckBox("Show Speed Text")
-        self.chk_show_speed.setChecked(False)
+        self.chk_show_speed.setChecked(True)
 
         # [추가] 6번에서 가져온 레이더 포인트 토글 (검정색, 진하게)
         self.chk_show_radar = QtWidgets.QCheckBox("Show Radar Points")
@@ -800,7 +826,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         for i, name in enumerate(display_order):
             chk = QtWidgets.QCheckBox(name)
-            is_active = name in START_ACTIVE_LANES
+            is_active = True
             chk.setChecked(is_active)
             self.chk_lanes[name] = chk
             g_vis.addWidget(chk, i // 2, i % 2)
@@ -813,6 +839,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         
         gb_vis.setLayout(v_vis)
         self.gb_vis = gb_vis
+        vbox.addWidget(gb_vis)
 
         # 하단 여백 추가
         vbox.addStretch()
@@ -1032,6 +1059,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
             # 4. 객체별 데이터 처리 루프
             confirmed_objects = [] # 실제로 2초 이상 검증된 객체들만 담을 리스트
+            active_ids = set()
             
             for obj in self.vis_objects:
                 g_id = obj['id']
@@ -1049,6 +1077,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             for obj in confirmed_objects:
                 g_id = obj['id']
                 x1, y1, x2, y2 = obj['bbox']
+                active_ids.add(g_id)
                 
                 # 1. 차선 필터링 (기존 로직 유지)
                 cx, cy = (x1 + x2) // 2, y2
@@ -1056,6 +1085,11 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 if has_lane_filter:
                     target_lane = find_target_lane((cx, cy), active_lane_polys)
                     if target_lane is None:
+                        self.radar_track_hist.pop(g_id, None)
+                        self.vehicle_lane_paths.pop(g_id, None)
+                        self.global_to_local_ids.pop(g_id, None)
+                        self.track_confirmed_cnt.pop(g_id, None)
+                        active_ids.discard(g_id)
                         continue
 
                 curr_lane_str, lane_path, local_no, label = update_lane_tracking(
@@ -1154,8 +1188,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     "cluster_score": cluster_score,
                 })
 
-                if rep_pt is not None:
-                    self.radar_track_hist.setdefault(g_id, deque(maxlen=self.track_hist_len)).append(rep_pt)
+                if cluster_pt is not None:
+                    self.radar_track_hist.setdefault(g_id, deque(maxlen=self.track_hist_len)).append(cluster_pt)
 
             # 5. 전역 UI 업데이트
             if calib_scores:
@@ -1259,9 +1293,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     if pts is not None and len(pts) > 0:
                         cv2.polylines(disp, [pts], True, (0, 255, 255), 2)
 
-            current_ids = {o['id'] for o in self.vis_objects}
-            self.track_confirmed_cnt = {k: v for k, v in self.track_confirmed_cnt.items() if k in current_ids}
-            self.radar_track_hist = {k: v for k, v in self.radar_track_hist.items() if k in current_ids}
+            visible_ids = {o['id'] for o in self.vis_objects}
+            self.track_confirmed_cnt = {k: v for k, v in self.track_confirmed_cnt.items() if k in visible_ids}
+            self.radar_track_hist = {k: v for k, v in self.radar_track_hist.items() if k in active_ids}
             if self.diag_dirty and hasattr(self, "txt_diag_log"):
                 self.txt_diag_log.setPlainText(self.latest_diag_msg)
                 self.diag_dirty = False
