@@ -34,6 +34,8 @@ class ExtrinsicCalibrationManager:
         self.detections_topic = rospy.get_param('~detections_topic', '/perception_test/tracks')
         self.radar_topic = rospy.get_param('~radar_topic', '/point_cloud')
         self.camera_info_topic = rospy.get_param('~camera_info_topic', '/camera/camera_info')
+        self.bbox_ref_mode = rospy.get_param('~bbox_ref_mode', 'center')
+
         
         # -------------------------------------------------------------
         # [설정] 논문 및 실무 기반 고정밀 파라미터
@@ -144,8 +146,7 @@ class ExtrinsicCalibrationManager:
         for det in det_msg.detections:
             if det.id <= 0: continue
             
-            u_target = (det.bbox.xmin + det.bbox.xmax) / 2.0
-            v_target = (det.bbox.ymin + det.bbox.ymax) / 2.0
+            u_target, v_target = self._get_bbox_ref_point(det.bbox)
             
             dists = np.hypot(proj_pts[:, 0] - u_target, proj_pts[:, 1] - v_target)
             idx = np.argmin(dists)
@@ -245,6 +246,15 @@ class ExtrinsicCalibrationManager:
             self.is_calibrating = False
             self.collection_start_time = None
 
+    def _get_bbox_ref_point(self, bbox):
+        x1, y1, x2, y2 = bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax
+        mode = str(self.bbox_ref_mode).lower()
+        if mode in {"bottom", "bottom_center", "bottom-center"}:
+            return (x1 + x2) / 2.0, float(y2)
+        if mode in {"top", "top_center", "top-center"}:
+            return (x1 + x2) / 2.0, float(y1)
+        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    
     def _save_result(self, R, t):
         data = {"R": R.tolist(), "t": t.flatten().tolist()}
         with open(self.save_path, 'w') as f:

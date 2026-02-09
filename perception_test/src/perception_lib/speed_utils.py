@@ -171,6 +171,17 @@ def update_lane_tracking(
 
     return curr_lane_str, lane_path, local_no, label
 
+def get_bbox_reference_point(
+    bbox: Tuple[int, int, int, int],
+    mode: str = "center",
+) -> Tuple[int, int]:
+    x1, y1, x2, y2 = bbox
+    mode = (mode or "center").lower()
+    if mode in {"bottom", "bottom_center", "bottom-center"}:
+        return int((x1 + x2) / 2), int(y2)
+    if mode in {"top", "top_center", "top-center"}:
+        return int((x1 + x2) / 2), int(y1)
+    return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
 def select_representative_point(
     proj_uvs: np.ndarray,
@@ -184,6 +195,7 @@ def select_representative_point(
     now_ts: float,
     g_id: int,
     min_speed_kmh: float,
+    ref_mode: str = "center",
     trim_ratio: float = 0.2,
 ) -> Tuple[Optional[float], Optional[Tuple[int, int]], Optional[float], float, float]:
     x1, y1, x2, y2 = bbox
@@ -211,7 +223,7 @@ def select_representative_point(
 
     target_idxs = valid_idxs
 
-    t_u, t_v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    t_u, t_v = get_bbox_reference_point(bbox, ref_mode)
     if g_id in rep_pt_mem:
         prev_u, prev_v, last_ts = rep_pt_mem[g_id]
         if now_ts - last_ts < 1.0:
@@ -260,7 +272,7 @@ def select_representative_point(
     if abs(rep_vel_raw) >= min_speed_kmh:
         meas_kmh = abs(rep_vel_raw)
 
-    target_pt = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+    target_pt = get_bbox_reference_point(bbox, ref_mode)
     dist_px = np.hypot(target_pt[0] - rep_pt[0], target_pt[1] - rep_pt[1])
     diag_len = np.hypot(x2 - x1, y2 - y1)
     err_ratio = dist_px / max(1, diag_len)

@@ -14,7 +14,7 @@ real_gui.py (Updated)
 
 2. 시각화 로직 개선:
    - Magnet Line: BBox 중앙 <-> 레이더 대표 점/클러스터 대표점 토글 연결
-   - Representative Point: 상단 30% 영역의 중앙값 사용 (Single Point 모드)
+   - Representative Point: BBox 기준점(상/중/하단) 선택 가능
    - Accuracy/Score: 캘리브레이션 정확도/트랙 속도 점수 분리 표시
 
 3. 데이터 저장 (Data Logging) 수정:
@@ -41,7 +41,7 @@ import rospy
 import rospkg
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from cv_bridge import CvBridge
-from std_msgs.msg import Bool, String
+from std_msgs.msg import String
 
 # ==============================================================================
 # Setup & Imports
@@ -58,6 +58,7 @@ from perception_lib.logging_utils import DataLogger
 from perception_lib.speed_utils import (
     build_record_row,
     find_target_lane,
+    get_bbox_reference_point,
     parse_radar_pointcloud,
     project_points,
     select_representative_point,
@@ -153,6 +154,7 @@ def score_point_to_bbox(target_pt: Tuple[int, int], ref_pt: Tuple[int, int], bbo
 def select_cluster_point_for_bbox(
     cluster_uvs: np.ndarray,
     bbox: Tuple[int, int, int, int],
+    ref_mode: str = "center",
 ) -> Optional[Tuple[int, int]]:
     if cluster_uvs is None or cluster_uvs.size == 0:
         return None
@@ -167,6 +169,8 @@ def select_cluster_point_for_bbox(
         return None
     candidates = cluster_uvs[inside]
     target_pt = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
+    target_u, target_v = get_bbox_reference_point(bbox, ref_mode)
+    target_pt = np.array([target_u, target_v], dtype=np.float64)
     dists = np.hypot(candidates[:, 0] - target_pt[0], candidates[:, 1] - target_pt[1])
     idx = int(np.argmin(dists))
     return (int(candidates[idx, 0]), int(candidates[idx, 1]))
@@ -259,7 +263,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.FIXED_MOV = 0.1   
 
         # ROS 통신 설정
-        self.pub_diag_start = rospy.Publisher("/perception_test/diagnosis/start", Bool, queue_size=1)
+        self.pub_diag_start = rospy.Publisher("/perception_test/diagnosis/start", String, queue_size=1)
         self.sub_diag_result = rospy.Subscriber("/perception_test/diagnosis/result", String, self._on_diag_msg)
         self.diag_signal.connect(self._update_log_ui)
 
@@ -303,16 +307,23 @@ class ManualCalibWindow(QtWidgets.QDialog):
         # (2) Diagnostic Tool
         gb_diag = QtWidgets.QGroupBox("2. Diagnostic Tool")
         v_diag = QtWidgets.QVBoxLayout(gb_diag)
-        self.btn_diag = QtWidgets.QPushButton("🔍 START DIAGNOSIS (Check Error)")
+        self.btn_diag = QtWidgets.QPushButton("📈 RUN TRAJECTORY EVAL")
         self.btn_diag.setStyleSheet("background-color: #3498db; color: white;")
         self.btn_diag.clicked.connect(self._start_diagnostic_ros)
         
+        self.cmb_diag_ref = QtWidgets.QComboBox()
+        self.cmb_diag_ref.addItems(["Bottom Center", "Center", "Top Center"])
+        self.cmb_diag_ref.setCurrentText(self.gui.bbox_ref_label())
+        self.cmb_diag_ref.currentTextChanged.connect(self._sync_diag_ref_mode)
+
         self.txt_log = QtWidgets.QPlainTextEdit()
         self.txt_log.setReadOnly(True)
-        self.txt_log.setPlaceholderText("Ready. Press button to analyze traffic.")
+        self.txt_log.setPlaceholderText("Ready. Press button to evaluate trajectories.")
         self.txt_log.setStyleSheet("background:#222; color:#0f0; font-family:Consolas; font-size:14px;")
         self.txt_log.setMinimumHeight(180)
-        v_diag.addWidget(self.btn_diag); v_diag.addWidget(self.txt_log)
+        v_diag.addWidget(self.btn_diag)
+        v_diag.addWidget(self.cmb_diag_ref)
+        v_diag.addWidget(self.txt_log)
         vbox.addWidget(gb_diag)
 
         L_GRAY, D_GRAY = "#e0e0e0", "#757575"
@@ -433,14 +444,16 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.txt_log.appendPlainText(">>> Reset to initial values.")
 
     def _start_diagnostic_ros(self):
-        """ROS 노드에게 진단 시작 요청 (고정 시점용 멘트)"""
+        """ROS 노드에게 평가 시작 요청 (궤적 기반)"""
         self.btn_diag.setEnabled(False)
-        # [수정] 육교 고정 시점이므로 '운전' 지시 제거
-        self.txt_log.setPlainText(">> [REQUEST] Starting 30s Diagnosis...\n>> Collecting traffic data (50m+)...")
-        self.pub_diag_start.publish(True)
+        self.txt_log.setPlainText(">> [REQUEST] Starting trajectory evaluation...\n>> Collecting track data...")
+        self.pub_diag_start.publish(self.gui.bbox_ref_mode)
 
     def _on_diag_msg(self, msg):
         self.diag_signal.emit(msg.data)
+
+    def _sync_diag_ref_mode(self, text: str):
+        self.gui.set_bbox_ref_mode_from_label(text)
 
     @Slot(str)
     def _update_log_ui(self, text):
@@ -500,6 +513,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.min_pts_for_rep = 2
         self.kf_vel = {}  # 차량 ID별 속도 칼만 필터 딕셔너리
         self.kf_score = {} # 차량 ID별 점수 칼만 필터 (점수 급락 방지용)
+        self.bbox_ref_mode = "bottom"
 
         # ---------------- Speed estimation memory / smoothing ----------------
         self.vel_memory = {}
@@ -726,6 +740,15 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v2.addWidget(self.bar_speed_score)
         v2.addWidget(self.chk_magnet)
         v2.addWidget(self.cmb_magnet_mode)
+        h_ref = QtWidgets.QHBoxLayout()
+        lbl_ref = QtWidgets.QLabel("BBox Reference")
+        self.cmb_bbox_ref = QtWidgets.QComboBox()
+        self.cmb_bbox_ref.addItems(["Bottom Center", "Center", "Top Center"])
+        self.cmb_bbox_ref.setCurrentText(self.bbox_ref_label())
+        self.cmb_bbox_ref.currentTextChanged.connect(self.set_bbox_ref_mode_from_label)
+        h_ref.addWidget(lbl_ref)
+        h_ref.addWidget(self.cmb_bbox_ref, stretch=1)
+        v2.addLayout(h_ref)
         gb2.setLayout(v2); vbox.addWidget(gb2)
 
         # 3. Lane Editor
@@ -1037,7 +1060,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 obj['lane_path'] = lane_path
                 obj['lane'] = curr_lane_str
 
-                target_pt = (int((x1+x2)/2), int((y1+y2)/2)) 
+                target_pt = get_bbox_reference_point((x1, y1, x2, y2), self.bbox_ref_mode)
                 
                 meas_kmh = None
                 rep_pt = None
@@ -1059,11 +1082,12 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                         self.pt_alpha,
                         now_ts,
                         g_id,
-                        NOISE_MIN_SPEED_KMH,  # [수정] UI 변수 대신 고정값(5.0) 사용
+                        NOISE_MIN_SPEED_KMH,
+                        self.bbox_ref_mode,
                     )
                 if cluster_uvs is not None and cluster_valid is not None:
                     valid_clusters = cluster_uvs[cluster_valid]
-                    cluster_pt = select_cluster_point_for_bbox(valid_clusters, (x1, y1, x2, y2))
+                    cluster_pt = select_cluster_point_for_bbox(valid_clusters, (x1, y1, x2, y2), self.bbox_ref_mode)
                     if cluster_pt is not None:
                         cluster_score = score_point_to_bbox(target_pt, cluster_pt, (x1, y1, x2, y2))
                         if cluster_score < 50:
@@ -1244,6 +1268,26 @@ class RealWorldGUI(QtWidgets.QMainWindow):
     def load_extrinsic(self):
         calibration_utils.load_extrinsic(self)
 
+    def bbox_ref_label(self) -> str:
+        if self.bbox_ref_mode == "top":
+            return "Top Center"
+        if self.bbox_ref_mode == "center":
+            return "Center"
+        return "Bottom Center"
+
+    def set_bbox_ref_mode_from_label(self, label: str) -> None:
+        label = (label or "").lower()
+        if "top" in label:
+            self.bbox_ref_mode = "top"
+        elif "center" in label and "bottom" not in label:
+            self.bbox_ref_mode = "center"
+        else:
+            self.bbox_ref_mode = "bottom"
+        if hasattr(self, "cmb_bbox_ref") and self.cmb_bbox_ref is not None:
+            target_label = self.bbox_ref_label()
+            if self.cmb_bbox_ref.currentText() != target_label:
+                self.cmb_bbox_ref.setCurrentText(target_label)
+                
     def run_calibration(self):
         calibration_utils.run_calibration(self, ManualCalibWindow)
 

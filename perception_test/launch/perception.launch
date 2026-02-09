@@ -58,6 +58,6 @@
     <param name="save_images/path" value="$(find perception_test)/calibration_images"/>
     </node>
 
-    <node pkg="perception_test" type="calibration_diagnosis_node.py" name="calib_diagnosis" output="screen" />
+    <node pkg="perception_test" type="calibration_diagnosis_node.py" name="trajectory_eval" output="screen" />
 
 </launch>
