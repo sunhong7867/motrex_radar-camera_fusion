@@ -669,8 +669,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         btn_autocal.clicked.connect(self.run_autocalibration)
         btn_calib = QtWidgets.QPushButton("Run Extrinsic (Manual)")
         btn_calib.clicked.connect(self.run_calibration)
-        btn_reload = QtWidgets.QPushButton("Reload JSON")
-        btn_reload.clicked.connect(self.load_extrinsic)
+        h_ref = QtWidgets.QHBoxLayout()
+        lbl_ref = QtWidgets.QLabel("BBox Reference (Auto)")
+        self.cmb_bbox_ref = QtWidgets.QComboBox()
+        self.cmb_bbox_ref.addItems(["Bottom Center", "Center", "Top Center"])
+        self.cmb_bbox_ref.setCurrentText(self.bbox_ref_label())
+        self.cmb_bbox_ref.currentTextChanged.connect(self.set_bbox_ref_mode_from_label)
+        h_ref.addWidget(lbl_ref)
+        h_ref.addWidget(self.cmb_bbox_ref, stretch=1)
         
         self.pbar_intrinsic = QtWidgets.QProgressBar()
         self.pbar_intrinsic.setRange(0, 0)
@@ -691,7 +697,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v_c.addWidget(btn_intri)
         v_c.addWidget(btn_autocal)
         v_c.addWidget(btn_calib)
-        v_c.addWidget(btn_reload)
+        v_c.addLayout(h_ref)
         v_c.addWidget(self.pbar_intrinsic)
         v_c.addWidget(self.txt_intrinsic_log)
         v_c.addWidget(self.pbar_extrinsic)
@@ -740,15 +746,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v2.addWidget(self.bar_speed_score)
         v2.addWidget(self.chk_magnet)
         v2.addWidget(self.cmb_magnet_mode)
-        h_ref = QtWidgets.QHBoxLayout()
-        lbl_ref = QtWidgets.QLabel("BBox Reference")
-        self.cmb_bbox_ref = QtWidgets.QComboBox()
-        self.cmb_bbox_ref.addItems(["Bottom Center", "Center", "Top Center"])
-        self.cmb_bbox_ref.setCurrentText(self.bbox_ref_label())
-        self.cmb_bbox_ref.currentTextChanged.connect(self.set_bbox_ref_mode_from_label)
-        h_ref.addWidget(lbl_ref)
-        h_ref.addWidget(self.cmb_bbox_ref, stretch=1)
-        v2.addLayout(h_ref)
         gb2.setLayout(v2); vbox.addWidget(gb2)
 
         # 3. Lane Editor
@@ -1287,7 +1284,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             target_label = self.bbox_ref_label()
             if self.cmb_bbox_ref.currentText() != target_label:
                 self.cmb_bbox_ref.setCurrentText(target_label)
-                
+
     def run_calibration(self):
         calibration_utils.run_calibration(self, ManualCalibWindow)
 

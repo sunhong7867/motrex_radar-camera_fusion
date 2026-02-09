@@ -52,6 +52,7 @@ def run_autocalibration(gui):
             f"source {setup_bash} && "
             f"rosrun perception_test calibration_ex_node.py "
             f"_extrinsic_path:={gui.extrinsic_path}"
+            f"_bbox_ref_mode:={gui.bbox_ref_mode}"
         )
         args = ["-c", ros_cmd]
         gui.extrinsic_proc.readyReadStandardOutput.connect(gui._on_extrinsic_stdout)

@@ -49,6 +49,7 @@ class ExtrinsicCalibrationManager:
         
         self.cluster_tol = 3.0          # 레이더 클러스터링 거리 임계값
         self.match_max_dist_px = 800.0  # 초기 매칭 허용 범위 (전역 매칭)
+        self.cam_track_len = 60
 
         # RANSAC 설정
         self.ransac_iterations = 300
@@ -59,7 +60,8 @@ class ExtrinsicCalibrationManager:
         default_path = os.path.join(rp.get_path('perception_test'), 'config', 'extrinsic.json')
         self.save_path = resolve_ros_path(rospy.get_param('~extrinsic_path', default_path))
 
-        self.track_buffer = {} 
+        self.track_buffer = {}
+        self.camera_tracks = {}
         self.K = None
         self.D = None 
         self.inv_K = None      
@@ -79,7 +81,7 @@ class ExtrinsicCalibrationManager:
         self.ts.registerCallback(self._callback)
         rospy.Subscriber(self.camera_info_topic, CameraInfo, self._info_callback)
 
-        rospy.loginfo("[Autocal] Robust Center-Matching Integration Started.")
+        rospy.loginfo("[Autocal] Robust Path-Matching Integration Started.")
 
     def _load_extrinsic(self):
         if os.path.exists(self.save_path):
@@ -140,25 +142,41 @@ class ExtrinsicCalibrationManager:
         proj_pts = np.array(proj_pts)
 
         # -------------------------------------------------------------
-        # [매칭 전략] 박스 정중앙(Center) 기준 매칭
-        # 앞차 가림 현상 등으로 바닥이 안 보이는 경우를 위한 대응
+        # [매칭 전략] 트랙 경로(Path) 기준 매칭
+        # 단일 포인트가 아닌 최근 경로와의 거리로 연관
         # -------------------------------------------------------------
         for det in det_msg.detections:
-            if det.id <= 0: continue
+            if det.id <= 0:
+                continue
             
             u_target, v_target = self._get_bbox_ref_point(det.bbox)
             
-            dists = np.hypot(proj_pts[:, 0] - u_target, proj_pts[:, 1] - v_target)
-            idx = np.argmin(dists)
-            
-            if dists[idx] < self.match_max_dist_px:
+            if det.id not in self.camera_tracks:
+                self.camera_tracks[det.id] = deque(maxlen=self.cam_track_len)
+            self.camera_tracks[det.id].append((u_target, v_target))
+
+            path_points = list(self.camera_tracks[det.id])
+            if len(path_points) < 2:
+                continue
+
+            best_idx = None
+            best_dist = None
+            best_uv = None
+            for idx, proj_pt in enumerate(proj_pts):
+                dist, uv_closest = self._closest_point_on_path(path_points, proj_pt)
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+                    best_uv = uv_closest
+
+            if best_dist is not None and best_dist < self.match_max_dist_px:
                 if det.id not in self.track_buffer:
                     self.track_buffer[det.id] = deque(maxlen=60)
                 
-                # Camera Ray 생성 (박스 중앙 기준)
-                nc = self.inv_K @ np.array([u_target, v_target, 1.0])
+                # Camera Ray 생성 (경로 기반 기준)
+                nc = self.inv_K @ np.array([best_uv[0], best_uv[1], 1.0])
                 nc /= np.linalg.norm(nc)
-                self.track_buffer[det.id].append((nc, obj_3d_pts[idx], (u_target, v_target)))
+                self.track_buffer[det.id].append((nc, obj_3d_pts[best_idx], (best_uv[0], best_uv[1])))
 
         # 수집 진행도 체크
         total = sum(len(d) for d in self.track_buffer.values() if len(d) >= self.min_track_len)
@@ -254,6 +272,30 @@ class ExtrinsicCalibrationManager:
         if mode in {"top", "top_center", "top-center"}:
             return (x1 + x2) / 2.0, float(y1)
         return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    
+    def _closest_point_on_path(self, path_points, query_pt):
+        if len(path_points) == 1:
+            pt = np.array(path_points[0], dtype=np.float64)
+            return float(np.linalg.norm(pt - query_pt)), pt
+
+        q = np.array(query_pt, dtype=np.float64)
+        min_dist = float("inf")
+        closest = None
+        for i in range(len(path_points) - 1):
+            p0 = np.array(path_points[i], dtype=np.float64)
+            p1 = np.array(path_points[i + 1], dtype=np.float64)
+            v = p1 - p0
+            denom = np.dot(v, v)
+            if denom == 0.0:
+                proj = p0
+            else:
+                t = np.clip(np.dot(q - p0, v) / denom, 0.0, 1.0)
+                proj = p0 + t * v
+            dist = float(np.linalg.norm(q - proj))
+            if dist < min_dist:
+                min_dist = dist
+                closest = proj
+        return min_dist, closest
     
     def _save_result(self, R, t):
         data = {"R": R.tolist(), "t": t.flatten().tolist()}
