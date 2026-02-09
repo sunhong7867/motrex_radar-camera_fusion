@@ -651,14 +651,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         btn_autocal.clicked.connect(self.run_autocalibration)
         btn_calib = QtWidgets.QPushButton("Run Extrinsic (Manual)")
         btn_calib.clicked.connect(self.run_calibration)
-        h_ref = QtWidgets.QHBoxLayout()
-        lbl_ref = QtWidgets.QLabel("BBox Reference (Auto)")
-        self.cmb_bbox_ref = QtWidgets.QComboBox()
-        self.cmb_bbox_ref.addItems(["Bottom Center", "Center", "Top Center"])
-        self.cmb_bbox_ref.setCurrentText(self.bbox_ref_label())
-        self.cmb_bbox_ref.currentTextChanged.connect(self.set_bbox_ref_mode_from_label)
-        h_ref.addWidget(lbl_ref)
-        h_ref.addWidget(self.cmb_bbox_ref, stretch=1)
         
         self.pbar_intrinsic = QtWidgets.QProgressBar()
         self.pbar_intrinsic.setRange(0, 0)
@@ -679,7 +671,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v_c.addWidget(btn_intri)
         v_c.addWidget(btn_autocal)
         v_c.addWidget(btn_calib)
-        v_c.addLayout(h_ref)
         v_c.addWidget(self.pbar_intrinsic)
         v_c.addWidget(self.txt_intrinsic_log)
         v_c.addWidget(self.pbar_extrinsic)
@@ -736,21 +727,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.bar_speed_score.setStyleSheet("QProgressBar::chunk { background-color: #2196F3; }")
         h_score.addWidget(lbl_speed_score)
         
-        self.chk_magnet = QtWidgets.QCheckBox("Show Magnet Line (Validation)")
-        self.chk_magnet.setChecked(True)
-        
-        self.cmb_magnet_mode = QtWidgets.QComboBox()
-        self.cmb_magnet_mode.addItems([
-            "BBox Representative (Speed)",
-            "Cluster Center (Calibration)",
-        ])
-
         v2.addLayout(h_acc)
         v2.addWidget(self.bar_calib_acc)
         v2.addLayout(h_score)
         v2.addWidget(self.bar_speed_score)
-        v2.addWidget(self.chk_magnet)
-        v2.addWidget(self.cmb_magnet_mode)
         gb2.setLayout(v2); vbox.addWidget(gb2)
 
         # 4. Lane Editor
@@ -801,24 +781,86 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.btn_toggle_vis.clicked.connect(self._toggle_view_options)
         vbox.addWidget(self.btn_toggle_vis)
         
-        self.chk_show_poly = QtWidgets.QCheckBox("Show Lane Polygons")
-        self.chk_show_poly.setChecked(False)
-        
-        # [수정] 아이디와 속도 체크박스
         self.chk_show_id = QtWidgets.QCheckBox("Show ID Text")
         self.chk_show_id.setChecked(True)
         self.chk_show_speed = QtWidgets.QCheckBox("Show Speed Text")
         self.chk_show_speed.setChecked(True)
 
-        # [추가] 6번에서 가져온 레이더 포인트 토글 (검정색, 진하게)
+        self.chk_show_boxes = QtWidgets.QCheckBox("Show BBoxes")
+        self.chk_show_boxes.setChecked(True)
+        self.chk_show_targets = QtWidgets.QCheckBox("Show BBox Reference Points")
+        self.chk_show_targets.setChecked(True)
+
         self.chk_show_radar = QtWidgets.QCheckBox("Show Radar Points")
         self.chk_show_radar.setChecked(False)
         self.chk_show_radar.setStyleSheet("color: black; font-weight: bold;")
         
-        v_vis.addWidget(self.chk_show_poly)
+        self.chk_show_rep_points = QtWidgets.QCheckBox("Show Speed Radar Points")
+        self.chk_show_rep_points.setChecked(False)
+        self.chk_show_cluster_points = QtWidgets.QCheckBox("Show Cluster Centers")
+        self.chk_show_cluster_points.setChecked(True)
+        self.chk_show_radar_tracks = QtWidgets.QCheckBox("Show Radar Tracks")
+        self.chk_show_radar_tracks.setChecked(True)
+        self.chk_magnet = QtWidgets.QCheckBox("Show Magnet Line")
+        self.chk_magnet.setChecked(False)
+
+        self.chk_show_poly = QtWidgets.QCheckBox("Show Lane Polygons")
+        self.chk_show_poly.setChecked(False)
+
+        self.cmb_bbox_ref = QtWidgets.QComboBox()
+        self.cmb_bbox_ref.addItems(["Bottom Center", "Center", "Top Center"])
+        self.cmb_bbox_ref.setCurrentText(self.bbox_ref_label())
+        self.cmb_bbox_ref.currentTextChanged.connect(self.set_bbox_ref_mode_from_label)
+
+        self.cmb_magnet_mode = QtWidgets.QComboBox()
+        self.cmb_magnet_mode.addItems([
+            "BBox Representative (Speed)",
+            "Cluster Center (Calibration)",
+        ])
+
+        v_vis.addWidget(QtWidgets.QLabel("Text / Labels"))
         v_vis.addWidget(self.chk_show_id)
         v_vis.addWidget(self.chk_show_speed)
+
+        sep1 = QtWidgets.QFrame()
+        sep1.setFrameShape(QtWidgets.QFrame.HLine)
+        sep1.setFrameShadow(QtWidgets.QFrame.Sunken)
+        v_vis.addWidget(sep1)
+
+        v_vis.addWidget(QtWidgets.QLabel("Boxes / Reference"))
+        v_vis.addWidget(self.chk_show_boxes)
+        v_vis.addWidget(self.chk_show_targets)
+
+        sep2 = QtWidgets.QFrame()
+        sep2.setFrameShape(QtWidgets.QFrame.HLine)
+        sep2.setFrameShadow(QtWidgets.QFrame.Sunken)
+        v_vis.addWidget(sep2)
+
+        v_vis.addWidget(QtWidgets.QLabel("Radar / Tracks"))
         v_vis.addWidget(self.chk_show_radar)
+        v_vis.addWidget(self.chk_show_rep_points)
+        v_vis.addWidget(self.chk_show_cluster_points)
+        v_vis.addWidget(self.chk_show_radar_tracks)
+        v_vis.addWidget(self.chk_magnet)
+
+        sep3 = QtWidgets.QFrame()
+        sep3.setFrameShape(QtWidgets.QFrame.HLine)
+        sep3.setFrameShadow(QtWidgets.QFrame.Sunken)
+        v_vis.addWidget(sep3)
+
+        v_vis.addWidget(QtWidgets.QLabel("Association Settings"))
+        v_vis.addWidget(QtWidgets.QLabel("BBox Reference (Auto)"))
+        v_vis.addWidget(self.cmb_bbox_ref)
+        v_vis.addWidget(QtWidgets.QLabel("Magnet Source"))
+        v_vis.addWidget(self.cmb_magnet_mode)
+
+        sep4 = QtWidgets.QFrame()
+        sep4.setFrameShape(QtWidgets.QFrame.HLine)
+        sep4.setFrameShadow(QtWidgets.QFrame.Sunken)
+        v_vis.addWidget(sep4)
+
+        v_vis.addWidget(QtWidgets.QLabel("Lane Overlay"))
+        v_vis.addWidget(self.chk_show_poly)
 
         self.chk_lanes = {}
         display_order = ["IN1", "OUT1", "IN2", "OUT2", "IN3", "OUT3"]
@@ -1223,19 +1265,22 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     col = (0, 255, 255)
                     cv2.circle(disp, (u, v), 4, col, -1)
 
-            for g_id, pts in self.radar_track_hist.items():
-                if len(pts) >= 2:
-                    arr = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
-                    cv2.polylines(disp, [arr], False, (0, 255, 0), 2)
-                    if arr.shape[0] >= 2:
-                        p1 = tuple(arr[-2][0])
-                        p2 = tuple(arr[-1][0])
-                        cv2.arrowedLine(disp, p1, p2, (0, 255, 0), 2, tipLength=0.3)
+            if self.chk_show_radar_tracks.isChecked():
+                for g_id, pts in self.radar_track_hist.items():
+                    if len(pts) >= 2:
+                        arr = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+                        cv2.polylines(disp, [arr], False, (0, 255, 0), 2)
+                        if arr.shape[0] >= 2:
+                            p1 = tuple(arr[-2][0])
+                            p2 = tuple(arr[-1][0])
+                            cv2.arrowedLine(disp, p1, p2, (0, 255, 0), 2, tipLength=0.3)
 
             for it in draw_items:
                 x1, y1, x2, y2 = it["bbox"]
-                cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 0, 255), 2)
-                cv2.circle(disp, it["target_pt"], 5, (0, 255, 255), -1) 
+                if self.chk_show_boxes.isChecked():
+                    cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 0, 255), 2)
+                if self.chk_show_targets.isChecked():
+                    cv2.circle(disp, it["target_pt"], 5, (0, 255, 255), -1) 
 
                 magnet_mode = self.cmb_magnet_mode.currentText()
                 magnet_pt = None
@@ -1251,11 +1296,15 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     lc = (255, 0, 0) if magnet_score > 50 else (0, 0, 255)
                     cv2.line(disp, it["target_pt"], magnet_pt, lc, 2)
 
-                if it["cluster_pt"] is not None and magnet_mode == "Cluster Center (Calibration)":
+                if (
+                    it["cluster_pt"] is not None
+                    and magnet_mode == "Cluster Center (Calibration)"
+                    and self.chk_show_cluster_points.isChecked()
+                ):
                     cv2.circle(disp, it["cluster_pt"], 5, (255, 0, 255), -1)
                     cv2.circle(disp, it["cluster_pt"], 6, (255, 255, 255), 1)
 
-                if it["rep_pt"] is not None:
+                if it["rep_pt"] is not None and self.chk_show_rep_points.isChecked():
                     # [수정] 대표점은 체크박스 없이 항상 그림 (단, 속도가 노이즈 이상일 때)
                     rv = it["rep_vel"]
                     if rv is not None and abs(rv) >= NOISE_MIN_SPEED_KMH:
