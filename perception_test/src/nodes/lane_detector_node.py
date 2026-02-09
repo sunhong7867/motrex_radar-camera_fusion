@@ -144,6 +144,7 @@ class LaneDetectorNode:
         # 2. 각 차량 검사
         for det in msg.detections:
             is_valid = False
+            matched_lane = None
             
             # target_lanes에 있는 차선들만 검사
             for lane_name in self.target_lanes:
@@ -151,9 +152,11 @@ class LaneDetectorNode:
                 if poly is not None:
                     if self.is_inside(det.bbox, poly):
                         is_valid = True
+                        matched_lane = lane_name
                         break # 하나라도 속하면 통과
             
             if is_valid:
+                det.lane_id = matched_lane if matched_lane is not None else ""
                 filtered_dets.append(det)
 
         # 3. 결과 발행

@@ -38,5 +38,6 @@ ___________________________________________________________________________
 rosrun plotjuggler plotjuggler
 
 
-판다스 업그레이드
+업그레이드
 pip3 install --upgrade pandas
+pip3 install --upgrade numexpr
