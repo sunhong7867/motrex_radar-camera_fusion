@@ -12,6 +12,7 @@ import os
 import numpy as np
 import cv2
 from rospkg import RosPack
+from collections import deque
 from perception_test.msg import DetectionArray, Detection, BoundingBox
 from filterpy.kalman import KalmanFilter
 
@@ -239,6 +240,9 @@ class TrackerNode:
         self._lane_polys = {}
         self._lane_polys_mtime = None
         self._last_lane_reload = rospy.Time(0)
+        self.traj_len = int(rospy.get_param("~bev/traj_len", 12))
+        self.stability_curv_max = float(rospy.get_param("~bev/stability_curv_max", 0.55))
+        self.track_traj = {}
         
         self.tracker = Sort(max_age=self.max_age, min_hits=self.min_hits, iou_threshold=self.iou_thres)
         
@@ -323,6 +327,23 @@ class TrackerNode:
             bbox.ymax = int(trk[3])
             d.bbox = bbox
             d.lane_id = self._assign_lane(bbox)
+
+            # BEV/FV 모호성 완화를 위한 간단한 궤적 안정성 스코어(곡률 기반)
+            tid = int(trk[4])
+            bc = ((bbox.xmin + bbox.xmax) * 0.5, float(bbox.ymax))
+            if tid not in self.track_traj:
+                self.track_traj[tid] = deque(maxlen=self.traj_len)
+            self.track_traj[tid].append(bc)
+            traj = np.array(self.track_traj[tid], dtype=np.float64)
+            if traj.shape[0] >= 4:
+                dv = np.diff(traj, axis=0)
+                headings = np.arctan2(dv[:, 1], dv[:, 0])
+                dth = np.diff(np.unwrap(headings))
+                curv = float(np.mean(np.abs(dth))) if dth.size > 0 else 0.0
+                if curv > self.stability_curv_max:
+                    d.score = 0.7
+                else:
+                    d.score = 1.0
             
             out_msg.detections.append(d)
             

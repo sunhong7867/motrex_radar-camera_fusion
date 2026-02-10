@@ -44,22 +44,29 @@ class ExtrinsicCalibrationManager:
         self.min_samples = 800          # 800개 이상의 정교한 포인트 확보
         self.req_duration = 20.0        # 20초 이상 주행 데이터 수집
         self.min_track_len = 15         # 최소 15프레임 이상 추적된 궤적만 사용
+        self.min_track_len_relaxed = int(rospy.get_param("~min_track_len_relaxed", 10))
         
         # [핵심] 정지 차량 배제: 시속 약 12.6km/h 미만은 노이즈로 간주
         self.min_speed_mps = 3.5        
         
         self.cluster_tol = 3.0          # 레이더 클러스터링 거리 임계값
+        self.dbscan_min_neighbors = int(rospy.get_param("~dbscan_min_neighbors", 3))
+        self.radar_smooth_alpha = float(rospy.get_param("~radar_smooth_alpha", 0.45))
         self.match_max_dist_px = 800.0  # 초기 매칭 허용 범위 (전역 매칭)
         self.cam_track_len = 60
         self.radar_track_len = 60
         self.radar_track_max_age_sec = 0.6
         self.radar_track_max_dist_m = 2.5
         self.cam_track_max_dt = float(rospy.get_param("~cam_track_max_dt", 0.15))
+        self.track_align_dt = float(rospy.get_param("~track_align_dt", 0.20))
+        self.track_curvature_max = float(rospy.get_param("~track_curvature_max", 0.45))
+        self.track_speed_var_max = float(rospy.get_param("~track_speed_var_max", 12.0))
         self.lvalid_use_lane = bool(rospy.get_param("~lvalid/use_lane_validation", False))
         self.lane_anchor = rospy.get_param("~lvalid/lane_anchor", "bbox_bottom_center")
         self.lane_polys = {}
         self.lane_polys_path = None
         self.lane_polys_mtime = None
+        rp = rospkg.RosPack()
         if self.lvalid_use_lane:
             default_lane_path = os.path.join(rp.get_path("perception_test"), "src", "nodes", "lane_polys.json")
             self.lane_polys_path = resolve_ros_path(
@@ -72,7 +79,6 @@ class ExtrinsicCalibrationManager:
         self.ransac_threshold_deg = 2.0 # 2도 이내 오차만 인라이어 판정
         
         # 파일 경로 설정
-        rp = rospkg.RosPack()
         default_path = os.path.join(rp.get_path('perception_test'), 'config', 'extrinsic.json')
         self.save_path = resolve_ros_path(rospy.get_param('~extrinsic_path', default_path))
 
@@ -81,6 +87,7 @@ class ExtrinsicCalibrationManager:
         self.radar_tracks = {}
         self.radar_track_meta = {}
         self.next_radar_track_id = 1
+        self.radar_track_smooth = {}
         self.K = None
         self.D = None 
         self.inv_K = None      
@@ -198,21 +205,49 @@ class ExtrinsicCalibrationManager:
     
     def _cluster_radar_points(self, points, velocities):
         n = points.shape[0]
-        if n == 0: return []
+        if n == 0:
+            return []
+
+        # DBSCAN 유사 방식으로 clutter를 우선 제거
         visited = np.zeros(n, dtype=bool)
         clusters = []
         for i in range(n):
-            if visited[i]: continue
+            if visited[i]:
+                continue
+            visited[i] = True
             dist_sq = np.sum((points[:, :2] - points[i, :2])**2, axis=1)
-            neighbors = np.where((dist_sq <= self.cluster_tol**2) & (~visited))[0]
-            if len(neighbors) >= 2:
-                visited[neighbors] = True
-                vel_med = np.median(velocities[neighbors])
+            neighbors = np.where(dist_sq <= self.cluster_tol**2)[0]
+            if len(neighbors) >= self.dbscan_min_neighbors:
+                queue = deque(neighbors.tolist())
+                members = set(neighbors.tolist())
+                while queue:
+                    idx = queue.popleft()
+                    if not visited[idx]:
+                        visited[idx] = True
+                    dist2 = np.sum((points[:, :2] - points[idx, :2])**2, axis=1)
+                    n2 = np.where(dist2 <= self.cluster_tol**2)[0]
+                    if len(n2) >= self.dbscan_min_neighbors:
+                        for j in n2:
+                            if j not in members:
+                                members.add(j)
+                                queue.append(j)
+                members = np.array(sorted(members), dtype=np.int64)
+                vel_med = np.median(velocities[members])
                 # 동적 객체 필터링: 주행 중인 차량만 최적화에 사용
                 if abs(vel_med) >= self.min_speed_mps:
-                    clusters.append((np.median(points[neighbors], axis=0), vel_med))
+                    clusters.append((np.median(points[members], axis=0), vel_med))
         return clusters
 
+    def _smooth_radar_centroid(self, tid: int, cent_3d: np.ndarray) -> np.ndarray:
+        prev = self.radar_track_smooth.get(tid)
+        if prev is None:
+            self.radar_track_smooth[tid] = cent_3d.copy()
+            return cent_3d
+        a = float(np.clip(self.radar_smooth_alpha, 0.01, 1.0))
+        smooth = a * cent_3d + (1.0 - a) * prev
+        self.radar_track_smooth[tid] = smooth
+        return smooth
+    
     def _update_radar_tracks(self, radar_objects, stamp_sec: float):
         if not radar_objects:
             return
@@ -242,8 +277,8 @@ class ExtrinsicCalibrationManager:
                 used_tracks.add(best_id)
 
         for tid, (cent_3d, vel) in assignments.items():
-            self.radar_tracks[tid].append((stamp_sec, cent_3d, vel))
-            self.radar_track_meta[tid]["last_ts"] = stamp_sec
+            smooth_cent = self._smooth_radar_centroid(tid, cent_3d)
+            self.radar_tracks[tid].append((stamp_sec, smooth_cent, vel))
 
         stale = [
             tid for tid, meta in self.radar_track_meta.items()
@@ -252,6 +287,7 @@ class ExtrinsicCalibrationManager:
         for tid in stale:
             self.radar_tracks.pop(tid, None)
             self.radar_track_meta.pop(tid, None)
+            self.radar_track_smooth.pop(tid, None)
 
     def _project_radar_track(self, track_points):
         if self.K is None or len(track_points) == 0:
@@ -286,14 +322,49 @@ class ExtrinsicCalibrationManager:
         pairs = []
         if not radar_track or len(cam_track) < 2:
             return pairs
+        radar_times = np.array([p[0] for p in radar_track], dtype=np.float64)
+        radar_pts = np.array([p[1] for p in radar_track], dtype=np.float64)
         cam_times = np.array([p[0] for p in cam_track], dtype=np.float64)
         cam_uvs = np.array([[p[1], p[2]] for p in cam_track], dtype=np.float64)
-        for stamp_sec, radar_pt, _vel in radar_track:
-            idx = int(np.argmin(np.abs(cam_times - stamp_sec)))
-            if abs(cam_times[idx] - stamp_sec) > self.cam_track_max_dt:
+
+        if len(radar_times) < 2 or len(cam_times) < 2:
+            return pairs
+
+        t0 = max(np.min(radar_times), np.min(cam_times))
+        t1 = min(np.max(radar_times), np.max(cam_times))
+        if t1 <= t0:
+            return pairs
+        ts = np.union1d(radar_times, cam_times)
+        ts = ts[(ts >= t0) & (ts <= t1)]
+        if ts.size == 0:
+            return pairs
+
+        ru = np.interp(ts, radar_times, radar_pts[:, 0])
+        rv = np.interp(ts, radar_times, radar_pts[:, 1])
+        rw = np.interp(ts, radar_times, radar_pts[:, 2])
+        cu = np.interp(ts, cam_times, cam_uvs[:, 0])
+        cv = np.interp(ts, cam_times, cam_uvs[:, 1])
+        for i, t in enumerate(ts):
+            nearest_cam = np.min(np.abs(cam_times - t))
+            nearest_rad = np.min(np.abs(radar_times - t))
+            if max(nearest_cam, nearest_rad) > self.track_align_dt:
                 continue
-            pairs.append((cam_uvs[idx], radar_pt))
+            pairs.append((np.array([cu[i], cv[i]], dtype=np.float64), np.array([ru[i], rv[i], rw[i]], dtype=np.float64)))
         return pairs
+    
+    def _track_stability_ok(self, track_data):
+        if len(track_data) < 4:
+            return False
+        radar_pts = np.array([rv for _nc, rv, _uv in track_data], dtype=np.float64)
+        diffs = np.diff(radar_pts[:, :2], axis=0)
+        spd = np.linalg.norm(diffs, axis=1)
+        if spd.size < 2:
+            return False
+        speed_var = float(np.var(spd))
+        headings = np.arctan2(diffs[:, 1], diffs[:, 0])
+        dtheta = np.diff(np.unwrap(headings))
+        curvature = float(np.mean(np.abs(dtheta))) if dtheta.size > 0 else 0.0
+        return (curvature <= self.track_curvature_max) and (speed_var <= self.track_speed_var_max)
     
     def _callback(self, det_msg, rad_msg):
         # 최적화 수행 중에는 새로운 데이터 수집 중단 (무한 로딩 방지 1단계)
@@ -427,7 +498,12 @@ class ExtrinsicCalibrationManager:
                 self.track_buffer[det.id].append((nc, radar_point, (uv[0], uv[1])))
 
         # 수집 진행도 체크
-        total = sum(len(d) for d in self.track_buffer.values() if len(d) >= self.min_track_len)
+        total = 0
+        for d in self.track_buffer.values():
+            if len(d) >= self.min_track_len:
+                total += len(d)
+            elif len(d) >= self.min_track_len_relaxed and self._track_stability_ok(d):
+                total += len(d)
         elapsed = (rospy.Time.now() - self.collection_start_time).to_sec()
         rospy.loginfo_throttle(2.0, f"[Autocal] Progress: {total}/{self.min_samples} pts | {elapsed:.1f}s")
 
@@ -435,7 +511,7 @@ class ExtrinsicCalibrationManager:
             self.run_robust_optimization()
 
     def run_robust_optimization(self):
-        """ RANSAC-SVD 2단계 최적화 """
+        """ RANSAC-SVD + covariance-aware reweighting 최적화 """
         self.is_calibrating = True 
         try:
             rospy.loginfo("[Autocal] Optimizing R and Refining t...")
@@ -443,9 +519,13 @@ class ExtrinsicCalibrationManager:
             # 유효 데이터 페어 구성
             unit_pairs = []
             for tid, data in self.track_buffer.items():
-                if len(data) < self.min_track_len: continue
+                if len(data) < self.min_track_len and not (len(data) >= self.min_track_len_relaxed and self._track_stability_ok(data)):
+                    continue
                 for nc, rv_3d, uv_2d in data:
-                    unit_pairs.append((rv_3d / np.linalg.norm(rv_3d), nc, uv_2d, rv_3d))
+                    rnorm = np.linalg.norm(rv_3d)
+                    if rnorm < 1e-6:
+                        continue
+                    unit_pairs.append((rv_3d / rnorm, nc, uv_2d, rv_3d))
             
             if len(unit_pairs) < 100:
                 rospy.logwarn("[Autocal] Insufficient track data. Continuing collection.")
@@ -455,14 +535,36 @@ class ExtrinsicCalibrationManager:
             best_R = self.curr_R
             max_inliers = -1
             final_inlier_mask = None
+
+            sigma_r = 0.30
+            sigma_az = np.deg2rad(1.0)
+            sigma_el = np.deg2rad(1.5)
+
+            def _cov_weight(pt):
+                x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
+                r = max(1e-3, np.sqrt(x * x + y * y + z * z))
+                az = np.arctan2(y, x)
+                el = np.arctan2(z, np.sqrt(x * x + y * y))
+                ca, sa = np.cos(az), np.sin(az)
+                ce, se = np.cos(el), np.sin(el)
+                J = np.array([
+                    [ce * ca, -r * ce * sa, -r * se * ca],
+                    [ce * sa,  r * ce * ca, -r * se * sa],
+                    [se,       0.0,          r * ce      ],
+                ], dtype=np.float64)
+                S_s = np.diag([sigma_r**2, sigma_az**2, sigma_el**2])
+                S_c = J @ S_s @ J.T
+                return 1.0 / np.sqrt(max(1e-9, np.trace(S_c)))
+
             
             for _ in range(self.ransac_iterations):
                 idx = np.random.choice(len(unit_pairs), 5, replace=False)
+                W = np.diag([_cov_weight(unit_pairs[i][3]) for i in idx])
                 A_sub = np.array([unit_pairs[i][0] for i in idx]).T
                 B_sub = np.array([unit_pairs[i][1] for i in idx]).T
                 
                 # SVD를 통한 회전 행렬 도출 (Kabsch)
-                H = A_sub @ B_sub.T
+                H = A_sub @ W @ B_sub.T
                 U, S, Vt = np.linalg.svd(H)
                 R_cand = Vt.T @ U.T
                 if np.linalg.det(R_cand) < 0:
@@ -471,9 +573,10 @@ class ExtrinsicCalibrationManager:
                 
                 # 인라이어 판별
                 inlier_mask = []
-                for rv_u, nc_u, _, _ in unit_pairs:
+                for rv_u, nc_u, _, rv_3d in unit_pairs:
                     err = np.rad2deg(np.arccos(np.clip(np.dot(R_cand @ rv_u, nc_u), -1.0, 1.0)))
-                    inlier_mask.append(err < self.ransac_threshold_deg)
+                    err_w = err * (1.0 / max(1e-3, _cov_weight(rv_3d)))
+                    inlier_mask.append(err_w < self.ransac_threshold_deg)
                 
                 num_in = sum(inlier_mask)
                 if num_in > max_inliers:
@@ -483,6 +586,20 @@ class ExtrinsicCalibrationManager:
 
             # --- [Step 2] Translation (t) Refinement ---
             inlier_indices = np.where(final_inlier_mask)[0]
+            if inlier_indices.size == 0:
+                rospy.logwarn("[Autocal] No inliers after weighted RANSAC")
+                return
+
+            # 인라이어 전체 재추정(가중 SVD)
+            A_all = np.array([unit_pairs[i][0] for i in inlier_indices], dtype=np.float64).T
+            B_all = np.array([unit_pairs[i][1] for i in inlier_indices], dtype=np.float64).T
+            W_all = np.diag([_cov_weight(unit_pairs[i][3]) for i in inlier_indices])
+            H_all = A_all @ W_all @ B_all.T
+            U, _S, Vt = np.linalg.svd(H_all)
+            best_R = Vt.T @ U.T
+            if np.linalg.det(best_R) < 0:
+                Vt[2, :] *= -1
+                best_R = Vt.T @ U.T
             v_obj = np.array([unit_pairs[i][3] for i in inlier_indices], dtype=np.float32)
             v_img = np.array([unit_pairs[i][2] for i in inlier_indices], dtype=np.float32)
 
