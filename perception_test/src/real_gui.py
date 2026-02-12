@@ -793,14 +793,13 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         self.chk_show_radar = QtWidgets.QCheckBox("Show Radar Points")
         self.chk_show_radar.setChecked(False)
-        self.chk_show_radar.setStyleSheet("color: black; font-weight: bold;")
         
         self.chk_show_rep_points = QtWidgets.QCheckBox("Show Speed Radar Points")
         self.chk_show_rep_points.setChecked(False)
         self.chk_show_cluster_points = QtWidgets.QCheckBox("Show Cluster Centers")
         self.chk_show_cluster_points.setChecked(True)
         self.chk_show_radar_tracks = QtWidgets.QCheckBox("Show Radar Tracks")
-        self.chk_show_radar_tracks.setChecked(True)
+        self.chk_show_radar_tracks.setChecked(False)
         self.chk_magnet = QtWidgets.QCheckBox("Show Magnet Line")
         self.chk_magnet.setChecked(False)
 

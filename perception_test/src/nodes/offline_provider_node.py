@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 import os
+import json
 import yaml
 import rospy
 import rosbag
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2
 from rospkg import RosPack
+
+def _resolve_ros_path(path: str) -> str:
+    if not isinstance(path, str):
+        return path
+    if "$(find perception_test)" in path:
+        rp = RosPack()
+        return path.replace("$(find perception_test)", rp.get_path("perception_test"))
+    return path
 
 class OfflineProvider:
     def __init__(self):
@@ -13,6 +22,11 @@ class OfflineProvider:
         # 1. 경로 및 파라미터 설정
         r = RosPack()
         pkg_path = r.get_path('perception_test')
+
+        # 오프라인 소스 JSON 설정 (bag 이름/경로/토픽을 한 파일에서 관리)
+        default_sources_json = os.path.join(pkg_path, 'config', 'offline_sources.json')
+        self.sources_json = _resolve_ros_path(rospy.get_param('~sources_json', default_sources_json))
+        self.source_name = rospy.get_param('~source_name', '')
         
         # 기본값 설정 (launch 파일에서 변경 가능)
         self.bag_path = rospy.get_param('~bag_path', os.path.join(pkg_path, 'models/my_test_data.bag'))
@@ -26,7 +40,8 @@ class OfflineProvider:
         self.out_image_topic = rospy.get_param('~out_image_topic', '/camera/image_raw')
         self.out_radar_topic = rospy.get_param('~out_radar_topic', '/point_cloud')
         self.out_info_topic = rospy.get_param('~out_info_topic', '/camera/camera_info')
-        
+        self._apply_source_config_from_json()
+
         # 2. 퍼블리셔 설정
         self.pub_img = rospy.Publisher(self.out_image_topic, Image, queue_size=10)
         self.pub_radar = rospy.Publisher(self.out_radar_topic, PointCloud2, queue_size=10)
@@ -36,6 +51,33 @@ class OfflineProvider:
         rospy.loginfo(f"Loading Camera Info from {self.intrinsic_path}...")
         self.camera_info = self.load_camera_info(self.intrinsic_path)
 
+    def _apply_source_config_from_json(self):
+        if not os.path.exists(self.sources_json):
+            rospy.logwarn(f"sources_json not found: {self.sources_json}. Using ROS params only.")
+            return
+        try:
+            with open(self.sources_json, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            sources = payload.get('sources', {}) if isinstance(payload, dict) else {}
+            selected = self.source_name or payload.get('active_source', '')
+            if not selected:
+                return
+            src = sources.get(selected)
+            if not isinstance(src, dict):
+                rospy.logwarn(f"source '{selected}' not found in {self.sources_json}. Using ROS params only.")
+                return
+
+            self.bag_path = _resolve_ros_path(src.get('bag_path', self.bag_path))
+            self.intrinsic_path = _resolve_ros_path(src.get('intrinsic_path', self.intrinsic_path))
+            self.bag_image_topic = src.get('bag_image_topic', self.bag_image_topic)
+            self.bag_radar_topic = src.get('bag_radar_topic', self.bag_radar_topic)
+            self.out_image_topic = src.get('out_image_topic', self.out_image_topic)
+            self.out_radar_topic = src.get('out_radar_topic', self.out_radar_topic)
+            self.out_info_topic = src.get('out_info_topic', self.out_info_topic)
+            rospy.loginfo(f"Loaded offline source '{selected}' from {self.sources_json}")
+        except Exception as exc:
+            rospy.logwarn(f"Failed to load sources_json '{self.sources_json}': {exc}")
+            
     def load_camera_info(self, yaml_path):
         """camera_intrinsic.yaml 파일을 읽어 CameraInfo 메시지 생성"""
         ci = CameraInfo()

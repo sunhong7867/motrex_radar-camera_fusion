@@ -26,11 +26,11 @@ rosrun perception_test radar_cluster_bbox_viz.py _frame_id:=retina_link _draw_te
 ___________________________________________________________________________
 cd ~/motrex/catkin_ws/src/perception_test/models
 rosparam set use_sim_time true
-rosbag play --clock my_test_data.bag
+rosbag play --clock test0.bag
 
 RROR bag unindexed
-rosbag reindex /home/sh/motrex/catkin_ws/src/perception_test/models/my_test_data.bag
-rosbag info /home/sh/motrex/catkin_ws/src/perception_test/models/my_test_data.bag
+rosbag reindex /home/sh/motrex/catkin_ws/src/perception_test/models/rosbag/test0.bag
+rosbag info /home/sh/motrex/catkin_ws/src/perception_test/models/rosbag/test0.bag
 ___________________________________________________________________________
 
 

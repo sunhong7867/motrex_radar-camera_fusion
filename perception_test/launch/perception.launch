@@ -1,18 +1,12 @@
 <launch>
     <arg name="detector_yaml" default="$(find perception_test)/config/detector.yaml" />
     <arg name="roi_lanes_yaml" default="$(find perception_test)/config/roi_lanes.yaml" />
+    <arg name="offline_sources_json" default="$(find perception_test)/config/offline_sources.json" />
+    <arg name="offline_source_name" default="default" />
     
     <node pkg="perception_test" type="offline_provider_node.py" name="offline_provider" output="screen">
-        <param name="bag_path" value="$(find perception_test)/models/my_test_data.bag" />
-        
-        <param name="intrinsic_path" value="$(find perception_test)/config/camera_intrinsic.yaml" />
-        
-        <param name="bag_image_topic" value="/camera/image_raw" />
-        <param name="bag_radar_topic" value="/point_cloud" />
-        
-        <param name="out_image_topic" value="/camera/image_raw" />
-        <param name="out_radar_topic" value="/point_cloud" />
-        <param name="out_info_topic" value="/camera/camera_info" />
+        <param name="sources_json" value="$(arg offline_sources_json)" />
+        <param name="source_name" value="$(arg offline_source_name)" />
     </node>
 
     <node pkg="perception_test" type="object_detector_node.py" name="object_detector" output="screen">

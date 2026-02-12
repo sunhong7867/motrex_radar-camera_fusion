@@ -291,7 +291,7 @@ def update_speed_estimate(
     kf_score: Dict[int, ScalarKalman],
     hold_sec: float = 0.6,
     decay_sec: float = 0.8,
-    decay_floor_kmh: float = 5.0,
+    decay_floor_kmh: float = 1.0,
     rate_limit_kmh_per_s: float = 12.0,
 ) -> Tuple[Optional[float], float]:
     if meas_kmh is not None:
@@ -335,7 +335,7 @@ def update_speed_estimate(
         return prev_vel + delta
     
     if meas_kmh is not None:
-        if abs(meas_kmh) < 4.0:
+        if abs(meas_kmh) < 1:
             meas_kmh = 0.0
 
         vel_out = kf_v.update(meas_kmh)

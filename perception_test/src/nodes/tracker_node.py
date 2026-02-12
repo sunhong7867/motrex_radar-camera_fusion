@@ -7,12 +7,7 @@ tracker_node.py
 """
 
 import rospy
-import json
-import os
 import numpy as np
-import cv2
-from rospkg import RosPack
-from collections import deque
 from perception_test.msg import DetectionArray, Detection, BoundingBox
 from filterpy.kalman import KalmanFilter
 
@@ -231,18 +226,6 @@ class TrackerNode:
         self.iou_thres = rospy.get_param('~iou_threshold', 0.1)
         self.min_hits = rospy.get_param('~min_hits', 1)
         self.max_age = rospy.get_param('~max_age', 15) 
-        self.lane_anchor = rospy.get_param("~lane_anchor", "bbox_bottom_center")
-        self.lane_polys_path = rospy.get_param(
-            "~lane_polys_path",
-            os.path.join(RosPack().get_path("perception_test"), "src", "nodes", "lane_polys.json"),
-        )
-        self.lane_reload_sec = float(rospy.get_param("~lane_reload_sec", 1.0))
-        self._lane_polys = {}
-        self._lane_polys_mtime = None
-        self._last_lane_reload = rospy.Time(0)
-        self.traj_len = int(rospy.get_param("~bev/traj_len", 12))
-        self.stability_curv_max = float(rospy.get_param("~bev/stability_curv_max", 0.55))
-        self.track_traj = {}
         
         self.tracker = Sort(max_age=self.max_age, min_hits=self.min_hits, iou_threshold=self.iou_thres)
         
@@ -253,46 +236,7 @@ class TrackerNode:
         
         rospy.loginfo(f"[tracker] iou_th={self.iou_thres} max_age={self.max_age} min_hits={self.min_hits}")
 
-    def _maybe_reload_lane_polys(self):
-        now = rospy.Time.now()
-        if (now - self._last_lane_reload).to_sec() < self.lane_reload_sec:
-            return
-        self._last_lane_reload = now
-        try:
-            if not os.path.exists(self.lane_polys_path):
-                return
-            mtime = os.path.getmtime(self.lane_polys_path)
-            if self._lane_polys_mtime is not None and mtime <= self._lane_polys_mtime:
-                return
-            with open(self.lane_polys_path, "r") as f:
-                payload = json.load(f)
-            lane_polys = {}
-            for name, pts in payload.items():
-                arr = np.array(pts, dtype=np.int32)
-                if arr.ndim == 2 and arr.shape[0] >= 3:
-                    lane_polys[name] = arr
-            if lane_polys:
-                self._lane_polys = lane_polys
-                self._lane_polys_mtime = mtime
-        except Exception as exc:
-            rospy.logwarn(f"[tracker] Failed to load lane polys: {exc}")
-
-    def _lane_anchor_point(self, bbox):
-        if self.lane_anchor == "bbox_center":
-            return (bbox.xmin + bbox.xmax) / 2.0, (bbox.ymin + bbox.ymax) / 2.0
-        return (bbox.xmin + bbox.xmax) / 2.0, float(bbox.ymax)
-
-    def _assign_lane(self, bbox):
-        if not self._lane_polys:
-            return ""
-        cx, cy = self._lane_anchor_point(bbox)
-        for lane_name, poly in self._lane_polys.items():
-            if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
-                return lane_name
-        return ""
-    
     def callback(self, msg):
-        self._maybe_reload_lane_polys()
         # 1. Convert DetectionArray -> Numpy
         dets_list = []
         for d in msg.detections:
@@ -326,24 +270,6 @@ class TrackerNode:
             bbox.xmax = int(trk[2])
             bbox.ymax = int(trk[3])
             d.bbox = bbox
-            d.lane_id = self._assign_lane(bbox)
-
-            # BEV/FV 모호성 완화를 위한 간단한 궤적 안정성 스코어(곡률 기반)
-            tid = int(trk[4])
-            bc = ((bbox.xmin + bbox.xmax) * 0.5, float(bbox.ymax))
-            if tid not in self.track_traj:
-                self.track_traj[tid] = deque(maxlen=self.traj_len)
-            self.track_traj[tid].append(bc)
-            traj = np.array(self.track_traj[tid], dtype=np.float64)
-            if traj.shape[0] >= 4:
-                dv = np.diff(traj, axis=0)
-                headings = np.arctan2(dv[:, 1], dv[:, 0])
-                dth = np.diff(np.unwrap(headings))
-                curv = float(np.mean(np.abs(dth))) if dth.size > 0 else 0.0
-                if curv > self.stability_curv_max:
-                    d.score = 0.7
-                else:
-                    d.score = 1.0
             
             out_msg.detections.append(d)
             
