@@ -10,6 +10,7 @@ import cv2
 import rospy
 import rospkg
 import message_filters
+from std_msgs.msg import String
 from sensor_msgs.msg import CameraInfo, PointCloud2
 import sensor_msgs.point_cloud2 as pc2
 from perception_test.msg import DetectionArray
@@ -29,42 +30,43 @@ def resolve_ros_path(path: str) -> str:
 class ExtrinsicCalibrationManager:
     def __init__(self):
         rospy.init_node('calibration_ex_node', anonymous=False)
-        
+
         # 1. 토픽 파라미터 로드
         self.detections_topic = rospy.get_param('~detections_topic', '/perception_test/tracks')
         self.radar_topic = rospy.get_param('~radar_topic', '/point_cloud')
         self.camera_info_topic = rospy.get_param('~camera_info_topic', '/camera/camera_info')
-        
+        self.bbox_ref_mode = rospy.get_param('~bbox_ref_mode', 'center')
+
         # -------------------------------------------------------------
         # [설정] 논문 및 실무 기반 고정밀 파라미터
         # -------------------------------------------------------------
-        self.min_samples = 800          # 800개 이상의 정교한 포인트 확보
-        self.req_duration = 20.0        # 20초 이상 주행 데이터 수집
+        self.min_samples = 100         # 800개 이상의 정교한 포인트 확보
+        self.req_duration = 30.0        # 20초 이상 주행 데이터 수집
         self.min_track_len = 15         # 최소 15프레임 이상 추적된 궤적만 사용
-        
+
         # [핵심] 정지 차량 배제: 시속 약 12.6km/h 미만은 노이즈로 간주
-        self.min_speed_mps = 3.5        
-        
+        self.min_speed_mps = 1
+
         self.cluster_tol = 3.0          # 레이더 클러스터링 거리 임계값
         self.match_max_dist_px = 800.0  # 초기 매칭 허용 범위 (전역 매칭)
 
         # RANSAC 설정
-        self.ransac_iterations = 300
+        self.ransac_iterations = 500
         self.ransac_threshold_deg = 2.0 # 2도 이내 오차만 인라이어 판정
-        
+
         # 파일 경로 설정
         rp = rospkg.RosPack()
         default_path = os.path.join(rp.get_path('perception_test'), 'config', 'extrinsic.json')
         self.save_path = resolve_ros_path(rospy.get_param('~extrinsic_path', default_path))
 
-        self.track_buffer = {} 
+        self.track_buffer = {}
         self.K = None
-        self.D = None 
-        self.inv_K = None      
-        
+        self.D = None
+        self.inv_K = None
+
         # 초기값 로드
         self.curr_R = np.eye(3)
-        self.curr_t = np.array([[0.08], [0.0], [-0.08]], dtype=np.float64) 
+        self.curr_t = np.array([[0.0], [0.0], [0.0]], dtype=np.float64)
         self._load_extrinsic()
 
         self.collection_start_time = None
@@ -76,6 +78,7 @@ class ExtrinsicCalibrationManager:
         self.ts = message_filters.ApproximateTimeSynchronizer([sub_det, sub_rad], 50, 0.1)
         self.ts.registerCallback(self._callback)
         rospy.Subscriber(self.camera_info_topic, CameraInfo, self._info_callback)
+        self.pub_diag_start = rospy.Publisher('/perception_test/diagnosis/start', String, queue_size=1)
 
         rospy.loginfo("[Autocal] Robust Center-Matching Integration Started.")
 
@@ -143,17 +146,16 @@ class ExtrinsicCalibrationManager:
         # -------------------------------------------------------------
         for det in det_msg.detections:
             if det.id <= 0: continue
-            
-            u_target = (det.bbox.xmin + det.bbox.xmax) / 2.0
-            v_target = (det.bbox.ymin + det.bbox.ymax) / 2.0
-            
+
+            u_target, v_target = self._get_bbox_ref_point(det.bbox)
+
             dists = np.hypot(proj_pts[:, 0] - u_target, proj_pts[:, 1] - v_target)
             idx = np.argmin(dists)
-            
+
             if dists[idx] < self.match_max_dist_px:
                 if det.id not in self.track_buffer:
                     self.track_buffer[det.id] = deque(maxlen=60)
-                
+
                 # Camera Ray 생성 (박스 중앙 기준)
                 nc = self.inv_K @ np.array([u_target, v_target, 1.0])
                 nc /= np.linalg.norm(nc)
@@ -169,7 +171,7 @@ class ExtrinsicCalibrationManager:
 
     def run_robust_optimization(self):
         """ RANSAC-SVD 2단계 최적화 """
-        self.is_calibrating = True 
+        self.is_calibrating = True
         try:
             rospy.loginfo("[Autocal] Optimizing R and Refining t...")
 
@@ -179,7 +181,7 @@ class ExtrinsicCalibrationManager:
                 if len(data) < self.min_track_len: continue
                 for nc, rv_3d, uv_2d in data:
                     unit_pairs.append((rv_3d / np.linalg.norm(rv_3d), nc, uv_2d, rv_3d))
-            
+
             if len(unit_pairs) < 100:
                 rospy.logwarn("[Autocal] Insufficient track data. Continuing collection.")
                 return
@@ -188,12 +190,12 @@ class ExtrinsicCalibrationManager:
             best_R = self.curr_R
             max_inliers = -1
             final_inlier_mask = None
-            
+
             for _ in range(self.ransac_iterations):
                 idx = np.random.choice(len(unit_pairs), 5, replace=False)
                 A_sub = np.array([unit_pairs[i][0] for i in idx]).T
                 B_sub = np.array([unit_pairs[i][1] for i in idx]).T
-                
+
                 # SVD를 통한 회전 행렬 도출 (Kabsch)
                 H = A_sub @ B_sub.T
                 U, S, Vt = np.linalg.svd(H)
@@ -201,13 +203,13 @@ class ExtrinsicCalibrationManager:
                 if np.linalg.det(R_cand) < 0:
                     Vt[2, :] *= -1
                     R_cand = Vt.T @ U.T
-                
+
                 # 인라이어 판별
                 inlier_mask = []
                 for rv_u, nc_u, _, _ in unit_pairs:
                     err = np.rad2deg(np.arccos(np.clip(np.dot(R_cand @ rv_u, nc_u), -1.0, 1.0)))
                     inlier_mask.append(err < self.ransac_threshold_deg)
-                
+
                 num_in = sum(inlier_mask)
                 if num_in > max_inliers:
                     max_inliers = num_in
@@ -224,8 +226,8 @@ class ExtrinsicCalibrationManager:
 
             # R 고정 상태에서 t 미세 조정
             success, _, t_final = cv2.solvePnP(
-                v_obj, v_img, self.K, self.D, 
-                r_fix, t_ref, 
+                v_obj, v_img, self.K, self.D,
+                r_fix, t_ref,
                 useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE
             )
 
@@ -235,6 +237,7 @@ class ExtrinsicCalibrationManager:
             # 결과 확정
             self.curr_R = best_R
             self._save_result(self.curr_R, self.curr_t)
+            self.pub_diag_start.publish(String(data=str(self.bbox_ref_mode)))
             rospy.loginfo(f"[Autocal] SUCCESS. Final Inliers: {max_inliers}/{len(unit_pairs)}")
             rospy.signal_shutdown("Calibration Process Done")
 
@@ -249,6 +252,15 @@ class ExtrinsicCalibrationManager:
         data = {"R": R.tolist(), "t": t.flatten().tolist()}
         with open(self.save_path, 'w') as f:
             json.dump(data, f, indent=4)
+
+    def _get_bbox_ref_point(self, bbox):
+        x1, y1, x2, y2 = bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax
+        mode = str(self.bbox_ref_mode).lower()
+        if mode in {'bottom', 'bottom_center', 'bottom-center'}:
+            return (x1 + x2) / 2.0, float(y2)
+        if mode in {'top', 'top_center', 'top-center'}:
+            return (x1 + x2) / 2.0, float(y1)
+        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
 if __name__ == '__main__':
     try: ExtrinsicCalibrationManager()

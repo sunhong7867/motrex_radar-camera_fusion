@@ -154,6 +154,9 @@ class AssociationNode:
 
         # association parameters
         self.history_frames = int(rospy.get_param("~association/radar_history_frames", 5))
+        self.use_bev_association = bool(rospy.get_param("~association/use_bev_association", True))
+        self.bev_gate_m = float(rospy.get_param("~association/bev_gate_m", 3.5))
+        self.use_temporal_alignment = bool(rospy.get_param("~association/use_temporal_alignment", True))
         self.min_range_m = float(rospy.get_param("~association/min_range_m", 0.0))
         self.min_abs_doppler = float(rospy.get_param("~association/min_abs_doppler_mps", 0.0))
         self.min_power = float(rospy.get_param("~association/min_power", 0.0))
@@ -230,6 +233,8 @@ class AssociationNode:
         self._track_last_xy = {}
         # {track_key: ema_speed_mps}
         self._track_speed_ema = {}
+        # {track_key: (x, y)} BEV 추정 중심
+        self._track_bev_center = {}
 
         # Publishers
         self.pub_assoc = rospy.Publisher(self.associated_topic, AssociationArray, queue_size=5)
@@ -338,6 +343,27 @@ class AssociationNode:
 
         return radar_header, np.vstack([a[:, :3] for a in arrays])
 
+    def _build_time_aligned_radar(self, target_stamp_sec: float) -> Tuple[Optional[rospy.Header], np.ndarray]:
+        """카메라 타임스탬프에 가장 가까운 레이더 프레임 반환(간단한 시공간 정렬)."""
+        if len(self._rad_hist) == 0:
+            return None, np.zeros((0, 3), dtype=np.float64)
+        best = None
+        best_dt = None
+        for h, p in self._rad_hist:
+            if h is None:
+                continue
+            ts = h.stamp.to_sec() if h.stamp else 0.0
+            dt = abs(ts - target_stamp_sec)
+            if best_dt is None or dt < best_dt:
+                best_dt = dt
+                best = (h, p)
+        if best is None:
+            return None, np.zeros((0, 3), dtype=np.float64)
+        h, p = best
+        if p is None or p.size == 0:
+            return h, np.zeros((0, 3), dtype=np.float64)
+        return h, p
+    
     def _get_latest_radar_frame(self):
         """최근 레이더 프레임(헤더, pts)을 반환. 없으면 (None, empty)."""
         if len(self._rad_hist) == 0:
@@ -356,7 +382,10 @@ class AssociationNode:
             return
 
         # 3. 레이더 데이터 스택 가져오기
-        radar_header, pts = self._build_radar_stack()
+        if self.use_temporal_alignment and msg.header.stamp.to_sec() > 0:
+            radar_header, pts = self._build_time_aligned_radar(msg.header.stamp.to_sec())
+        else:
+            radar_header, pts = self._build_radar_stack()
         # track-speed는 기본적으로 최신 레이더 프레임만 쓰도록 별도 보관
         latest_header, latest_pts = self._get_latest_radar_frame()
         if radar_header is None or pts.size == 0:
@@ -486,6 +515,17 @@ class AssociationNode:
                 out.objects.append(assoc)
                 continue
 
+            # --- [핵심] BEV 중심 연관 보강 ---
+            if self.use_bev_association and sel.shape[0] > 0:
+                track_key = f"{int(det.id)}:{int((0.5 * (x1 + x2)) / max(1.0, self.track_speed_key_bucket_px))}"
+                prev_bev = self._track_bev_center.get(track_key)
+                if prev_bev is not None:
+                    xy = sel[:, :2]
+                    bev_dist = np.linalg.norm(xy - np.array(prev_bev, dtype=np.float64), axis=1)
+                    sel_gate = sel[bev_dist <= self.bev_gate_m]
+                    if sel_gate.shape[0] > 0:
+                        sel = sel_gate
+
             # --- [핵심] 거리 계산 ---
             sel_xyz = sel[:, :3]
             sel_rng = np.linalg.norm(sel_xyz, axis=1)
@@ -546,6 +586,7 @@ class AssociationNode:
 
                 if (prev is None) or (t_sec > prev[0] + 1e-6):
                     self._track_last_xy[track_key] = (t_sec, cx, cy)
+                self._track_bev_center[track_key] = (cx, cy)
 
             # --- [핵심] 속도 계산 및 보정 (Doppler 기반) ---
             speed_mps = float("nan")

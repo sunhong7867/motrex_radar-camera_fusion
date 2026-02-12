@@ -14,7 +14,7 @@ real_gui.py (Updated)
 
 2. 시각화 로직 개선:
    - Magnet Line: BBox 중앙 <-> 레이더 대표 점/클러스터 대표점 토글 연결
-   - Representative Point: 상단 30% 영역의 중앙값 사용 (Single Point 모드)
+   - Representative Point: BBox 기준점(상/중/하단) 선택 가능
    - Accuracy/Score: 캘리브레이션 정확도/트랙 속도 점수 분리 표시
 
 3. 데이터 저장 (Data Logging) 수정:
@@ -41,7 +41,7 @@ import rospy
 import rospkg
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from cv_bridge import CvBridge
-from std_msgs.msg import Bool, String
+from std_msgs.msg import String
 
 # ==============================================================================
 # Setup & Imports
@@ -58,6 +58,7 @@ from perception_lib.logging_utils import DataLogger
 from perception_lib.speed_utils import (
     build_record_row,
     find_target_lane,
+    get_bbox_reference_point,
     parse_radar_pointcloud,
     project_points,
     select_representative_point,
@@ -103,9 +104,6 @@ TOPIC_CAMERA_INFO = "/camera/camera_info"
 TOPIC_FINAL_OUT = "/perception_test/output"
 TOPIC_TRACKS = "/perception_test/tracks"
 TOPIC_ASSOCIATED = "/perception_test/associated"
-
-BRIGHTNESS_PARAM_ENABLE = "/object_detector/runtime/brightness_enable"
-BRIGHTNESS_PARAM_GAIN = "/object_detector/runtime/brightness_gain"
 
 START_ACTIVE_LANES = ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]
 
@@ -156,23 +154,17 @@ def score_point_to_bbox(target_pt: Tuple[int, int], ref_pt: Tuple[int, int], bbo
 def select_cluster_point_for_bbox(
     cluster_uvs: np.ndarray,
     bbox: Tuple[int, int, int, int],
+    ref_mode: str = "center",
 ) -> Optional[Tuple[int, int]]:
     if cluster_uvs is None or cluster_uvs.size == 0:
         return None
     x1, y1, x2, y2 = bbox
-    inside = (
-        (cluster_uvs[:, 0] >= x1)
-        & (cluster_uvs[:, 0] <= x2)
-        & (cluster_uvs[:, 1] >= y1)
-        & (cluster_uvs[:, 1] <= y2)
-    )
-    if not np.any(inside):
-        return None
-    candidates = cluster_uvs[inside]
-    target_pt = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
-    dists = np.hypot(candidates[:, 0] - target_pt[0], candidates[:, 1] - target_pt[1])
+    target_u, target_v = get_bbox_reference_point(bbox, ref_mode)
+    target_pt = np.array([target_u, target_v], dtype=np.float64)
+    dists = np.hypot(cluster_uvs[:, 0] - target_pt[0], cluster_uvs[:, 1] - target_pt[1])
     idx = int(np.argmin(dists))
-    return (int(candidates[idx, 0]), int(candidates[idx, 1]))
+    return (int(cluster_uvs[idx, 0]), int(cluster_uvs[idx, 1]))
+
 # ==============================================================================
 # UI Classes
 # ==============================================================================
@@ -236,9 +228,6 @@ class ImageCanvasViewer(QtWidgets.QWidget):
 # ManualCalibWindow
 # ==============================================================================
 class ManualCalibWindow(QtWidgets.QDialog):
-    # ROS 메시지를 GUI 스레드로 안전하게 넘기기 위한 시그널
-    diag_signal = Signal(str)
-
     def __init__(self, gui: 'RealWorldGUI'):
         super().__init__(gui, QtCore.Qt.Window | QtCore.Qt.WindowMinMaxButtonsHint | QtCore.Qt.WindowCloseButtonHint)
         self.gui = gui
@@ -260,11 +249,6 @@ class ManualCalibWindow(QtWidgets.QDialog):
         
         self.FIXED_DEG = 0.5   
         self.FIXED_MOV = 0.1   
-
-        # ROS 통신 설정
-        self.pub_diag_start = rospy.Publisher("/perception_test/diagnosis/start", Bool, queue_size=1)
-        self.sub_diag_result = rospy.Subscriber("/perception_test/diagnosis/result", String, self._on_diag_msg)
-        self.diag_signal.connect(self._update_log_ui)
 
         self.init_ui()
         self._timer = QtCore.QTimer(self); self._timer.timeout.connect(self.update_view); self._timer.start(33)
@@ -303,25 +287,10 @@ class ManualCalibWindow(QtWidgets.QDialog):
         g_vis.addWidget(self.chk_raw, 1, 0); g_vis.addWidget(self.chk_noise_filter, 1, 1)
         vbox.addWidget(gb_vis)
 
-        # (2) Diagnostic Tool
-        gb_diag = QtWidgets.QGroupBox("2. Diagnostic Tool")
-        v_diag = QtWidgets.QVBoxLayout(gb_diag)
-        self.btn_diag = QtWidgets.QPushButton("🔍 START DIAGNOSIS (Check Error)")
-        self.btn_diag.setStyleSheet("background-color: #3498db; color: white;")
-        self.btn_diag.clicked.connect(self._start_diagnostic_ros)
-        
-        self.txt_log = QtWidgets.QPlainTextEdit()
-        self.txt_log.setReadOnly(True)
-        self.txt_log.setPlaceholderText("Ready. Press button to analyze traffic.")
-        self.txt_log.setStyleSheet("background:#222; color:#0f0; font-family:Consolas; font-size:14px;")
-        self.txt_log.setMinimumHeight(180)
-        v_diag.addWidget(self.btn_diag); v_diag.addWidget(self.txt_log)
-        vbox.addWidget(gb_diag)
-
         L_GRAY, D_GRAY = "#e0e0e0", "#757575"
 
-        # (3) Translation Pad
-        gb_trans = QtWidgets.QGroupBox("3. Translation (0.1m)")
+        # (2) Translation Pad
+        gb_trans = QtWidgets.QGroupBox("2. Translation (0.1m)")
         t_grid = QtWidgets.QGridLayout(gb_trans)
         t_grid.addWidget(self._create_btn("FWD ▲ (T)", L_GRAY, lambda: self._move(1, 1)), 0, 1)
         t_grid.addWidget(self._create_btn("LEFT ◀ (R)", L_GRAY, lambda: self._move(0, -1)), 1, 0)
@@ -331,8 +300,8 @@ class ManualCalibWindow(QtWidgets.QDialog):
         t_grid.addWidget(self._create_btn("DOWN ⤓ (H)", D_GRAY, lambda: self._move(2, -1), "white"), 2, 2)
         vbox.addWidget(gb_trans)
 
-        # (4) Rotation Pad
-        gb_rot = QtWidgets.QGroupBox("4. Rotation (0.5°)")
+        # (3) Rotation Pad
+        gb_rot = QtWidgets.QGroupBox("3. Rotation (0.5°)")
         r_grid = QtWidgets.QGridLayout(gb_rot)
         r_grid.addWidget(self._create_btn("Pitch+ ⇈ (Q)", L_GRAY, lambda: self._rotate(0, 1)), 0, 1)
         r_grid.addWidget(self._create_btn("Yaw+ ↶ (W)", L_GRAY, lambda: self._rotate(1, -1)), 1, 0)
@@ -405,21 +374,22 @@ class ManualCalibWindow(QtWidgets.QDialog):
             if self.chk_bbox.isChecked() and self.gui.vis_objects:
                 for obj in self.gui.vis_objects:
                     x1, y1, x2, y2 = obj['bbox']
-                    cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 0, 255), 2)
             if self.chk_raw.isChecked() and uvs_man is not None:
                 for i in range(len(uvs_man)):
                     if not valid_man[i]: continue
                     vel = dops[i] if (dops is not None and i < len(dops)) else 0.0
                     if self.chk_noise_filter.isChecked() and abs(vel) < 1.4: continue
-                    color = (0, 0, 255) if vel < -0.5 else (255, 0, 0) if vel > 0.5 else (0, 255, 0)
-                    cv2.circle(disp, (int(uvs_man[i, 0]), int(uvs_man[i, 1])), 3, color, -1)
+                    color = (0, 255, 255)
+                    cv2.circle(disp, (int(uvs_man[i, 0]), int(uvs_man[i, 1])), 5, color, -1)
             self.img_view.update_image(disp)
         except Exception: pass
 
     def _draw_grid_and_axis(self, img, K, cx, cy):
-        grid_z = -1.5; purple = (255, 0, 255)
-        for x in np.arange(-15, 16, 3): self._draw_safe_line(img, [x, 0, grid_z], [x, 100, grid_z], K, cx, cy, purple)
-        for y in range(0, 101, 10): self._draw_safe_line(img, [-15, y, grid_z], [15, y, grid_z], K, cx, cy, purple)
+        grid_z = -1.5; grid_color = (0, 255, 0)
+        for x in np.arange(-15, 16, 3): self._draw_safe_line(img, [x, 0, grid_z], [x, 100, grid_z], K, cx, cy, grid_color)
+        for y in range(0, 101, 10): self._draw_safe_line(img, [-15, y, grid_z], [15, y, grid_z], K, cx, cy, grid_color)
+
 
     def _draw_safe_line(self, img, p1, p2, K, cx, cy, color):
         pts = np.vstack([p1, p2]); uv, v = project_points(K, self.T_current[:3,:3], self.T_current[:3,3], pts)
@@ -431,30 +401,46 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.gui.load_extrinsic(); self.close()
 
     def _reset_T(self): 
-        self.T_current = self.T_init.copy(); self.update_view()
-        self.txt_log.appendPlainText(">>> Reset to initial values.")
-
-    def _start_diagnostic_ros(self):
-        """ROS 노드에게 진단 시작 요청 (고정 시점용 멘트)"""
-        self.btn_diag.setEnabled(False)
-        # [수정] 육교 고정 시점이므로 '운전' 지시 제거
-        self.txt_log.setPlainText(">> [REQUEST] Starting 30s Diagnosis...\n>> Collecting traffic data (50m+)...")
-        self.pub_diag_start.publish(True)
-
-    def _on_diag_msg(self, msg):
-        self.diag_signal.emit(msg.data)
-
-    @Slot(str)
-    def _update_log_ui(self, text):
-        self.btn_diag.setEnabled(True)
-        self.txt_log.appendPlainText("\n" + "="*30)
-        self.txt_log.appendPlainText(text)
-        self.txt_log.appendPlainText("="*30)
-        self.txt_log.verticalScrollBar().setValue(self.txt_log.verticalScrollBar().maximum())
+        self.T_current = self.T_init.copy()
+        self.update_view()
 
     def closeEvent(self, e): 
         self._timer.stop() 
         super().closeEvent(e)
+
+# ==============================================================================
+# View Options Dialog
+# ==============================================================================
+class ViewOptionsDialog(QtWidgets.QDialog):
+    def __init__(self, gui: 'RealWorldGUI'):
+        super().__init__(gui)
+        self.gui = gui
+        self.setWindowTitle("View Options")
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Window)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self._original_parent = gui.gb_vis.parentWidget()
+        self._original_layout = gui._gb_vis_parent_layout
+
+        gui.gb_vis.setParent(self)
+        gui.gb_vis.setVisible(True)
+        layout.addWidget(gui.gb_vis)
+
+        size = gui.gb_vis.sizeHint()
+        self.setFixedSize(size.width() + 20, size.height() + 20)
+        main_geo = gui.geometry()
+        x = main_geo.x() + main_geo.width() - self.width() - 20
+        y = main_geo.y() + main_geo.height() - self.height() - 60
+        self.move(max(main_geo.x(), x), max(main_geo.y(), y))
+
+    def closeEvent(self, event):
+        self.gui.gb_vis.setParent(self._original_parent)
+        if self._original_layout is not None:
+            self._original_layout.addWidget(self.gui.gb_vis)
+        self.gui.gb_vis.setVisible(False)
+        if hasattr(self.gui, "btn_toggle_vis"):
+            self.gui.btn_toggle_vis.setText("👁️ Show View Options")
+        super().closeEvent(event)
 
 # ==============================================================================
 # Main GUI - [수정됨: 우측 패널 상단 세로 로고 배치, 전체화면]
@@ -496,16 +482,22 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.extrinsic_last_loaded = None
         self.rep_pt_mem = {} 
         self.track_confirmed_cnt = {}
+        self.radar_track_hist = {}
+        self.track_hist_len = 40
         self.pt_alpha = 0.15
         self.vel_gate_mps = 1.5 
         self.spatial_weight_sigma = 30.0 
         self.min_pts_for_rep = 2
         self.kf_vel = {}  # 차량 ID별 속도 칼만 필터 딕셔너리
         self.kf_score = {} # 차량 ID별 점수 칼만 필터 (점수 급락 방지용)
+        self.bbox_ref_mode = "bottom"
 
         # ---------------- Speed estimation memory / smoothing ----------------
         self.vel_memory = {}
-        self.vel_hold_sec_default = 10.0
+        self.vel_hold_sec = 0.6
+        self.vel_decay_sec = 0.8
+        self.vel_decay_floor_kmh = 5.0
+        self.vel_rate_limit_kmh_per_s = 12.0
         self.radar_frame_count = 0
         self.radar_warmup_frames = 8
         self.max_jump_kmh = 25.0
@@ -539,12 +531,17 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         rospy.Subscriber(TOPIC_FINAL_OUT, AssociationArray, self.cb_final_result, queue_size=1)
         rospy.Subscriber(TOPIC_ASSOCIATED, AssociationArray, self.cb_association_result, queue_size=1)
         rospy.Subscriber(TOPIC_TRACKS, DetectionArray, self.cb_tracker_result, queue_size=1)
+        self.pub_diag_start = rospy.Publisher("/perception_test/diagnosis/start", String, queue_size=1)
+        self.sub_diag_result = rospy.Subscriber("/perception_test/diagnosis/result", String, self._on_diag_msg)
+        self.latest_diag_msg = ""
+        self.diag_dirty = False
 
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_loop)
         self.timer.start(REFRESH_RATE_MS)
 
         self.last_update_time = time.time()
+        self.view_options_dialog = None
 
     def init_ui(self):
         # 메인 위젯
@@ -654,8 +651,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         btn_autocal.clicked.connect(self.run_autocalibration)
         btn_calib = QtWidgets.QPushButton("Run Extrinsic (Manual)")
         btn_calib.clicked.connect(self.run_calibration)
-        btn_reload = QtWidgets.QPushButton("Reload JSON")
-        btn_reload.clicked.connect(self.load_extrinsic)
         
         self.pbar_intrinsic = QtWidgets.QProgressBar()
         self.pbar_intrinsic.setRange(0, 0)
@@ -676,7 +671,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v_c.addWidget(btn_intri)
         v_c.addWidget(btn_autocal)
         v_c.addWidget(btn_calib)
-        v_c.addWidget(btn_reload)
         v_c.addWidget(self.pbar_intrinsic)
         v_c.addWidget(self.txt_intrinsic_log)
         v_c.addWidget(self.pbar_extrinsic)
@@ -685,8 +679,31 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_calib.setLayout(v_c)
         vbox.addWidget(gb_calib)
 
-        # 2. Calibration Accuracy (New)
-        gb2 = QtWidgets.QGroupBox("2. Accuracy / Score")
+        # 2. Diagnostic Tool
+        gb_diag = QtWidgets.QGroupBox("2. Diagnostic Tool")
+        v_diag = QtWidgets.QVBoxLayout()
+        self.btn_diag = QtWidgets.QPushButton("📈 RUN TRAJECTORY EVAL")
+        self.btn_diag.setStyleSheet("background-color: #3498db; color: white;")
+        self.btn_diag.clicked.connect(self._start_diagnostic_ros)
+
+        self.cmb_diag_ref = QtWidgets.QComboBox()
+        self.cmb_diag_ref.addItems(["Bottom Center", "Center", "Top Center"])
+        self.cmb_diag_ref.setCurrentText(self.bbox_ref_label())
+        self.cmb_diag_ref.currentTextChanged.connect(self.set_bbox_ref_mode_from_label)
+
+        self.txt_diag_log = QtWidgets.QPlainTextEdit()
+        self.txt_diag_log.setReadOnly(True)
+        self.txt_diag_log.setPlaceholderText("Ready. Press button to evaluate trajectories.")
+        self.txt_diag_log.setMaximumHeight(180)
+        self.txt_diag_log.setStyleSheet("background:#222; color:#0f0; font-family:Consolas; font-size:14px;")
+        v_diag.addWidget(self.btn_diag)
+        v_diag.addWidget(self.cmb_diag_ref)
+        v_diag.addWidget(self.txt_diag_log)
+        gb_diag.setLayout(v_diag)
+        vbox.addWidget(gb_diag)
+
+        # 3. Calibration Accuracy (New)
+        gb2 = QtWidgets.QGroupBox("3. Accuracy / Score")
         v2 = QtWidgets.QVBoxLayout()
         
         h_acc = QtWidgets.QHBoxLayout()
@@ -699,7 +716,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         lbl_emoji.setStyleSheet("font-size: 30px;")
         self.lbl_emoji = lbl_emoji
         h_acc.addWidget(lbl_calib)
-        h_acc.addWidget(self.bar_calib_acc, stretch=1)
+        h_acc.addStretch(1)
         h_acc.addWidget(self.lbl_emoji)
 
         h_score = QtWidgets.QHBoxLayout()
@@ -709,26 +726,15 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.bar_speed_score.setValue(0)
         self.bar_speed_score.setStyleSheet("QProgressBar::chunk { background-color: #2196F3; }")
         h_score.addWidget(lbl_speed_score)
-        h_score.addWidget(self.bar_speed_score, stretch=1)
-
         
-        self.chk_magnet = QtWidgets.QCheckBox("Show Magnet Line (Validation)")
-        self.chk_magnet.setChecked(True)
-        
-        self.cmb_magnet_mode = QtWidgets.QComboBox()
-        self.cmb_magnet_mode.addItems([
-            "BBox Representative (Speed)",
-            "Cluster Center (Calibration)",
-        ])
-
         v2.addLayout(h_acc)
+        v2.addWidget(self.bar_calib_acc)
         v2.addLayout(h_score)
-        v2.addWidget(self.chk_magnet)
-        v2.addWidget(self.cmb_magnet_mode)
+        v2.addWidget(self.bar_speed_score)
         gb2.setLayout(v2); vbox.addWidget(gb2)
 
-        # 3. Lane Editor
-        gb_lane = QtWidgets.QGroupBox("3. Lane Editor")
+        # 4. Lane Editor
+        gb_lane = QtWidgets.QGroupBox("4. Lane Editor")
         v_l = QtWidgets.QVBoxLayout()
         btn_edit = QtWidgets.QPushButton("🖌️ Open Editor")
         btn_edit.setStyleSheet("background-color: #FFD700; color: black; font-weight: bold; padding: 10px;")
@@ -737,8 +743,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_lane.setLayout(v_l)
         vbox.addWidget(gb_lane)
 
-        # 4. Data Logging
-        gb_logging = QtWidgets.QGroupBox("4. Data Logging")
+        # 5. Data Logging
+        gb_logging = QtWidgets.QGroupBox("5. Data Logging")
         v_log = QtWidgets.QVBoxLayout()
         v_log.setSpacing(10)
 
@@ -764,30 +770,96 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v_log.addWidget(self.lbl_record_status)
         gb_logging.setLayout(v_log)
         
-        vbox.addWidget(gb_logging) # 4번 섹션으로 추가
+        vbox.addWidget(gb_logging)
 
-        # 5. View Options
-        gb_vis = QtWidgets.QGroupBox("5. View Options")
+        # 6. View Options
+        gb_vis = QtWidgets.QGroupBox("6. View Options")
         v_vis = QtWidgets.QVBoxLayout()
+        gb_vis.setVisible(False)
+        self._gb_vis_parent_layout = vbox
+        self.btn_toggle_vis = QtWidgets.QPushButton("👁️ Show View Options")
+        self.btn_toggle_vis.clicked.connect(self._toggle_view_options)
+        vbox.addWidget(self.btn_toggle_vis)
         
-        self.chk_show_poly = QtWidgets.QCheckBox("Show Lane Polygons")
-        self.chk_show_poly.setChecked(False)
-        
-        # [수정] 아이디와 속도 체크박스
         self.chk_show_id = QtWidgets.QCheckBox("Show ID Text")
         self.chk_show_id.setChecked(True)
         self.chk_show_speed = QtWidgets.QCheckBox("Show Speed Text")
         self.chk_show_speed.setChecked(True)
 
-        # [추가] 6번에서 가져온 레이더 포인트 토글 (검정색, 진하게)
+        self.chk_show_boxes = QtWidgets.QCheckBox("Show BBoxes")
+        self.chk_show_boxes.setChecked(True)
+        self.chk_show_targets = QtWidgets.QCheckBox("Show BBox Reference Points")
+        self.chk_show_targets.setChecked(True)
+
         self.chk_show_radar = QtWidgets.QCheckBox("Show Radar Points")
-        self.chk_show_radar.setChecked(True)
-        self.chk_show_radar.setStyleSheet("color: black; font-weight: bold;")
+        self.chk_show_radar.setChecked(False)
         
-        v_vis.addWidget(self.chk_show_poly)
+        self.chk_show_rep_points = QtWidgets.QCheckBox("Show Speed Radar Points")
+        self.chk_show_rep_points.setChecked(False)
+        self.chk_show_cluster_points = QtWidgets.QCheckBox("Show Cluster Centers")
+        self.chk_show_cluster_points.setChecked(True)
+        self.chk_show_radar_tracks = QtWidgets.QCheckBox("Show Radar Tracks")
+        self.chk_show_radar_tracks.setChecked(False)
+        self.chk_magnet = QtWidgets.QCheckBox("Show Magnet Line")
+        self.chk_magnet.setChecked(False)
+
+        self.chk_show_poly = QtWidgets.QCheckBox("Show Lane Polygons")
+        self.chk_show_poly.setChecked(False)
+
+        self.cmb_bbox_ref = QtWidgets.QComboBox()
+        self.cmb_bbox_ref.addItems(["Bottom Center", "Center", "Top Center"])
+        self.cmb_bbox_ref.setCurrentText(self.bbox_ref_label())
+        self.cmb_bbox_ref.currentTextChanged.connect(self.set_bbox_ref_mode_from_label)
+
+        self.cmb_magnet_mode = QtWidgets.QComboBox()
+        self.cmb_magnet_mode.addItems([
+            "BBox Representative (Speed)",
+            "Cluster Center (Calibration)",
+        ])
+
+        v_vis.addWidget(QtWidgets.QLabel("Text / Labels"))
         v_vis.addWidget(self.chk_show_id)
         v_vis.addWidget(self.chk_show_speed)
+
+        sep1 = QtWidgets.QFrame()
+        sep1.setFrameShape(QtWidgets.QFrame.HLine)
+        sep1.setFrameShadow(QtWidgets.QFrame.Sunken)
+        v_vis.addWidget(sep1)
+
+        v_vis.addWidget(QtWidgets.QLabel("Boxes / Reference"))
+        v_vis.addWidget(self.chk_show_boxes)
+        v_vis.addWidget(self.chk_show_targets)
+
+        sep2 = QtWidgets.QFrame()
+        sep2.setFrameShape(QtWidgets.QFrame.HLine)
+        sep2.setFrameShadow(QtWidgets.QFrame.Sunken)
+        v_vis.addWidget(sep2)
+
+        v_vis.addWidget(QtWidgets.QLabel("Radar / Tracks"))
         v_vis.addWidget(self.chk_show_radar)
+        v_vis.addWidget(self.chk_show_rep_points)
+        v_vis.addWidget(self.chk_show_cluster_points)
+        v_vis.addWidget(self.chk_show_radar_tracks)
+        v_vis.addWidget(self.chk_magnet)
+
+        sep3 = QtWidgets.QFrame()
+        sep3.setFrameShape(QtWidgets.QFrame.HLine)
+        sep3.setFrameShadow(QtWidgets.QFrame.Sunken)
+        v_vis.addWidget(sep3)
+
+        v_vis.addWidget(QtWidgets.QLabel("Association Settings"))
+        v_vis.addWidget(QtWidgets.QLabel("BBox Reference (Auto)"))
+        v_vis.addWidget(self.cmb_bbox_ref)
+        v_vis.addWidget(QtWidgets.QLabel("Magnet Source"))
+        v_vis.addWidget(self.cmb_magnet_mode)
+
+        sep4 = QtWidgets.QFrame()
+        sep4.setFrameShape(QtWidgets.QFrame.HLine)
+        sep4.setFrameShadow(QtWidgets.QFrame.Sunken)
+        v_vis.addWidget(sep4)
+
+        v_vis.addWidget(QtWidgets.QLabel("Lane Overlay"))
+        v_vis.addWidget(self.chk_show_poly)
 
         self.chk_lanes = {}
         display_order = ["IN1", "OUT1", "IN2", "OUT2", "IN3", "OUT3"]
@@ -795,7 +867,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         for i, name in enumerate(display_order):
             chk = QtWidgets.QCheckBox(name)
-            is_active = name in START_ACTIVE_LANES
+            is_active = True
             chk.setChecked(is_active)
             self.chk_lanes[name] = chk
             g_vis.addWidget(chk, i // 2, i % 2)
@@ -807,37 +879,13 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         v_vis.addWidget(btn_reset_id)
         
         gb_vis.setLayout(v_vis)
+        self.gb_vis = gb_vis
         vbox.addWidget(gb_vis)
-
-        # [삭제] 6. Radar Speed Filters 섹션 전체 삭제됨
-
-        # 6. Image Brightness (번호 7 -> 6으로 변경)
-        gb_brightness = QtWidgets.QGroupBox("6. Image Brightness")
-        v_b = QtWidgets.QVBoxLayout()
-        self.chk_brightness = QtWidgets.QCheckBox("Enable Brightness Gain")
-        self.chk_brightness.setChecked(False)
-        row_b = QtWidgets.QHBoxLayout()
-        row_b.addWidget(QtWidgets.QLabel("Gain (x):"))
-        self.spin_brightness_gain = QtWidgets.QDoubleSpinBox()
-        self.spin_brightness_gain.setDecimals(2)
-        self.spin_brightness_gain.setRange(0.3, 2.5)
-        self.spin_brightness_gain.setSingleStep(0.05)
-        self.spin_brightness_gain.setValue(1.0)
-        row_b.addWidget(self.spin_brightness_gain, stretch=1)
-        v_b.addWidget(self.chk_brightness)
-        v_b.addLayout(row_b)
-        gb_brightness.setLayout(v_b)
-        vbox.addWidget(gb_brightness)
-        
-        self.chk_brightness.toggled.connect(self._update_brightness_params)
-        self.spin_brightness_gain.valueChanged.connect(self._update_brightness_params)
 
         # 하단 여백 추가
         vbox.addStretch()
         layout.addWidget(panel, stretch=0)
-        
-        self._update_brightness_params()
-        
+                
         # 내부적으로 사용하는 speed parameter 들 (UI에는 없지만 로직 유지를 위해 필요)
         self.spin_hold_sec = type('obj', (object,), {'value': lambda: 10.0})
         self.cmb_smoothing = type('obj', (object,), {'currentText': lambda: "EMA"})
@@ -848,16 +896,33 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.global_to_local_ids = {}
         self.vehicle_lane_paths = {}
 
-    def _update_brightness_params(self):
-        if not hasattr(self, "chk_brightness") or not hasattr(self, "spin_brightness_gain"):
-            return
-        enabled = bool(self.chk_brightness.isChecked())
-        gain = float(self.spin_brightness_gain.value())
-        try:
-            rospy.set_param(BRIGHTNESS_PARAM_ENABLE, enabled)
-            rospy.set_param(BRIGHTNESS_PARAM_GAIN, gain)
-        except Exception as e:
-            print(f"Brightness Param Error: {e}")
+    def _toggle_view_options(self):
+        if self.view_options_dialog is None:
+            self.view_options_dialog = ViewOptionsDialog(self)
+        if self.view_options_dialog.isVisible():
+            self.view_options_dialog.close()
+            self.view_options_dialog = None
+            if hasattr(self, "btn_toggle_vis"):
+                self.btn_toggle_vis.setText("👁️ Show View Options")
+        else:
+            self.view_options_dialog.show()
+            self.view_options_dialog.raise_()
+            self.view_options_dialog.activateWindow()
+            if hasattr(self, "btn_toggle_vis"):
+                self.btn_toggle_vis.setText("👁️ Hide View Options")
+
+    def _start_diagnostic_ros(self):
+        if hasattr(self, "btn_diag") and self.btn_diag is not None:
+            self.btn_diag.setEnabled(False)
+        if hasattr(self, "txt_diag_log") and self.txt_diag_log is not None:
+            self.txt_diag_log.setPlainText(">> [REQUEST] Starting trajectory evaluation...\n>> Collecting track data...")
+        self.pub_diag_start.publish(String(data=str(self.bbox_ref_mode)))
+
+    def _on_diag_msg(self, msg):
+        self.latest_diag_msg = msg.data
+        self.diag_dirty = True
+        if hasattr(self, "btn_diag") and self.btn_diag is not None:
+            self.btn_diag.setEnabled(True)
 
     def _toggle_recording(self):
         """기록 시작/중단 토글 및 스타일 제어"""
@@ -990,12 +1055,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             if self.cv_image is None: return
 
             disp = self.cv_image.copy()
-            
-            # 밝기 조절
-            if hasattr(self, "chk_brightness") and self.chk_brightness.isChecked():
-                g = self.spin_brightness_gain.value()
-                if abs(g - 1.0) > 0.001:
-                    disp = cv2.convertScaleAbs(disp, alpha=g, beta=0)
 
             # 2. 레이더 투영
             proj_uvs = None
@@ -1041,6 +1100,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
             # 4. 객체별 데이터 처리 루프
             confirmed_objects = [] # 실제로 2초 이상 검증된 객체들만 담을 리스트
+            active_ids = set()
             
             for obj in self.vis_objects:
                 g_id = obj['id']
@@ -1058,6 +1118,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             for obj in confirmed_objects:
                 g_id = obj['id']
                 x1, y1, x2, y2 = obj['bbox']
+                active_ids.add(g_id)
                 
                 # 1. 차선 필터링 (기존 로직 유지)
                 cx, cy = (x1 + x2) // 2, y2
@@ -1065,6 +1126,11 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 if has_lane_filter:
                     target_lane = find_target_lane((cx, cy), active_lane_polys)
                     if target_lane is None:
+                        self.radar_track_hist.pop(g_id, None)
+                        self.vehicle_lane_paths.pop(g_id, None)
+                        self.global_to_local_ids.pop(g_id, None)
+                        self.track_confirmed_cnt.pop(g_id, None)
+                        active_ids.discard(g_id)
                         continue
 
                 curr_lane_str, lane_path, local_no, label = update_lane_tracking(
@@ -1078,7 +1144,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 obj['lane_path'] = lane_path
                 obj['lane'] = curr_lane_str
 
-                target_pt = (int((x1+x2)/2), int((y1+y2)/2)) 
+                target_pt = get_bbox_reference_point((x1, y1, x2, y2), self.bbox_ref_mode)
                 
                 meas_kmh = None
                 rep_pt = None
@@ -1100,11 +1166,12 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                         self.pt_alpha,
                         now_ts,
                         g_id,
-                        NOISE_MIN_SPEED_KMH,  # [수정] UI 변수 대신 고정값(5.0) 사용
+                        NOISE_MIN_SPEED_KMH,
+                        self.bbox_ref_mode,
                     )
                 if cluster_uvs is not None and cluster_valid is not None:
                     valid_clusters = cluster_uvs[cluster_valid]
-                    cluster_pt = select_cluster_point_for_bbox(valid_clusters, (x1, y1, x2, y2))
+                    cluster_pt = select_cluster_point_for_bbox(valid_clusters, (x1, y1, x2, y2), self.bbox_ref_mode)
                     if cluster_pt is not None:
                         cluster_score = score_point_to_bbox(target_pt, cluster_pt, (x1, y1, x2, y2))
                         if cluster_score < 50:
@@ -1126,6 +1193,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     self.vel_memory,
                     self.kf_vel,
                     self.kf_score,
+                    hold_sec=self.vel_hold_sec,
+                    decay_sec=self.vel_decay_sec,
+                    decay_floor_kmh=self.vel_decay_floor_kmh,
+                    rate_limit_kmh_per_s=self.vel_rate_limit_kmh_per_s,
                 )
 
                 obj['vel'] = round(vel_out, 1) if vel_out is not None else float('nan')
@@ -1158,6 +1229,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     "cluster_score": cluster_score,
                 })
 
+                if cluster_pt is not None:
+                    self.radar_track_hist.setdefault(g_id, deque(maxlen=self.track_hist_len)).append(cluster_pt)
+
             # 5. 전역 UI 업데이트
             if calib_scores:
                 avg = sum(calib_scores) / len(calib_scores)
@@ -1187,13 +1261,25 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     # [수정] UI 변수 대신 고정값 사용
                     if abs(spd) < NOISE_MIN_SPEED_KMH: continue
                     
-                    col = (0, 0, 255) if spd < -0.5 else (255, 0, 0) if spd > 0.5 else (0, 255, 0)
-                    cv2.circle(disp, (u, v), 2, col, -1)
+                    col = (0, 255, 255)
+                    cv2.circle(disp, (u, v), 4, col, -1)
+
+            if self.chk_show_radar_tracks.isChecked():
+                for g_id, pts in self.radar_track_hist.items():
+                    if len(pts) >= 2:
+                        arr = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+                        cv2.polylines(disp, [arr], False, (0, 255, 0), 2)
+                        if arr.shape[0] >= 2:
+                            p1 = tuple(arr[-2][0])
+                            p2 = tuple(arr[-1][0])
+                            cv2.arrowedLine(disp, p1, p2, (0, 255, 0), 2, tipLength=0.3)
 
             for it in draw_items:
                 x1, y1, x2, y2 = it["bbox"]
-                cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.circle(disp, it["target_pt"], 4, (0, 255, 255), -1) 
+                if self.chk_show_boxes.isChecked():
+                    cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 0, 255), 2)
+                if self.chk_show_targets.isChecked():
+                    cv2.circle(disp, it["target_pt"], 5, (0, 255, 255), -1) 
 
                 magnet_mode = self.cmb_magnet_mode.currentText()
                 magnet_pt = None
@@ -1206,26 +1292,30 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     magnet_score = it["score"]
 
                 if magnet_pt is not None and self.chk_magnet.isChecked():
-                    lc = (0, 255, 0) if magnet_score > 50 else (0, 0, 255)
+                    lc = (255, 0, 0) if magnet_score > 50 else (0, 0, 255)
                     cv2.line(disp, it["target_pt"], magnet_pt, lc, 2)
 
-                if it["cluster_pt"] is not None and magnet_mode == "Cluster Center (Calibration)":
+                if (
+                    it["cluster_pt"] is not None
+                    and magnet_mode == "Cluster Center (Calibration)"
+                    and self.chk_show_cluster_points.isChecked()
+                ):
                     cv2.circle(disp, it["cluster_pt"], 5, (255, 0, 255), -1)
                     cv2.circle(disp, it["cluster_pt"], 6, (255, 255, 255), 1)
 
-                if it["rep_pt"] is not None:
+                if it["rep_pt"] is not None and self.chk_show_rep_points.isChecked():
                     # [수정] 대표점은 체크박스 없이 항상 그림 (단, 속도가 노이즈 이상일 때)
                     rv = it["rep_vel"]
                     if rv is not None and abs(rv) >= NOISE_MIN_SPEED_KMH:
-                        col = (0, 0, 255) if rv < -0.5 else (255, 0, 0) if rv > 0.5 else (0, 255, 0)
-                        cv2.circle(disp, it["rep_pt"], 5, col, -1)
-                        cv2.circle(disp, it["rep_pt"], 6, (255, 255, 255), 1)
+                        col = (0, 255, 255)
+                        cv2.circle(disp, it["rep_pt"], 6, col, -1)
+                        cv2.circle(disp, it["rep_pt"], 7, (255, 255, 255), 1)
 
                 lines = []
                 if self.chk_show_id.isChecked(): lines.append(it['label'])
                 if self.chk_show_speed.isChecked():
                     v = it["obj"].get("vel", float("nan"))
-                    lines.append(f"Vel: {v:.1f}km/h" if np.isfinite(v) else "Vel: --km/h")
+                    lines.append(f"Vel: {int(v)}km/h" if np.isfinite(v) else "Vel: --km/h")
 
                 if lines:
                     font, sc, th = cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
@@ -1251,8 +1341,12 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     if pts is not None and len(pts) > 0:
                         cv2.polylines(disp, [pts], True, (0, 255, 255), 2)
 
-            current_ids = {o['id'] for o in self.vis_objects}
-            self.track_confirmed_cnt = {k: v for k, v in self.track_confirmed_cnt.items() if k in current_ids}
+            visible_ids = {o['id'] for o in self.vis_objects}
+            self.track_confirmed_cnt = {k: v for k, v in self.track_confirmed_cnt.items() if k in visible_ids}
+            self.radar_track_hist = {k: v for k, v in self.radar_track_hist.items() if k in active_ids}
+            if self.diag_dirty and hasattr(self, "txt_diag_log"):
+                self.txt_diag_log.setPlainText(self.latest_diag_msg)
+                self.diag_dirty = False
 
             self.viewer.update_image(disp)
 
@@ -1280,6 +1374,26 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
     def load_extrinsic(self):
         calibration_utils.load_extrinsic(self)
+
+    def bbox_ref_label(self) -> str:
+        if self.bbox_ref_mode == "top":
+            return "Top Center"
+        if self.bbox_ref_mode == "center":
+            return "Center"
+        return "Bottom Center"
+
+    def set_bbox_ref_mode_from_label(self, label: str) -> None:
+        label = (label or "").lower()
+        if "top" in label:
+            self.bbox_ref_mode = "top"
+        elif "center" in label and "bottom" not in label:
+            self.bbox_ref_mode = "center"
+        else:
+            self.bbox_ref_mode = "bottom"
+        if hasattr(self, "cmb_bbox_ref") and self.cmb_bbox_ref is not None:
+            target_label = self.bbox_ref_label()
+            if self.cmb_bbox_ref.currentText() != target_label:
+                self.cmb_bbox_ref.setCurrentText(target_label)
 
     def run_calibration(self):
         calibration_utils.run_calibration(self, ManualCalibWindow)

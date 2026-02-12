@@ -171,6 +171,17 @@ def update_lane_tracking(
 
     return curr_lane_str, lane_path, local_no, label
 
+def get_bbox_reference_point(
+    bbox: Tuple[int, int, int, int],
+    mode: str = "center",
+) -> Tuple[int, int]:
+    x1, y1, x2, y2 = bbox
+    mode = (mode or "center").lower()
+    if mode in {"bottom", "bottom_center", "bottom-center"}:
+        return int((x1 + x2) / 2), int(y2)
+    if mode in {"top", "top_center", "top-center"}:
+        return int((x1 + x2) / 2), int(y1)
+    return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
 def select_representative_point(
     proj_uvs: np.ndarray,
@@ -184,6 +195,8 @@ def select_representative_point(
     now_ts: float,
     g_id: int,
     min_speed_kmh: float,
+    ref_mode: str = "center",
+    trim_ratio: float = 0.2,
 ) -> Tuple[Optional[float], Optional[Tuple[int, int]], Optional[float], float, float]:
     x1, y1, x2, y2 = bbox
     meas_kmh = None
@@ -210,7 +223,11 @@ def select_representative_point(
 
     target_idxs = valid_idxs
 
-    t_u, t_v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    t_u, t_v = get_bbox_reference_point(bbox, ref_mode)
+    if g_id in rep_pt_mem:
+        prev_u, prev_v, last_ts = rep_pt_mem[g_id]
+        if now_ts - last_ts < 1.0:
+            t_u, t_v = prev_u, prev_v
 
     if len(target_idxs) == 0:
         return meas_kmh, rep_pt, rep_vel_raw, score, radar_dist
@@ -232,7 +249,12 @@ def select_representative_point(
         best_dists_3d = np.linalg.norm(best_3d_pts, axis=1)
         radar_dist = np.mean(best_dists_3d)
 
-    rep_vel_raw = np.median(dop_raw[target_idxs[closest_indices]]) * 3.6
+    vel_samples = dop_raw[target_idxs[closest_indices]]
+    if trim_ratio > 0.0 and vel_samples.size >= 5:
+        k = int(np.floor(vel_samples.size * trim_ratio))
+        vel_sorted = np.sort(vel_samples)
+        vel_samples = vel_sorted[k:vel_sorted.size - k] if (vel_sorted.size - 2 * k) > 0 else vel_sorted
+    rep_vel_raw = np.median(vel_samples) * 3.6
 
     if g_id in rep_pt_mem:
         prev_u, prev_v, last_ts = rep_pt_mem[g_id]
@@ -250,7 +272,7 @@ def select_representative_point(
     if abs(rep_vel_raw) >= min_speed_kmh:
         meas_kmh = abs(rep_vel_raw)
 
-    target_pt = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+    target_pt = get_bbox_reference_point(bbox, ref_mode)
     dist_px = np.hypot(target_pt[0] - rep_pt[0], target_pt[1] - rep_pt[1])
     diag_len = np.hypot(x2 - x1, y2 - y1)
     err_ratio = dist_px / max(1, diag_len)
@@ -267,6 +289,10 @@ def update_speed_estimate(
     vel_memory: Dict[int, Dict[str, float]],
     kf_vel: Dict[int, ScalarKalman],
     kf_score: Dict[int, ScalarKalman],
+    hold_sec: float = 0.6,
+    decay_sec: float = 0.8,
+    decay_floor_kmh: float = 1.0,
+    rate_limit_kmh_per_s: float = 12.0,
 ) -> Tuple[Optional[float], float]:
     if meas_kmh is not None:
         if abs(meas_kmh) > 120.0:
@@ -301,11 +327,19 @@ def update_speed_estimate(
     v_pred = kf_v.predict()
     s_pred = kf_s.predict()
 
+    def _rate_limit(prev_vel: float, new_vel: float, dt: float) -> float:
+        if dt <= 0.0 or rate_limit_kmh_per_s <= 0.0:
+            return new_vel
+        max_delta = rate_limit_kmh_per_s * dt
+        delta = float(np.clip(new_vel - prev_vel, -max_delta, max_delta))
+        return prev_vel + delta
+    
     if meas_kmh is not None:
-        if abs(meas_kmh) < 4.0:
+        if abs(meas_kmh) < 1:
             meas_kmh = 0.0
 
         vel_out = kf_v.update(meas_kmh)
+        vel_out = _rate_limit(last_vel, vel_out, max(0.0, now_ts - last_ts))
         score_out = kf_s.update(score)
 
         vel_memory[g_id] = {
@@ -317,16 +351,21 @@ def update_speed_estimate(
     else:
         time_gap = now_ts - last_ts
 
-        if time_gap > 0.5:
-            vel_out = 0.0
-        elif time_gap > 0.1:
-            vel_out = v_pred * 0.75
-        else:
+        if time_gap <= hold_sec:
             vel_out = v_pred
-
-        if vel_out < 5.0:
+        elif time_gap <= hold_sec + decay_sec:
+            ratio = (hold_sec + decay_sec - time_gap) / max(decay_sec, 1e-6)
+            vel_out = v_pred * max(0.0, ratio)
+        else:
             vel_out = 0.0
 
+        if vel_out < decay_floor_kmh:
+            vel_out = 0.0
+
+        if vel_out < decay_floor_kmh:
+            vel_out = 0.0
+        vel_out = _rate_limit(last_vel, vel_out, max(0.0, now_ts - last_ts))
+        
         score_out = s_pred * 0.998
 
         mem["fail_count"] = fail_cnt
