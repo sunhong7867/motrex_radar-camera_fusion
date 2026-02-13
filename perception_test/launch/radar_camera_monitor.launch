@@ -1,0 +1,25 @@
+<launch>
+  <arg name="image_topic" default="/camera/image_raw"/>
+  <arg name="output_topic" default="/perception_test/output"/>
+  <arg name="tracks_topic" default="/perception_test/tracks"/>
+  <arg name="extrinsic_path" default="$(find perception_test)/config/extrinsic.json"/>
+  <arg name="autocal_rounds" default="3"/>
+  <arg name="bbox_ref_mode" default="bottom"/>
+
+  <include file="$(find perception_test)/launch/perception_dev.launch">
+    <arg name="launch_real_gui" value="false"/>
+  </include>
+
+  <node pkg="perception_test"
+        type="gui.py"
+        name="consumer_gui"
+        output="screen">
+    <param name="image_topic" value="$(arg image_topic)"/>
+    <param name="output_topic" value="$(arg output_topic)"/>
+    <param name="tracks_topic" value="$(arg tracks_topic)"/>
+    <param name="extrinsic_path" value="$(arg extrinsic_path)"/>
+    <param name="autocal_rounds" value="$(arg autocal_rounds)"/>
+    <param name="bbox_ref_mode" value="$(arg bbox_ref_mode)"/>
+    <param name="autostart" value="true"/>
+  </node>
+</launch>

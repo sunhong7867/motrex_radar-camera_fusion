@@ -40,19 +40,19 @@ class ExtrinsicCalibrationManager:
         # -------------------------------------------------------------
         # [설정] 논문 및 실무 기반 고정밀 파라미터
         # -------------------------------------------------------------
-        self.min_samples = 100         # 800개 이상의 정교한 포인트 확보
+        self.min_samples = 1000         # 800개 이상의 정교한 포인트 확보
         self.req_duration = 30.0        # 20초 이상 주행 데이터 수집
         self.min_track_len = 15         # 최소 15프레임 이상 추적된 궤적만 사용
 
-        # [핵심] 정지 차량 배제: 시속 약 12.6km/h 미만은 노이즈로 간주
-        self.min_speed_mps = 1
+        # [핵심] 정지 차량 배제
+        self.min_speed_mps = 2
 
-        self.cluster_tol = 3.0          # 레이더 클러스터링 거리 임계값
+        self.cluster_tol = 2.0          # 레이더 클러스터링 거리 임계값
         self.match_max_dist_px = 800.0  # 초기 매칭 허용 범위 (전역 매칭)
 
         # RANSAC 설정
         self.ransac_iterations = 500
-        self.ransac_threshold_deg = 2.0 # 2도 이내 오차만 인라이어 판정
+        self.ransac_threshold_deg = 3.0 # 2도 이내 오차만 인라이어 판정
 
         # 파일 경로 설정
         rp = rospkg.RosPack()

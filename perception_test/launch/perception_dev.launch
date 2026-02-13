@@ -3,7 +3,8 @@
     <arg name="roi_lanes_yaml" default="$(find perception_test)/config/roi_lanes.yaml" />
     <arg name="offline_sources_json" default="$(find perception_test)/config/offline_sources.json" />
     <arg name="offline_source_name" default="default" />
-    
+    <arg name="launch_real_gui" default="true" />
+
     <node pkg="perception_test" type="offline_provider_node.py" name="offline_provider" output="screen">
         <param name="sources_json" value="$(arg offline_sources_json)" />
         <param name="source_name" value="$(arg offline_source_name)" />
@@ -53,5 +54,6 @@
     </node>
 
     <node pkg="perception_test" type="calibration_diagnosis_node.py" name="trajectory_eval" output="screen" />
-
+    <node if="$(arg launch_real_gui)" pkg="perception_test" type="real_gui.py" name="real_gui" output="screen" />
+    
 </launch>

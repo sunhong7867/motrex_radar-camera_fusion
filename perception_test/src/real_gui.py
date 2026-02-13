@@ -57,7 +57,7 @@ from perception_lib.lane_editor import LaneEditorDialog
 from perception_lib.logging_utils import DataLogger
 from perception_lib.speed_utils import (
     build_record_row,
-    find_target_lane,
+    find_target_lane_from_bbox,
     get_bbox_reference_point,
     parse_radar_pointcloud,
     project_points,
@@ -1121,10 +1121,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 active_ids.add(g_id)
                 
                 # 1. 차선 필터링 (기존 로직 유지)
-                cx, cy = (x1 + x2) // 2, y2
                 target_lane = None
                 if has_lane_filter:
-                    target_lane = find_target_lane((cx, cy), active_lane_polys)
+                    target_lane = find_target_lane_from_bbox((x1, y1, x2, y2), active_lane_polys)
                     if target_lane is None:
                         self.radar_track_hist.pop(g_id, None)
                         self.vehicle_lane_paths.pop(g_id, None)

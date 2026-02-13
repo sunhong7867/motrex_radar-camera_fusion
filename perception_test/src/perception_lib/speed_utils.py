@@ -138,6 +138,30 @@ def find_target_lane(point_xy: Tuple[int, int], active_lane_polys: Dict[str, np.
     return None
 
 
+def find_target_lane_from_bbox(
+    bbox: Tuple[int, int, int, int],
+    active_lane_polys: Dict[str, np.ndarray],
+) -> Optional[str]:
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    m = 6
+
+    # 하단 중심 + 중심 + 하단 좌/우를 순차 검사
+    candidates = [
+        (cx, y2),
+        (cx, cy),
+        (x1 + m, max(y1, y2 - m)),
+        (x2 - m, max(y1, y2 - m)),
+    ]
+
+    for pt in candidates:
+        lane = find_target_lane(pt, active_lane_polys)
+        if lane is not None:
+            return lane
+    return None
+
+
 def update_lane_tracking(
     g_id: int,
     target_lane: Optional[str],

@@ -7,18 +7,20 @@ catkin_make
 2. Source Environment
 source devel/setup.bash
 
-3. Execution Steps (Run in separate terminals)
+3. Execution Steps
 
-   (2) Run Perception System (Detectors, Tracker)
-roslaunch perception_test perception.launch
+   (A) One-shot Consumer Calibration (Perception + Consumer GUI together)
+roslaunch perception_test radar_camera_monitor.launch
 
-   (3) Run GUI (Visualizer)
-rosrun perception_test real_gui.py
+   (B) Developer flow (Perception + real_gui together)
+roslaunch perception_test perception_dev.launch
 
 4. Notes
    - Ensure 'test_video.mp4' and 'log.csv' are in the 'models' folder.
    - If permission denied:
+
 chmod +x src/perception_test/src/nodes/*.py
+chmod +x src/perception_test/src/*.py
 
 chmod +x ~/motrex/catkin_ws/src/perception_test/src/nodes/radar_cluster_bbox_viz.py
 rosrun perception_test radar_cluster_bbox_viz.py _frame_id:=retina_link _point_scale:=0.8 _bbox_width:=0.15
