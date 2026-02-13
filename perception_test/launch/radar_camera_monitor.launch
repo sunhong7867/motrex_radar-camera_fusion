@@ -3,7 +3,7 @@
   <arg name="output_topic" default="/perception_test/output"/>
   <arg name="tracks_topic" default="/perception_test/tracks"/>
   <arg name="extrinsic_path" default="$(find perception_test)/config/extrinsic.json"/>
-  <arg name="autocal_rounds" default="3"/>
+  <arg name="autocal_rounds" default="1"/>
   <arg name="bbox_ref_mode" default="bottom"/>
 
   <include file="$(find perception_test)/launch/perception_dev.launch">

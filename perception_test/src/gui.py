@@ -9,7 +9,7 @@ Run:
 
 Description:
     1. Startup Dialog: Choose AutoCal (Y/N)
-    2. Y -> 5s countdown -> AutoCal x3 rounds -> View Mode
+    2. Y -> 5s countdown -> AutoCal x1 round -> View Mode
     3. N -> View Mode immediately
 """
 
@@ -65,7 +65,7 @@ REFRESH_RATE_MS     = 33       # ~30 FPS
 MAX_REASONABLE_KMH  = 100.0
 NOISE_MIN_SPEED_KMH = 3.0
 AUTOCAL_DELAY_SEC   = 5        # Delay before calibration starts
-AUTOCAL_ROUNDS      = 3        # Total calibration rounds
+AUTOCAL_ROUNDS      = 1        # Total calibration rounds
 
 TOPIC_IMAGE       = "/camera/image_raw"
 TOPIC_RADAR       = "/point_cloud"
@@ -98,7 +98,7 @@ class StartupDialog(QtWidgets.QDialog):
         layout.addWidget(title)
 
         sub = QtWidgets.QLabel(
-            "Y : AutoCal x3 rounds will start in 5 sec  ->  then view\n"
+            "Y : AutoCal x1 rounds will start in 5 sec  ->  then view\n"
             "N : Skip calibration, start live view immediately"
         )
         sub.setAlignment(Qt.AlignCenter)
