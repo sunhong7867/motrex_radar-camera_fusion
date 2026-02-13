@@ -1108,7 +1108,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 # 연속 감지 카운트 업데이트
                 self.track_confirmed_cnt[g_id] = self.track_confirmed_cnt.get(g_id, 0) + 1
                 
-                # 2초(30 FPS * 2 = 60프레임) 미만으로 감지된 객체는 무시 (반사광 박스 제거)
+                # 차선 영역 진입 즉시 박스 표시
                 if self.track_confirmed_cnt[g_id] < 20:
                     continue
                 

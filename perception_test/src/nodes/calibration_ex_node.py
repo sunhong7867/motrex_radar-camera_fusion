@@ -29,7 +29,7 @@ def resolve_ros_path(path: str) -> str:
 
 class ExtrinsicCalibrationManager:
     def __init__(self):
-        rospy.init_node('calibration_ex_node', anonymous=False)
+        rospy.init_node('calibration_ex_node', anonymous=True)
 
         # 1. 토픽 파라미터 로드
         self.detections_topic = rospy.get_param('~detections_topic', '/perception_test/tracks')
