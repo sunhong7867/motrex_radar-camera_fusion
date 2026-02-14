@@ -419,19 +419,30 @@ class ViewOptionsDialog(QtWidgets.QDialog):
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.Window)
 
         layout = QtWidgets.QVBoxLayout(self)
-        self._original_parent = gui.gb_vis.parentWidget()
-        self._original_layout = gui._gb_vis_parent_layout
-
+        
+        # [수정] 부모/레이아웃 저장 로직 삭제
+        # 위젯을 이 다이얼로그로 영구적으로 가져옵니다.
         gui.gb_vis.setParent(self)
         gui.gb_vis.setVisible(True)
         layout.addWidget(gui.gb_vis)
 
+        # 사이즈 및 위치 설정
         size = gui.gb_vis.sizeHint()
-        self.setFixedSize(size.width() + 20, size.height() + 20)
+        self.setFixedSize(size.width() + 40, size.height() + 40)
+        
         main_geo = gui.geometry()
         x = main_geo.x() + main_geo.width() - self.width() - 20
         y = main_geo.y() + main_geo.height() - self.height() - 60
         self.move(max(main_geo.x(), x), max(main_geo.y(), y))
+
+    def closeEvent(self, event):
+        # [수정] 위젯을 돌려보내지 않고 창만 숨깁니다 (Hide)
+        event.ignore()  # 창이 파괴되는 것을 막음
+        self.hide()
+        
+        # 메인 윈도우 버튼 텍스트 복구
+        if hasattr(self.gui, "btn_toggle_vis"):
+            self.gui.btn_toggle_vis.setText("👁️ Show View Options")
 
     def closeEvent(self, event):
         self.gui.gb_vis.setParent(self._original_parent)
@@ -482,6 +493,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.extrinsic_last_loaded = None
         self.rep_pt_mem = {} 
         self.track_confirmed_cnt = {}
+        self.lane_stable_cnt = {}       # {id: (candidate_lane, count)}
+        self.LANE_STABLE_FRAMES = 45    # 약 1.5초 (30fps 기준). 2초를 원하시면 60으로 설정
         self.radar_track_hist = {}
         self.track_hist_len = 40
         self.pt_alpha = 0.15
@@ -897,13 +910,17 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.vehicle_lane_paths = {}
 
     def _toggle_view_options(self):
+        # 1. 다이얼로그가 없으면 딱 한 번만 생성
         if self.view_options_dialog is None:
             self.view_options_dialog = ViewOptionsDialog(self)
+        
+        # 2. 이미 열려있으면 숨김
         if self.view_options_dialog.isVisible():
-            self.view_options_dialog.close()
-            self.view_options_dialog = None
+            self.view_options_dialog.hide()
             if hasattr(self, "btn_toggle_vis"):
                 self.btn_toggle_vis.setText("👁️ Show View Options")
+        
+        # 3. 닫혀있으면 보임
         else:
             self.view_options_dialog.show()
             self.view_options_dialog.raise_()
@@ -1131,6 +1148,38 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                         self.track_confirmed_cnt.pop(g_id, None)
                         active_ids.discard(g_id)
                         continue
+                
+                if g_id in self.vehicle_lane_paths:
+                    # 현재 확정된 마지막 차선 (예: "IN2->OUT2" 에서 "OUT2")
+                    last_confirmed = self.vehicle_lane_paths[g_id].split("->")[-1]
+                    
+                    # 감지된 차선(target_lane)이 확정된 차선과 다르다면? (차선 변경 시도)
+                    if target_lane != last_confirmed:
+                        # 후보 차선과 카운트 가져오기
+                        cand_lane, cnt = self.lane_stable_cnt.get(g_id, (target_lane, 0))
+                        
+                        if cand_lane == target_lane:
+                            # 같은 후보 차선이 계속 유지되면 카운트 증가
+                            cnt += 1
+                        else:
+                            # 후보 차선이 또 바뀌었으면(왔다갔다 하면) 리셋
+                            cand_lane = target_lane
+                            cnt = 1
+                        
+                        self.lane_stable_cnt[g_id] = (cand_lane, cnt)
+
+                        # 임계값(1.5초)을 넘지 못했으면 아직 '변경 안 됨'으로 간주하고 기존 차선 유지
+                        if cnt < self.LANE_STABLE_FRAMES:
+                            target_lane = last_confirmed
+                        else:
+                            # 임계값 넘으면 변경 인정! (카운터 제거하여 다음 변경 대기)
+                            self.lane_stable_cnt.pop(g_id, None)
+                    else:
+                        # 다시 원래 차선으로 돌아오면 카운터 리셋
+                        self.lane_stable_cnt.pop(g_id, None)
+                else:
+                    # 처음 발견된 차량은 안정화 없이 즉시 반영
+                    self.lane_stable_cnt.pop(g_id, None)
 
                 curr_lane_str, lane_path, local_no, label = update_lane_tracking(
                     g_id,
@@ -1343,6 +1392,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             visible_ids = {o['id'] for o in self.vis_objects}
             self.track_confirmed_cnt = {k: v for k, v in self.track_confirmed_cnt.items() if k in visible_ids}
             self.radar_track_hist = {k: v for k, v in self.radar_track_hist.items() if k in active_ids}
+            self.lane_stable_cnt = {k: v for k, v in self.lane_stable_cnt.items() if k in visible_ids}
             if self.diag_dirty and hasattr(self, "txt_diag_log"):
                 self.txt_diag_log.setPlainText(self.latest_diag_msg)
                 self.diag_dirty = False

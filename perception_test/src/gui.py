@@ -204,7 +204,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.app_start_time   = time.time()
         self.cal_round        = 0
         self.cal_start_time   = 0.0
-        self.cal_total_sec    = 60.0
+        self.cal_total_sec    = 110.0
         self.countdown_start  = 0.0
         self.extrinsic_proc   = None
         self.extrinsic_mtime  = None
@@ -248,6 +248,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.vel_gate_mps        = 1.5
         self._speed_frame_counter = 0
         self.speed_update_period  = 2
+        self.prev_disp_vel = {}
 
         # Dummy speed params for compatibility
         self.spin_hold_sec  = type('o', (object,), {'value': lambda: 10.0})
@@ -487,11 +488,32 @@ class ConsumerGUI(QtWidgets.QMainWindow):
 
             # COUNTDOWN STATE
             if self.state == self.STATE_COUNTDOWN:
+                
+                # 1. 데이터가 들어왔는지 확인 (Warm-up Check)
+                has_valid_data = False
+                pts = None
+                if self.latest_frame is not None:
+                    pts = self.latest_frame.get("radar_points")
+
+                # 조건: 포인트 10개 이상 AND 박스(vis_objects)가 1개 이상 감지됨
+                if (pts is not None and len(pts) > 10 and 
+                    self.latest_frame.get("cv_image") is not None and
+                    len(self.vis_objects) > 0):  # <--- 핵심: 박스가 보여야 시작
+                    has_valid_data = True
+
+                # 2. 데이터가 불안정하면 대기
+                if not has_valid_data:
+                    self.countdown_start = now  # 타이머 계속 리셋
+                    self._show_countdown_screen(AUTOCAL_DELAY_SEC, elapsed_total, waiting_data=True)
+                    return
+
+                # 3. 데이터가 안정적이면 카운트다운 진행
                 remaining = AUTOCAL_DELAY_SEC - (now - self.countdown_start)
+                
                 if remaining <= 0:
                     self._start_calibration_round()
                 else:
-                    self._show_countdown_screen(int(np.ceil(remaining)), elapsed_total)
+                    self._show_countdown_screen(int(np.ceil(remaining)), elapsed_total, waiting_data=False)
                     return
 
             # CALIBRATING STATE
@@ -529,6 +551,30 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                 proj_uvs, proj_valid = project_points(
                     self.cam_K, self.Extr_R, self.Extr_t.flatten(), pts_raw
                 )
+            
+            # --- [추가] 겹치는 BBox(가림 현상) 필터링 ---
+            # 카메라에 더 가까운(ymax가 큰) 차량이 포인트를 선점하도록 분배
+            num_pts = len(proj_uvs) if proj_uvs is not None else 0
+            point_owner = np.full(num_pts, -1, dtype=int)
+
+            if num_pts > 0 and proj_valid is not None:
+                # 카메라에 가까운 차량부터 선점하되, 박스 전체가 아닌 '핵심 영역(Core)'만 사용
+                sorted_objs = sorted(self.vis_objects, key=lambda o: o['bbox'][3], reverse=True)
+                for s_obj in sorted_objs:
+                    s_id = s_obj['id']
+                    x1, y1, x2, y2 = s_obj['bbox']
+                    
+                    # 좌우 15%, 상단 20%를 제외한 안쪽 알맹이 영역만 자기 포인트로 강력하게 소유
+                    w, h = x2 - x1, y2 - y1
+                    cx1, cx2 = x1 + w * 0.15, x2 - w * 0.15
+                    cy1, cy2 = y1 + h * 0.2, y2 
+                    
+                    u = proj_uvs[:, 0]
+                    v = proj_uvs[:, 1]
+                    in_box = (u >= cx1) & (u <= cx2) & (v >= cy1) & (v <= cy2)
+                    unowned = (point_owner == -1)
+                    point_owner[in_box & unowned & proj_valid] = s_id
+            # ---------------------------------------------
 
             disp = self.cv_image.copy()
 
@@ -602,15 +648,52 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                 meas_kmh = rep_pt = rep_vel_raw = None
                 score = 0
 
+                # 1. 내 박스로 할당된 레이더 포인트만 사용 (가림 현상 방지)
                 if proj_uvs is not None and dop_raw is not None:
+                    my_proj_valid = proj_valid & (point_owner == g_id)
+                    
                     meas_kmh, rep_pt, rep_vel_raw, score, _ = select_representative_point(
-                        proj_uvs, proj_valid, dop_raw,
+                        proj_uvs, my_proj_valid, dop_raw,
                         (x1, y1, x2, y2), pts_raw,
                         self.vel_gate_mps, self.rep_pt_mem,
                         self.pt_alpha, now, g_id, NOISE_MIN_SPEED_KMH,
                         self.bbox_ref_mode,
                     )
+                    
+                    # 2. 스마트 급변 필터 (초기 진입 프리패스 + 관통 완벽 방어)
+                    if meas_kmh is not None:
+                        if not hasattr(self, 'rejected_cnt'): self.rejected_cnt = {}
+                        if not hasattr(self, 'prev_disp_vel'): self.prev_disp_vel = {}
+                        
+                        current_vel = self.prev_disp_vel.get(g_id)
+                        tracking_frames = self.track_confirmed_cnt.get(g_id, 0)
+                        
+                        if current_vel is not None:
+                            speed_diff = abs(meas_kmh - current_vel)
+                            
+                            # [핵심 1] 화면에 2초(60프레임) 이상 존재하며 '완전 정지' 중인 차량에만 관통 방어 적용
+                            if tracking_frames > 60 and current_vel <= 5.0 and meas_kmh >= 15.0:
+                                self.rejected_cnt[g_id] = self.rejected_cnt.get(g_id, 0) + 1
+                                # 1초(30프레임) 연속으로 잡히지 않으면 뒷차 관통 노이즈로 보고 차단
+                                if self.rejected_cnt[g_id] < 30:
+                                    meas_kmh = None
+                                else:
+                                    self.rejected_cnt[g_id] = 0
+                                    
+                            # [핵심 2] 주행 중 순간적으로 10km/h 이상 튀는 일반 레이더 노이즈 방어
+                            # (단, 초기 진입 후 2초 이내인 차량은 한 번에 50km/h 등으로 뛸 수 있도록 예외 처리)
+                            elif speed_diff > 10.0 and tracking_frames > 60:
+                                self.rejected_cnt[g_id] = self.rejected_cnt.get(g_id, 0) + 1
+                                if self.rejected_cnt[g_id] < 5:
+                                    meas_kmh = None 
+                                else:
+                                    self.rejected_cnt[g_id] = 0
+                                    
+                            else:
+                                # 막 진입한 차량의 초기 속도 점프나, 정상적인 가감속은 즉시 통과!
+                                self.rejected_cnt[g_id] = 0
 
+                # 3. 칼만 필터 및 속도 업데이트
                 vel_out, score_out = update_speed_estimate(
                     g_id, meas_kmh, score, now,
                     self.vel_memory, self.kf_vel, self.kf_score,
@@ -620,7 +703,12 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                     rate_limit_kmh_per_s=self.vel_rate_limit_kmh_per_s,
                 )
 
-                obj["vel"] = round(vel_out, 1) if vel_out is not None else float("nan")
+                # 4. 객체 속도 저장
+                if vel_out is not None:
+                    self.prev_disp_vel[g_id] = vel_out
+                    obj["vel"] = float(int(round(vel_out)))
+                else:
+                    obj["vel"] = float("nan")
 
                 draw_items.append({
                     "bbox":      (x1, y1, x2, y2),
@@ -635,7 +723,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                 cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 0, 255), 2)
 
                 vel = it["vel"]
-                speed_str = f"{vel:.1f} km/h" if np.isfinite(vel) else "-- km/h"
+                speed_str = f"{int(vel)} km/h" if np.isfinite(vel) else "-- km/h"
                 lines = [it["label"], speed_str]
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 sc, th = 0.55, 1
@@ -662,17 +750,22 @@ class ConsumerGUI(QtWidgets.QMainWindow):
             self.track_confirmed_cnt = {k: v for k, v in self.track_confirmed_cnt.items() if k in visible_ids}
             self.radar_track_hist    = {k: v for k, v in self.radar_track_hist.items()    if k in active_ids}
             self.lane_stable_cnt     = {k: v for k, v in self.lane_stable_cnt.items()     if k in visible_ids}
+            
+            # [추가] 화면에서 사라진 차량의 오래된 캐시 삭제
+            if hasattr(self, 'prev_disp_vel'):
+                self.prev_disp_vel = {k: v for k, v in self.prev_disp_vel.items() if k in visible_ids}
+            if hasattr(self, 'rejected_cnt'):
+                self.rejected_cnt = {k: v for k, v in self.rejected_cnt.items() if k in visible_ids}
 
             self.viewer.update_image(disp)
-
+            
         except Exception as e:
             rospy.logwarn_throttle(5.0, f"[ConsumerGUI] update_loop error: {e}")
 
     # ------------------------------------------------------------------
     # Overlay Helpers
     # ------------------------------------------------------------------
-    def _show_countdown_screen(self, remaining: int, elapsed_total: float):
-        """Countdown screen (ENGLISH ONLY)"""
+    def _show_countdown_screen(self, remaining: int, elapsed_total: float, waiting_data: bool = False):
         if self.latest_frame is not None and self.latest_frame.get("cv_image") is not None:
             disp = self.latest_frame["cv_image"].copy()
         else:
@@ -684,20 +777,27 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         cv2.addWeighted(overlay, 0.55, disp, 0.45, 0, disp)
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        # ENGLISH STRINGS
-        cv2.putText(disp, "Preparing AutoCal...", (w // 2 - 200, h // 2 - 80),
-                    font, 1.4, (255, 255, 255), 3)
-        cv2.putText(disp, f"Start in {remaining}s",
-                    (w // 2 - 130, h // 2 + 10), font, 2.0, (0, 200, 255), 4)
-        cv2.putText(disp, "Ensure vehicle is inside the lane.",
-                    (w // 2 - 310, h // 2 + 90), font, 0.75, (200, 200, 200), 2)
+
+        if waiting_data:
+            # [수정] 대기 안내 문구 구체화
+            cv2.putText(disp, "Waiting for STABLE TRACKS...", (w // 2 - 280, h // 2 - 50),
+                        font, 1.2, (0, 165, 255), 3)
+            # 포인트뿐만 아니라 '박스'가 잡혀야 함을 안내
+            cv2.putText(disp, "Waiting for object detection...", (w // 2 - 300, h // 2 + 50),
+                        font, 1.0, (200, 200, 200), 2)
+        else:
+            # 기존 카운트다운
+            cv2.putText(disp, "Preparing AutoCal...", (w // 2 - 200, h // 2 - 80),
+                        font, 1.4, (255, 255, 255), 3)
+            cv2.putText(disp, f"Start in {remaining}s",
+                        (w // 2 - 130, h // 2 + 10), font, 2.0, (0, 200, 255), 4)
         
-        self._draw_status_overlay(disp, elapsed_total, mode="countdown",
-                                  extra=f"{remaining}s until start")
+        extra_msg = "Waiting for Stream" if waiting_data else f"{remaining}s until start"
+        self._draw_status_overlay(disp, elapsed_total, mode="countdown", extra=extra_msg)
         self.viewer.update_image(disp)
 
     def _show_calibrating_screen(self, elapsed_total: float):
-        """Calibration screen (ENGLISH ONLY)"""
+        """Calibration screen (ENGLISH ONLY) - Text Centered"""
         if self.latest_frame is not None and self.latest_frame.get("cv_image") is not None:
             disp = self.latest_frame["cv_image"].copy()
         else:
@@ -709,27 +809,49 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         cv2.addWeighted(overlay, 0.40, disp, 0.60, 0, disp)
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        # ENGLISH STRINGS
         round_str = f"Calibrating... ({self.cal_round + 1} / {self.autocal_rounds} Rounds)"
-        cv2.putText(disp, round_str,
-                    (w // 2 - 350, h // 2 - 40), font, 1.1, (255, 255, 255), 3)
+        
+        # [수정] 텍스트의 실제 너비(tw)와 높이(th)를 계산해서 정중앙(Center) 좌표 구하기
+        font_scale = 1.2
+        thickness = 3
+        (tw, th), _ = cv2.getTextSize(round_str, font, font_scale, thickness)
+        
+        text_x = (w - tw) // 2
+        text_y = h // 2 - 40  # 진행 바 위쪽으로 살짝 띄움
+
+        cv2.putText(disp, round_str, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
 
         # Progress bar
         round_elapsed = time.time() - self.cal_start_time
         frac = min(1.0, round_elapsed / max(1.0, self.cal_total_sec))
-        bar_x, bar_y, bar_w, bar_h = w // 2 - 300, h // 2 + 20, 600, 28
+        
+        # 바(Bar)도 중앙 정렬
+        bar_w = 600
+        bar_h = 28
+        bar_x = (w - bar_w) // 2
+        bar_y = h // 2 + 20
+        
         cv2.rectangle(disp, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h),
                       (60, 60, 60), -1)
         cv2.rectangle(disp, (bar_x, bar_y),
                       (bar_x + int(bar_w * frac), bar_y + bar_h), (0, 200, 100), -1)
-        cv2.putText(disp, f"{int(frac * 100)}%",
-                    (bar_x + bar_w // 2 - 20, bar_y + bar_h - 6),
+        
+        # 퍼센트 텍스트 중앙 정렬
+        pct_str = f"{int(frac * 100)}%"
+        (pw, ph), _ = cv2.getTextSize(pct_str, font, 0.65, 2)
+        pct_x = bar_x + (bar_w - pw) // 2
+        pct_y = bar_y + bar_h - 6
+        
+        cv2.putText(disp, pct_str, (pct_x, pct_y),
                     font, 0.65, (255, 255, 255), 2)
 
         # Last log line
         if self._cal_log_buf:
             last = self._cal_log_buf[-1][-80:]
-            cv2.putText(disp, last, (bar_x, h // 2 + 80),
+            # 로그 텍스트도 중앙 정렬 (선택 사항)
+            (lw, lh), _ = cv2.getTextSize(last, cv2.FONT_HERSHEY_PLAIN, 1.1, 1)
+            log_x = (w - lw) // 2
+            cv2.putText(disp, last, (log_x, h // 2 + 80),
                         cv2.FONT_HERSHEY_PLAIN, 1.1, (160, 220, 160), 1)
 
         self._draw_status_overlay(disp, elapsed_total, mode="calibrating",
