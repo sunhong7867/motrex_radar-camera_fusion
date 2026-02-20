@@ -2,22 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-association_node.py
-
 역할:
-- 레이더 PointCloud2를 카메라 픽셀(u,v)로 투영
-- 입력 DetectionArray(bbox 리스트)를 기준으로 bbox 내부 레이더 점을 선택
-- 선택된 레이더 점으로 거리(dist)와 도플러 기반 속도(speed)를 산출하여 publish
-- [핵심] CARLA 시뮬레이션과 동일한 '기하학적 속도 보정(Cosine Correction)' 적용
+- 레이더 PointCloud2를 프레임 버퍼에 누적하고, DetectionArray 수신 시 카메라 타임스탬프 기준 정렬 또는 최근 스택 방식으로 매칭 대상을 구성
+- 레이더 점을 extrinsic(R, t)와 카메라 내부파라미터(K, D)로 영상 좌표에 투영한 뒤 bbox 내부 점만 선택해 객체 단위 연관 수행
+- 거리, 최소 range, 최소 Doppler, 최소 power, 상위 power K개, bbox 상단 비율 필터를 순차 적용해 잡음을 억제하고 대표 점 집합을 구성
+- Doppler 속도에 Cosine Correction을 적용해 시선각 영향을 보정하고, power 가중 중앙값 또는 일반 중앙값으로 객체 속도를 산출
+- Doppler 신뢰도가 낮거나 값이 약한 구간에서는 트랙 중심 이동량 기반 속도 추정값으로 대체해 저속/원거리 안정성을 보완
+- 최종 결과를 AssociationArray로 발행하고, 옵션 활성 시 RViz 확인용 MarkerArray를 함께 발행
 
 입력:
-- ~radar/pointcloud_topic (sensor_msgs/PointCloud2)
-- ~camera/camera_info_topic (sensor_msgs/CameraInfo)
-- ~bbox_topic (autocal/DetectionArray)
+- `~radar/pointcloud_topic` (`sensor_msgs/PointCloud2`)
+- `~camera/camera_info_topic` (`sensor_msgs/CameraInfo`)
+- `~bbox_topic` (`autocal/DetectionArray`)
+- `~extrinsic_source/path` (`json`, R/t)
 
 출력:
-- ~associated_topic (autocal/AssociationArray)
-- (옵션) ~debug/marker_topic (visualization_msgs/MarkerArray)
+- `~associated_topic` (`autocal/AssociationArray`)
+- `~debug/marker_topic` (`visualization_msgs/MarkerArray`, 선택)
 """
 
 import json
@@ -29,15 +30,11 @@ from typing import Optional, Tuple
 import numpy as np
 import rospy
 import rospkg
-import message_filters  # 타임 싱크를 위해 필수
-
-from sensor_msgs.msg import PointCloud2, CameraInfo
-import sensor_msgs.point_cloud2 as pc2
-
-from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
-
-from autocal.msg import DetectionArray, AssociationArray, Association, BoundingBox
+import sensor_msgs.point_cloud2 as pc2
+from autocal.msg import Association, AssociationArray, BoundingBox, DetectionArray
+from sensor_msgs.msg import CameraInfo, PointCloud2
+from visualization_msgs.msg import Marker, MarkerArray
 
 try:
     import cv2
@@ -47,7 +44,41 @@ except Exception:
 
 _FIND_RE = re.compile(r"\$\(\s*find\s+([A-Za-z0-9_]+)\s*\)")
 
+# ---------------------------------------------------------
+# 투영 및 연관 파라미터
+# ---------------------------------------------------------
+DEFAULT_USE_DISTORTION = False             # 카메라 왜곡 계수 사용 여부
+DEFAULT_PROJECTION_Z_MIN_M = 0.10          # 카메라 전방 최소 깊이(m)
+DEFAULT_RADAR_HISTORY_FRAMES = 5           # 레이더 스택 프레임 수
+DEFAULT_USE_BEV_ASSOCIATION = True         # 이전 BEV 중심 기반 게이팅 사용
+DEFAULT_BEV_GATE_M = 3.5                   # BEV 게이팅 거리(m)
+DEFAULT_USE_TEMPORAL_ALIGNMENT = True      # 검출 시각 기준 레이더 프레임 정렬
+DEFAULT_MIN_RANGE_M = 0.0                  # 최소 거리(m)
+DEFAULT_MIN_ABS_DOPPLER_MPS = 0.0          # 최소 절대 Doppler(m/s)
+DEFAULT_MIN_POWER = 0.0                    # 최소 power
+DEFAULT_TOPK_BY_POWER = 0                  # power 상위 K개만 사용(0=전체)
+DEFAULT_USE_POWER_WEIGHTED_SPEED = True    # power 가중 중앙값 속도 사용
+DEFAULT_USE_ABS_SPEED = True               # 속도 절대값 사용
+DEFAULT_BBOX_TOP_HEIGHT_RATIO = 0.3        # bbox 상단 사용 비율
+
+# ---------------------------------------------------------
+# 트랙 기반 속도 보완 파라미터
+# ---------------------------------------------------------
+DEFAULT_TRACK_SPEED_ENABLE = True                      # 트랙 기반 속도 보완 사용
+DEFAULT_TRACK_SPEED_USE_CAMERA_STAMP = False           # 트랙 속도 시간축에 카메라 stamp 사용
+DEFAULT_TRACK_SPEED_USE_LATEST_RADAR_ONLY = True       # 최신 레이더 프레임만으로 트랙 속도 계산
+DEFAULT_TRACK_SPEED_MIN_DT = 0.02                      # 트랙 속도 계산 최소 dt(s)
+DEFAULT_TRACK_SPEED_MAX_DT = 0.80                      # 트랙 속도 계산 최대 dt(s)
+DEFAULT_TRACK_SPEED_MIN_DISP_M = 0.03                  # 최소 이동량(m)
+DEFAULT_TRACK_SPEED_MAX_MPS = 60.0                     # 트랙 속도 상한(m/s)
+DEFAULT_TRACK_SPEED_EMA_ALPHA = 0.40                   # 트랙 속도 EMA 계수
+DEFAULT_TRACK_SPEED_KEY_BUCKET_PX = 200.0              # det.id 중복 완화용 x 버킷 크기(px)
+DEFAULT_TRACK_SPEED_FALLBACK_ABS_DOPPLER_LT_MPS = 1.0  # Doppler 절대값이 이 값보다 작으면 트랙 속도로 대체
+
 def resolve_ros_path(path: str) -> str:
+    """
+    `$(find pkg)` 형식의 ROS 경로를 실제 절대 경로로 변환
+    """
     if not isinstance(path, str):
         return path
     if "$(" not in path:
@@ -65,6 +96,9 @@ def resolve_ros_path(path: str) -> str:
 
 
 def load_extrinsic_json(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    extrinsic JSON 파일에서 회전행렬 R과 평행이동 t를 로드
+    """
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
     R = np.array(payload["R"], dtype=np.float64)
@@ -72,6 +106,9 @@ def load_extrinsic_json(path: str) -> Tuple[np.ndarray, np.ndarray]:
     return R, t
 
 def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """
+    가중치를 고려한 중앙값 계산
+    """
     values = np.asarray(values, dtype=np.float64)
     weights = np.asarray(weights, dtype=np.float64)
 
@@ -99,9 +136,7 @@ def project_radar_to_image_with_indices(
     z_min_m: float
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    returns:
-      uv_int: (M,2) int pixels
-      keep_idx: (M,) indices in original radar_xyz
+    레이더 점을 카메라 영상 좌표로 투영하고 이미지 경계 안 점만 선별
     """
     Xr = radar_xyz.astype(np.float64).T
     Xc = (R @ Xr) + t.reshape(3, 1)
@@ -141,81 +176,59 @@ def project_radar_to_image_with_indices(
 
 class AssociationNode:
     def __init__(self):
-        # topics
+        # 토픽 설정
         self.radar_topic = rospy.get_param("~radar/pointcloud_topic", "/point_cloud")
         self.camera_info_topic = rospy.get_param("~camera/camera_info_topic", "/camera/camera_info")
         self.bbox_topic = rospy.get_param("~bbox_topic", "/autocal/detections")
         self.associated_topic = rospy.get_param("~associated_topic", "/autocal/associated")
 
-        # frames / projection
+        # 좌표계 및 투영 설정
         self.radar_frame_default = rospy.get_param("~frames/radar_frame", "retina_link")
-        self.use_distortion = bool(rospy.get_param("~projection/use_distortion", False))
-        self.z_min_m = float(rospy.get_param("~projection/z_min_m", 0.10))
+        self.use_distortion = bool(rospy.get_param("~projection/use_distortion", DEFAULT_USE_DISTORTION))
+        self.z_min_m = float(rospy.get_param("~projection/z_min_m", DEFAULT_PROJECTION_Z_MIN_M))
 
-        # association parameters
-        self.history_frames = int(rospy.get_param("~association/radar_history_frames", 5))
-        self.use_bev_association = bool(rospy.get_param("~association/use_bev_association", True))
-        self.bev_gate_m = float(rospy.get_param("~association/bev_gate_m", 3.5))
-        self.use_temporal_alignment = bool(rospy.get_param("~association/use_temporal_alignment", True))
-        self.min_range_m = float(rospy.get_param("~association/min_range_m", 0.0))
-        self.min_abs_doppler = float(rospy.get_param("~association/min_abs_doppler_mps", 0.0))
-        self.min_power = float(rospy.get_param("~association/min_power", 0.0))
-        self.topk_by_power = int(rospy.get_param("~association/topk_by_power", 0)) 
-        self.use_power_weighted = bool(rospy.get_param("~association/use_power_weighted_speed", True))
-        self.use_abs_speed = bool(rospy.get_param("~association/use_abs_speed", True))
+        # 연관 파라미터
+        self.history_frames = int(rospy.get_param("~association/radar_history_frames", DEFAULT_RADAR_HISTORY_FRAMES))
+        self.use_bev_association = bool(rospy.get_param("~association/use_bev_association", DEFAULT_USE_BEV_ASSOCIATION))
+        self.bev_gate_m = float(rospy.get_param("~association/bev_gate_m", DEFAULT_BEV_GATE_M))
+        self.use_temporal_alignment = bool(rospy.get_param("~association/use_temporal_alignment", DEFAULT_USE_TEMPORAL_ALIGNMENT))
+        self.min_range_m = float(rospy.get_param("~association/min_range_m", DEFAULT_MIN_RANGE_M))
+        self.min_abs_doppler = float(rospy.get_param("~association/min_abs_doppler_mps", DEFAULT_MIN_ABS_DOPPLER_MPS))
+        self.min_power = float(rospy.get_param("~association/min_power", DEFAULT_MIN_POWER))
+        self.topk_by_power = int(rospy.get_param("~association/topk_by_power", DEFAULT_TOPK_BY_POWER)) 
+        self.use_power_weighted = bool(rospy.get_param("~association/use_power_weighted_speed", DEFAULT_USE_POWER_WEIGHTED_SPEED))
+        self.use_abs_speed = bool(rospy.get_param("~association/use_abs_speed", DEFAULT_USE_ABS_SPEED))
+        self.bbox_top_h_ratio = float(rospy.get_param("~association/bbox_top_height_ratio", DEFAULT_BBOX_TOP_HEIGHT_RATIO))
 
-        # [NEW] BBox 상단(높이의 N%) 영역의 레이더 점만 사용할지 여부 (Tailgating 대응)
-        self.bbox_top_h_ratio = float(rospy.get_param("~association/bbox_top_height_ratio", 0.3))
-
-        # -------------------------------------------------
-        # Tracking-based speed (ground-plane) parameters
-        # - Doppler(LOS 성분)이 작아지거나 0으로 뭉개지는 상황(멀어짐/측면/저 SNR)에서
-        #   레이더 클러스터 중심의 (x,y) 이동량 / dt 로 속도를 추정하여 fallback 합니다.
-        # - 카메라 트래커가 부여한 det.id(=track id)를 key로 사용합니다.
-        # -------------------------------------------------
-        self.track_speed_enable = bool(rospy.get_param("~track_speed/enable", True))
-        # track-speed의 시간(dt) 계산에 사용할 타임스탬프.
-        # - 기본값은 레이더 stamp를 사용(False). (레이더 점의 실제 시간축과 일치)
-        # - 카메라 stamp를 사용하고 싶으면 True로 설정.
-        self.track_speed_use_camera_stamp = bool(rospy.get_param("~track_speed/use_camera_stamp", False))
-        # IMPORTANT:
-        # 레이더 history_frames를 스택으로 합치면(여러 프레임을 한 번에 사용) bbox 내부 레이더 점들이 시간적으로 섞여
-        # (x,y) 중심이 평균화됩니다. 그러면 프레임 간 중심 이동량이 작아져 track-speed가 0에 수렴할 수 있습니다.
-        # 특히 멀어지는 차량은 Doppler(LOS 성분)가 0 근처로 뭉개지는 경우가 많아 track-speed가 핵심인데,
-        # 스택 평균화로 track-speed가 무력화되는 문제가 실제로 발생합니다.
-        # 따라서 track-speed는 기본적으로 "가장 최신 레이더 프레임"만 사용하도록 옵션을 제공합니다.
+        # 트랙 기반 지면 속도 파라미터
+        self.track_speed_enable = bool(rospy.get_param("~track_speed/enable", DEFAULT_TRACK_SPEED_ENABLE))
+        self.track_speed_use_camera_stamp = bool(rospy.get_param("~track_speed/use_camera_stamp", DEFAULT_TRACK_SPEED_USE_CAMERA_STAMP))
         self.track_speed_use_latest_radar_only = bool(
-            rospy.get_param("~track_speed/use_latest_radar_only", True)
+            rospy.get_param("~track_speed/use_latest_radar_only", DEFAULT_TRACK_SPEED_USE_LATEST_RADAR_ONLY)
         )
-        # 카메라 30fps 환경에서도 계산 가능하도록 기본 min_dt를 0.02s로 설정
-        self.track_speed_min_dt = float(rospy.get_param("~track_speed/min_dt", 0.02))
-        self.track_speed_max_dt = float(rospy.get_param("~track_speed/max_dt", 0.80))
-        # 원거리 차량도 프레임간 이동량이 작게 보일 수 있어 기본 min_disp를 0.03m로 설정
-        self.track_speed_min_disp = float(rospy.get_param("~track_speed/min_disp_m", 0.03))
-        self.track_speed_max_mps = float(rospy.get_param("~track_speed/max_mps", 60.0))
-        self.track_speed_ema_alpha = float(rospy.get_param("~track_speed/ema_alpha", 0.40))
-        # tracker_node의 det.id가 ROI별로 1,2,3...으로 재시작되는 경우가 있어
-        # 같은 id가 화면 내 여러 영역에서 중복될 수 있습니다.
-        # 이를 완화하기 위해 bbox center x를 일정 픽셀 bucket으로 양자화하여 key에 포함합니다.
-        self.track_speed_key_bucket_px = float(rospy.get_param("~track_speed/key_bucket_px", 200.0))
-        # Doppler 기반 속도가 이 값보다 작으면(track_speed가 유효할 때) track_speed로 대체
+        self.track_speed_min_dt = float(rospy.get_param("~track_speed/min_dt", DEFAULT_TRACK_SPEED_MIN_DT))
+        self.track_speed_max_dt = float(rospy.get_param("~track_speed/max_dt", DEFAULT_TRACK_SPEED_MAX_DT))
+        self.track_speed_min_disp = float(rospy.get_param("~track_speed/min_disp_m", DEFAULT_TRACK_SPEED_MIN_DISP_M))
+        self.track_speed_max_mps = float(rospy.get_param("~track_speed/max_mps", DEFAULT_TRACK_SPEED_MAX_MPS))
+        self.track_speed_ema_alpha = float(rospy.get_param("~track_speed/ema_alpha", DEFAULT_TRACK_SPEED_EMA_ALPHA))
+        self.track_speed_key_bucket_px = float(rospy.get_param("~track_speed/key_bucket_px", DEFAULT_TRACK_SPEED_KEY_BUCKET_PX))
         self.track_speed_fallback_abs_doppler_lt = float(
-            rospy.get_param("~track_speed/fallback_when_abs_doppler_lt_mps", 1.0)
+            rospy.get_param("~track_speed/fallback_when_abs_doppler_lt_mps", DEFAULT_TRACK_SPEED_FALLBACK_ABS_DOPPLER_LT_MPS)
         )
 
-        # extrinsic
+        # 외부파라미터 설정
         extr_path = rospy.get_param("~extrinsic_source/path", "$(find autocal)/config/extrinsic.json")
         self.extrinsic_path = resolve_ros_path(extr_path)
         self.extrinsic_reload_sec = float(rospy.get_param("~extrinsic_reload_sec", 1.0))
 
-        # debug markers
+        # 디버그 마커 설정
         self.publish_markers = bool(rospy.get_param("~debug/publish_markers", True))
         self.marker_topic = rospy.get_param("~debug/marker_topic", "/autocal/association_markers")
         self.marker_lifetime = float(rospy.get_param("~debug/marker_lifetime", 0.2))
         self.point_scale = float(rospy.get_param("~debug/point_scale", 0.18))
         self.max_points_drawn = int(rospy.get_param("~debug/max_points_drawn", 400))
 
-        # internal states
+        # 내부 상태
         self._cam_K: Optional[np.ndarray] = None
         self._cam_D: Optional[np.ndarray] = None
         self._img_w: int = 0
@@ -224,29 +237,19 @@ class AssociationNode:
         self._t = np.zeros((3, 1), dtype=np.float64)
         self._extr_mtime: float = 0.0
         self._last_extr_load = rospy.Time(0)
-
-        # radar history: deque of (header, points_array)
         self._rad_hist: deque = deque(maxlen=max(1, self.history_frames))
-
-        # tracking-speed internal states
-        # {track_key: (t_sec, cx, cy)}  where (cx,cy) are radar-frame cluster center (median)
         self._track_last_xy = {}
-        # {track_key: ema_speed_mps}
         self._track_speed_ema = {}
-        # {track_key: (x, y)} BEV 추정 중심
         self._track_bev_center = {}
 
-        # Publishers
+        # 퍼블리셔
         self.pub_assoc = rospy.Publisher(self.associated_topic, AssociationArray, queue_size=5)
         self.pub_markers = rospy.Publisher(self.marker_topic, MarkerArray, queue_size=2) if self.publish_markers else None
 
-        # Subscribers
+        # 서브스크라이버
         rospy.Subscriber(self.camera_info_topic, CameraInfo, self._on_camera_info, queue_size=1)
         
-        # [수정] Time Sync를 위한 MessageFilters 설정 (DetectionArray + PointCloud2)
-        # 만약 동기화 없이 각각 콜백을 쓴다면 기존 방식을 쓰지만,
-        # 여기서는 bbox가 들어왔을 때 가장 최신의 레이더 버퍼를 조회하는 방식(Async)을 유지합니다.
-        # (이유: 레이더는 20fps, 카메라는 30fps로 서로 주기가 다르므로, 버퍼링 방식이 더 유리할 수 있음)
+        # DetectionArray와 PointCloud2를 비동기 버퍼 방식으로 수신
         rospy.Subscriber(self.radar_topic, PointCloud2, self._on_radar_pc, queue_size=5)
         rospy.Subscriber(self.bbox_topic, DetectionArray, self._on_detections, queue_size=5)
 
@@ -259,7 +262,9 @@ class AssociationNode:
         self._img_h = int(msg.height)
 
     def _on_radar_pc(self, msg: PointCloud2):
-        """레이더 데이터를 받아서 내부 버퍼에 쌓음 (비동기 수신)"""
+        """
+        레이더 데이터를 수신해 내부 버퍼에 누적
+        """
         pts = self._read_radar_pointcloud(msg)
         # (header, points_Nx5) 저장
         self._rad_hist.append((msg.header, pts))
@@ -267,11 +272,11 @@ class AssociationNode:
     def _read_radar_pointcloud(self, msg: PointCloud2) -> np.ndarray:
         field_names = [f.name for f in msg.fields]
         
-        # [중요] 실제 드라이버 필드명 확인 (x, y, z, doppler, power)
+        # 실제 드라이버 필드명 확인
         has_dop = "doppler" in field_names
         has_pow = "power" in field_names
 
-        # 모든 필드가 다 있는 경우 (Best)
+        # 모든 필드가 있는 경우
         if has_dop and has_pow:
             use_fields = ("x","y","z","doppler","power")
             out = []
@@ -344,7 +349,9 @@ class AssociationNode:
         return radar_header, np.vstack([a[:, :3] for a in arrays])
 
     def _build_time_aligned_radar(self, target_stamp_sec: float) -> Tuple[Optional[rospy.Header], np.ndarray]:
-        """카메라 타임스탬프에 가장 가까운 레이더 프레임 반환(간단한 시공간 정렬)."""
+        """
+        입력 타임스탬프와 가장 가까운 레이더 프레임 선택
+        """
         if len(self._rad_hist) == 0:
             return None, np.zeros((0, 3), dtype=np.float64)
         best = None
@@ -365,7 +372,9 @@ class AssociationNode:
         return h, p
     
     def _get_latest_radar_frame(self):
-        """최근 레이더 프레임(헤더, pts)을 반환. 없으면 (None, empty)."""
+        """
+        최근 레이더 프레임 반환
+        """
         if len(self._rad_hist) == 0:
             return None, np.zeros((0, 0), dtype=np.float64)
         h, p = self._rad_hist[-1]
@@ -377,7 +386,7 @@ class AssociationNode:
         # 1. 캘리브레이션 갱신 확인
         self._maybe_reload_extrinsic()
 
-        # 2. CameraInfo 대기
+        # 2. CameraInfo 수신 대기
         if self._cam_K is None or self._img_w <= 0:
             return
 
@@ -392,7 +401,7 @@ class AssociationNode:
             self._publish_empty(msg, radar_header)
             return
 
-        # 4. 1차 필터링 (Range)
+        # 4. 1차 거리 필터링
         xyz = pts[:, :3]
         rng = np.linalg.norm(xyz, axis=1)
         # min_range_m 적용
@@ -403,7 +412,7 @@ class AssociationNode:
             self._publish_empty(msg, radar_header)
             return
 
-        xyz = pts[:, :3] # 필터링된 xyz
+        xyz = pts[:, :3]  # 필터링된 xyz
 
         # 5. 투영 (3D -> 2D)
         uv, keep_idx = project_radar_to_image_with_indices(
@@ -437,7 +446,7 @@ class AssociationNode:
         marker_id = 0
         radar_frame = radar_header.frame_id if radar_header.frame_id else self.radar_frame_default
 
-        # Track-speed용: 최신 레이더 프레임만 따로 투영(옵션)
+        # track-speed용 최신 레이더 프레임 별도 투영(옵션)
         latest_uv = None
         latest_pts_valid = None
         latest_uu = latest_vv = None
@@ -468,7 +477,7 @@ class AssociationNode:
                     latest_uu = latest_uv[:, 0].astype(np.float64)
                     latest_vv = latest_uv[:, 1].astype(np.float64)
 
-        # 6. 각 차량 박스(bbox)에 대해 루프
+        # 6. bbox별 처리 루프
         for det in msg.detections:
             x1, y1 = float(det.bbox.xmin), float(det.bbox.ymin)
             x2, y2 = float(det.bbox.xmax), float(det.bbox.ymax)
@@ -476,27 +485,15 @@ class AssociationNode:
             # 박스 내부 점 찾기
             inside = (uu >= x1) & (uu <= x2) & (vv >= y1) & (vv <= y2)
             
-            # [NEW] Tailgating 방지: BBox 상단 영역(Top N%)의 포인트만 우선적으로 선택
+            # bbox 상단 영역 포인트를 우선 선택
             # 뒤차의 포인트는 앞차 박스의 하단부에 걸칠 확률이 높으므로 이를 배제함.
             h_box = y2 - y1
             if h_box > 0:
                 # 이미지 좌표계(v)는 위쪽이 0이므로, top 영역은 y1 ~ (y1 + h*ratio)
                 v_limit = y1 + (h_box * self.bbox_top_h_ratio)
                 inside_top = (vv <= v_limit)
-                
-                # 상단 영역 필터 적용
-                # 만약 상단에 점이 하나도 없다면? -> fallback: 전체 box 사용?
-                # 아니면 그냥 매칭 실패로? -> tailgating 방지가 우선이므로 엄격하게 적용 권장.
                 mask_final = inside & inside_top
-                
-                # 안전장치: 상단에 점이 너무 없으면(0개), 그냥 전체 박스를 쓸 수도 있지만,
-                # "뒤차 간섭 배제"가 목적이므로 여기서는 엄격하게 필터링된 결과만 씁니다.
                 sel = pts_valid[mask_final]
-                
-                # 만약 상단 필터로 점이 다 사라졌다면, 전체 박스로 fallback 할지 선택.
-                # (옵션) 아래 주석 해제 시 fallback 동작
-                # if sel.shape[0] == 0:
-                #     sel = pts_valid[inside]
             else:
                 sel = pts_valid[inside]
 
@@ -515,7 +512,7 @@ class AssociationNode:
                 out.objects.append(assoc)
                 continue
 
-            # --- [핵심] BEV 중심 연관 보강 ---
+            # BEV 중심 기반 연관 보강
             if self.use_bev_association and sel.shape[0] > 0:
                 track_key = f"{int(det.id)}:{int((0.5 * (x1 + x2)) / max(1.0, self.track_speed_key_bucket_px))}"
                 prev_bev = self._track_bev_center.get(track_key)
@@ -526,13 +523,13 @@ class AssociationNode:
                     if sel_gate.shape[0] > 0:
                         sel = sel_gate
 
-            # --- [핵심] 거리 계산 ---
+            # 거리 계산
             sel_xyz = sel[:, :3]
             sel_rng = np.linalg.norm(sel_xyz, axis=1)
             dist_m = float(np.median(sel_rng))
 
             # -------------------------------------------------
-            # Tracking-based speed (ground-plane)
+            # 트랙 기반 지면 속도 계산
             # -------------------------------------------------
             track_speed_mps = float("nan")
             if self.track_speed_enable:
@@ -553,7 +550,7 @@ class AssociationNode:
                 if self.track_speed_use_latest_radar_only and (latest_pts_valid is not None) and (latest_uu is not None):
                     l_inside = (latest_uu >= x1) & (latest_uu <= x2) & (latest_vv >= y1) & (latest_vv <= y2)
                     
-                    # [NEW] Track-speed 용 최신 프레임에도 동일한 상단 필터 적용
+                    # track-speed 최신 프레임에도 동일한 상단 필터 적용
                     if h_box > 0:
                         l_v_limit = y1 + (h_box * self.bbox_top_h_ratio)
                         l_inside_top = (latest_vv <= l_v_limit)
@@ -588,7 +585,7 @@ class AssociationNode:
                     self._track_last_xy[track_key] = (t_sec, cx, cy)
                 self._track_bev_center[track_key] = (cx, cy)
 
-            # --- [핵심] 속도 계산 및 보정 (Doppler 기반) ---
+            # Doppler 기반 속도 계산 및 보정
             speed_mps = float("nan")
             
             # 데이터 컬럼 파싱 (x, y, z, doppler, power)
@@ -623,7 +620,7 @@ class AssociationNode:
                     pwr_m = pwr_m[idx]
                     xyz_m = xyz_m[idx]
 
-                # 6-4. [중요] 기하학적 보정 (Cosine Correction)
+                # 6-4. 기하학적 보정(Cosine Correction)
                 if dop_m.size > 0:
                     corrected_dops = []
                     valid_pwrs = []
@@ -662,7 +659,7 @@ class AssociationNode:
                     else:
                         speed_mps = float("nan")
 
-            # Final speed selection: Doppler vs Track-speed fallback
+            # 최종 속도 선택: Doppler 또는 track-speed 대체
             doppler_speed_mps = float(speed_mps)
             used_track_fallback = False
             if self.track_speed_enable and np.isfinite(track_speed_mps):
@@ -685,7 +682,7 @@ class AssociationNode:
 
             # 마커 추가 (시각화)
             if self.publish_markers and marker_pack is not None and sel.shape[0] > 0:
-                # [수정] 대표성을 띄는 점들(상단 필터링된 점들)만 마커로 표시하여 Rviz에서도 확인 가능하게 함
+                # 상단 필터링된 대표 점들만 마커로 표시
                 draw_xyz = sel_xyz
                 if draw_xyz.shape[0] > self.max_points_drawn:
                     idx = np.linspace(0, draw_xyz.shape[0]-1, self.max_points_drawn).astype(np.int32)
@@ -703,7 +700,7 @@ class AssociationNode:
                 mk.scale.y = self.point_scale
                 mk.scale.z = self.point_scale
                 mk.color.a = 0.85
-                mk.color.r = 1.0 # Yellow
+                mk.color.r = 1.0  # 노란색
                 mk.color.g = 1.0
                 mk.color.b = 0.0
                 mk.lifetime = rospy.Duration.from_sec(self.marker_lifetime)
@@ -716,7 +713,9 @@ class AssociationNode:
             self.pub_markers.publish(marker_pack)
 
     def _publish_empty(self, detection_msg, radar_header):
-        """매칭 실패 시 빈 결과 발행"""
+        """
+        매칭 실패 시 NaN 기반 빈 결과 발행
+        """
         out = AssociationArray()
         out.header = detection_msg.header
         if radar_header is not None:

@@ -2,15 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-gui.py  —  Motrex Consumer GUI
+역할:
+- 오프라인/실시간 센서 입력을 받아 레이더-카메라 정합 상태와 속도/차선 정보를 시각화하는 메인 소비자 GUI를 제공한다.
+- 시작 다이얼로그에서 자동 보정 실행 여부를 선택하고, 자동 보정 완료 이후 동일 화면에서 결과 모니터링을 이어서 수행한다.
+- 연관/트래킹/최종 출력 토픽을 동기화해 객체별 상태를 표시하고, 보정 품질 판단에 필요한 지표를 화면에 반영한다.
 
-Run:
-    roslaunch autocal autocal.launch
+입력:
+- 카메라/레이더/CameraInfo 토픽, 연관 결과(`AssociationArray`), 트래킹 결과(`DetectionArray`), 최종 결과 토픽.
+- `extrinsic.json`, `lane_polys.json` 등 보정/차선 설정 파일.
 
-Description:
-    1. Startup Dialog: Choose AutoCal (Y/N)
-    2. Y -> 5s countdown -> AutoCal x1 round -> View Mode
-    3. N -> View Mode immediately
+출력:
+- Qt 기반 시각화 화면, 상태 텍스트, 자동 보정 실행 로그.
 """
 
 import sys
@@ -32,9 +34,6 @@ import rospkg
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from cv_bridge import CvBridge
 
-# ==============================================================================
-# Path Setup
-# ==============================================================================
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.append(CURRENT_DIR)
@@ -43,7 +42,7 @@ if NODES_DIR in sys.path:
     sys.path.remove(NODES_DIR)
 sys.path.insert(0, NODES_DIR)
 
-from perception_lib.speed_utils import (
+from library.speed_utils import (
     find_target_lane_from_bbox,
     get_bbox_reference_point,
     parse_radar_pointcloud,
@@ -53,19 +52,19 @@ from perception_lib.speed_utils import (
     update_speed_estimate,
 )
 from autocal.msg import AssociationArray, DetectionArray
-from perception_lib import calibration_utils
-from perception_lib import lane_utils
+from library import calibration_utils
+from library import lane_utils
 
 os.environ["QT_LOGGING_RULES"] = "qt.gui.painting=false"
 
-# ==============================================================================
-# Settings
-# ==============================================================================
-REFRESH_RATE_MS     = 33       # ~30 FPS
-MAX_REASONABLE_KMH  = 100.0
-NOISE_MIN_SPEED_KMH = 3.0
-AUTOCAL_DELAY_SEC   = 5        # Delay before calibration starts
-AUTOCAL_ROUNDS      = 1        # Total calibration rounds
+# ---------------------------------------------------------
+# GUI 동작 파라미터
+# ---------------------------------------------------------
+REFRESH_RATE_MS     = 33       # 화면 갱신 주기(ms)
+MAX_REASONABLE_KMH  = 100.0    # 표시 가능한 최대 속도(km/h)
+NOISE_MIN_SPEED_KMH = 3.0      # 노이즈로 간주할 최소 속도 임계값(km/h)
+AUTOCAL_DELAY_SEC   = 5        # 자동 보정 시작 전 대기 시간(초)
+AUTOCAL_ROUNDS      = 1        # 자동 보정 실행 라운드 수
 
 TOPIC_IMAGE       = "/camera/image_raw"
 TOPIC_RADAR       = "/point_cloud"
@@ -74,13 +73,7 @@ TOPIC_FINAL_OUT   = "/autocal/output"
 TOPIC_ASSOCIATED  = "/autocal/associated"
 TOPIC_TRACKS      = "/autocal/tracks"
 
-
-# ==============================================================================
-# Startup Dialog
-# ==============================================================================
 class StartupDialog(QtWidgets.QDialog):
-    """Startup Options Dialog"""
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Motrex  -  Startup Options")
@@ -125,6 +118,9 @@ class StartupDialog(QtWidgets.QDialog):
         layout.addLayout(btn_row)
 
     def keyPressEvent(self, event):
+        """
+        키보드 입력을 해석해 대응 동작을 실행
+        """
         key = event.key()
         if key in (Qt.Key_Y, Qt.Key_Return, Qt.Key_Enter):
             self.accept()
@@ -133,12 +129,11 @@ class StartupDialog(QtWidgets.QDialog):
         else:
             super().keyPressEvent(event)
 
-
-# ==============================================================================
-# Image Viewer Widget
-# ==============================================================================
 class ImageCanvasViewer(QtWidgets.QWidget):
     def __init__(self, parent=None):
+        """
+        클래스 상태와 UI/리소스를 초기화
+        """
         super().__init__(parent)
         self.pixmap = None
         self._scaled_rect = None
@@ -146,6 +141,9 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         self.setStyleSheet("background:#000;")
 
     def update_image(self, cv_img: np.ndarray):
+        """
+        입력 이미지를 QPixmap으로 변환해 갱신
+        """
         h, w = cv_img.shape[:2]
         self._image_size = (w, h)
         rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
@@ -154,6 +152,9 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         self.update()
 
     def paintEvent(self, event):
+        """
+        현재 프레임을 위젯에 렌더링
+        """
         painter = QtGui.QPainter(self)
         if self.pixmap:
             scaled = self.pixmap.scaled(
@@ -167,26 +168,21 @@ class ImageCanvasViewer(QtWidgets.QWidget):
             painter.setPen(QtCore.Qt.white)
             painter.drawText(self.rect(), Qt.AlignCenter, "Waiting for camera stream...")
 
-
-# ==============================================================================
-# Main Consumer GUI
-# ==============================================================================
 class ConsumerGUI(QtWidgets.QMainWindow):
-
-    # ------------------------------------------------------------------
-    # States
-    # ------------------------------------------------------------------
     STATE_IDLE      = "idle"
     STATE_COUNTDOWN = "countdown"
     STATE_CALIBING  = "calibrating"
     STATE_VIEW      = "view"
 
     def __init__(self, do_autocal: bool):
+        """
+        클래스 상태와 UI/리소스를 초기화
+        """
         super().__init__()
         self.setWindowTitle("Motrex  |  Vehicle Speed Monitor")
         self.showMaximized()
 
-        # ---- ROS Init ----
+        # ROS 초기화
         rospy.init_node("consumer_gui_node", anonymous=True)
         self.bridge = CvBridge()
 
@@ -194,11 +190,11 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.extrinsic_path = os.path.join(pkg_path, "config", "extrinsic.json")
         self.lane_json_path  = os.path.join(pkg_path, "config", "lane_polys.json")
 
-        # ---- ROS Params ----
+        # ROS 파라미터
         self.bbox_ref_mode   = rospy.get_param("~bbox_ref_mode",   "bottom")
         self.autocal_rounds  = int(rospy.get_param("~autocal_rounds", AUTOCAL_ROUNDS))
 
-        # ---- Internal State ----
+        # 내부 상태
         self.do_autocal       = do_autocal
         self.state            = self.STATE_IDLE
         self.app_start_time   = time.time()
@@ -210,7 +206,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.extrinsic_mtime  = None
         self._cal_log_buf     = []
 
-        # ---- Image / Radar State ----
+        # 이미지/레이더 상태
         self.latest_frame     = None
         self.cv_image         = None
         self.cam_K            = None
@@ -226,7 +222,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.last_radar_ts    = 0.0
         self.radar_hold_threshold = 0.06
 
-        # ---- Speed estimation ----
+        # 속도 추정 상태
         self.lane_counters       = {n: 0 for n in ["IN1","IN2","IN3","OUT1","OUT2","OUT3"]}
         self.global_to_local_ids = {}
         self.vehicle_lane_paths  = {}
@@ -250,19 +246,19 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.speed_update_period  = 2
         self.prev_disp_vel = {}
 
-        # Dummy speed params for compatibility
+        # 호환성 유지용 더미 속도 파라미터
         self.spin_hold_sec  = type('o', (object,), {'value': lambda: 10.0})
         self.cmb_smoothing  = type('o', (object,), {'currentText': lambda: "EMA"})
         self.spin_ema_alpha = type('o', (object,), {'value': lambda: 0.35})
 
-        # ---- Load ----
+        # 설정 로드
         self._load_extrinsic()
         self._load_lane_polys()
 
-        # ---- UI ----
+        # UI 초기화
         self._init_ui()
 
-        # ---- ROS Subscribers ----
+        # ROS 구독 설정
         img_sub   = message_filters.Subscriber(TOPIC_IMAGE,  Image)
         radar_sub = message_filters.Subscriber(TOPIC_RADAR,  PointCloud2)
         self.ts   = message_filters.ApproximateTimeSynchronizer(
@@ -274,21 +270,21 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         rospy.Subscriber(TOPIC_ASSOCIATED,  AssociationArray, self._cb_association_result,queue_size=1)
         rospy.Subscriber(TOPIC_TRACKS,      DetectionArray,   self._cb_tracker_result,    queue_size=1)
 
-        # ---- Timer ----
+        # 주기 타이머
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self._update_loop)
         self.timer.start(REFRESH_RATE_MS)
 
-        # ---- Start ----
+        # 시작 상태 설정
         if self.do_autocal:
             self._start_countdown()
         else:
             self.state = self.STATE_VIEW
 
-    # ------------------------------------------------------------------
-    # UI Init
-    # ------------------------------------------------------------------
     def _init_ui(self):
+        """
+        메인 창의 위젯 레이아웃과 시각 요소를 구성
+        """
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
@@ -298,15 +294,17 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.viewer = ImageCanvasViewer()
         layout.addWidget(self.viewer, stretch=1)
 
-    # ------------------------------------------------------------------
-    # AutoCal flow
-    # ------------------------------------------------------------------
     def _start_countdown(self):
+        """
+        백그라운드 작업 또는 프로세스를 시작
+        """
         self.state = self.STATE_COUNTDOWN
         self.countdown_start = time.time()
 
     def _start_calibration_round(self):
-        """Run one AutoCal round via calibration_utils.run_autocalibration."""
+        """
+        calibration_utils를 호출해 자동 외부보정 1회 라운드를 시작
+        """
         self.state = self.STATE_CALIBING
         self.cal_start_time = time.time()
         self._cal_log_buf = []
@@ -314,7 +312,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         if not hasattr(self, "_cal_candidates"):
             self._cal_candidates = []
 
-        # Dummy attrs for calibration_utils compat
+        # calibration_utils 호환용 더미 속성
         if not hasattr(self, "txt_extrinsic_log"):
             self.txt_extrinsic_log = _DummyLog()
         if not hasattr(self, "pbar_extrinsic"):
@@ -323,6 +321,9 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         calibration_utils.run_autocalibration(self)
 
     def _on_extrinsic_stdout(self):
+        """
+        외부 프로세스 표준출력 로그를 수신해 화면에 반영
+        """
         if not self.extrinsic_proc:
             return
         data = bytes(self.extrinsic_proc.readAllStandardOutput()).decode("utf-8", errors="ignore")
@@ -330,6 +331,9 @@ class ConsumerGUI(QtWidgets.QMainWindow):
             self._cal_log_buf.append(data.rstrip())
 
     def _on_extrinsic_stderr(self):
+        """
+        외부 프로세스 표준에러 로그를 수신해 화면에 반영
+        """
         if not self.extrinsic_proc:
             return
         data = bytes(self.extrinsic_proc.readAllStandardError()).decode("utf-8", errors="ignore")
@@ -337,10 +341,13 @@ class ConsumerGUI(QtWidgets.QMainWindow):
             self._cal_log_buf.append(data.rstrip())
 
     def _on_extrinsic_finished(self):
+        """
+        외부 프로세스 종료 결과를 처리하고 후속 상태를 갱신
+        """
         if hasattr(self, "pbar_extrinsic"):
             self.pbar_extrinsic.setVisible(False)
 
-        # --- Read result of this round and score it ---
+        # 현재 라운드 결과를 읽고 점수를 계산
         result = self._read_extrinsic_file()
         if result is not None:
             R, t = result
@@ -368,6 +375,9 @@ class ConsumerGUI(QtWidgets.QMainWindow):
             self.state = self.STATE_VIEW
 
     def _read_extrinsic_file(self):
+        """
+        입력 값을 읽어 표시 가능한 형식으로 변환
+        """
         try:
             if not os.path.exists(self.extrinsic_path):
                 return None
@@ -381,6 +391,9 @@ class ConsumerGUI(QtWidgets.QMainWindow):
             return None
 
     def _score_extrinsic(self, R: np.ndarray, t: np.ndarray) -> float:
+        """
+        평가 점수를 계산해 정합 품질을 수치화
+        """
         det_err = abs(np.linalg.det(R) - 1.0)
         ortho_err = np.linalg.norm(R @ R.T - np.eye(3))
         t_mag = float(np.linalg.norm(t))
@@ -403,6 +416,9 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         return float(score)
 
     def _apply_best_candidate(self):
+        """
+        선택된 후보 결과를 현재 상태에 적용
+        """
         candidates = getattr(self, "_cal_candidates", [])
         if not candidates:
             rospy.logwarn("[ConsumerGUI] No valid calibration candidates.")
@@ -423,10 +439,10 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self._load_extrinsic()
         self._cal_candidates = []
 
-    # ------------------------------------------------------------------
-    # ROS Callbacks
-    # ------------------------------------------------------------------
     def _cb_sync(self, img_msg, radar_msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         try:
             cv_img = self.bridge.imgmsg_to_cv2(img_msg, "bgr8")
         except Exception:
@@ -439,10 +455,16 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         }
 
     def _cb_info(self, msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         if self.cam_K is None:
             self.cam_K = np.array(msg.K).reshape(3, 3)
 
     def _cb_final_result(self, msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         objects = []
         for obj in msg.objects:
             spd = obj.speed_kph
@@ -460,12 +482,18 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.last_update_time = time.time()
 
     def _cb_association_result(self, msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         for obj in msg.objects:
             if np.isfinite(obj.speed_kph):
                 self.assoc_speed_by_id[obj.id] = obj.speed_kph
         self.assoc_last_update_time = time.time()
 
     def _cb_tracker_result(self, msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         if time.time() - self.last_update_time > 0.3:
             objects = []
             for det in msg.detections:
@@ -477,16 +505,16 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                 })
             self.vis_objects = objects
 
-    # ------------------------------------------------------------------
-    # Update Loop
-    # ------------------------------------------------------------------
     def _update_loop(self):
+        """
+        현재 상태를 기반으로 화면 오버레이와 위젯 표시를 갱신
+        """
         try:
             self._maybe_reload_extrinsic()
             now = time.time()
             elapsed_total = now - self.app_start_time
 
-            # COUNTDOWN STATE
+            # 카운트다운 상태
             if self.state == self.STATE_COUNTDOWN:
                 
                 # 1. 데이터가 들어왔는지 확인 (Warm-up Check)
@@ -495,10 +523,9 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                 if self.latest_frame is not None:
                     pts = self.latest_frame.get("radar_points")
 
-                # 조건: 포인트 10개 이상 AND 박스(vis_objects)가 1개 이상 감지됨
                 if (pts is not None and len(pts) > 10 and 
                     self.latest_frame.get("cv_image") is not None and
-                    len(self.vis_objects) > 0):  # <--- 핵심: 박스가 보여야 시작
+                    len(self.vis_objects) > 0):
                     has_valid_data = True
 
                 # 2. 데이터가 불안정하면 대기
@@ -516,12 +543,12 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                     self._show_countdown_screen(int(np.ceil(remaining)), elapsed_total, waiting_data=False)
                     return
 
-            # CALIBRATING STATE
+            # 보정 진행 상태
             if self.state == self.STATE_CALIBING:
                 self._show_calibrating_screen(elapsed_total)
                 return
 
-            # VIEW MODE
+            # 모니터링 상태
             if self.latest_frame is None:
                 return
 
@@ -544,7 +571,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                     pts_raw = self.last_radar_pts
                     dop_raw = self.last_radar_dop
 
-            # Radar Project
+            # 레이더 점 투영
             proj_uvs = proj_valid = None
             if (pts_raw is not None and self.cam_K is not None
                     and self.Extr_R is not None and self.Extr_t is not None):
@@ -552,8 +579,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                     self.cam_K, self.Extr_R, self.Extr_t.flatten(), pts_raw
                 )
             
-            # --- [추가] 겹치는 BBox(가림 현상) 필터링 ---
-            # 카메라에 더 가까운(ymax가 큰) 차량이 포인트를 선점하도록 분배
+            # 겹치는 BBox(가림 현상) 필터링
             num_pts = len(proj_uvs) if proj_uvs is not None else 0
             point_owner = np.full(num_pts, -1, dtype=int)
 
@@ -574,11 +600,10 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                     in_box = (u >= cx1) & (u <= cx2) & (v >= cy1) & (v <= cy2)
                     unowned = (point_owner == -1)
                     point_owner[in_box & unowned & proj_valid] = s_id
-            # ---------------------------------------------
 
             disp = self.cv_image.copy()
 
-            # Lanes
+            # 차선 상태 갱신
             active_lane_polys = {
                 name: poly
                 for name, poly in self.lane_polys.items()
@@ -589,13 +614,13 @@ class ConsumerGUI(QtWidgets.QMainWindow):
             draw_items = []
             self._speed_frame_counter += 1
 
-            # -- Objects --
+            # 객체 처리
             active_ids = set()
             for obj in self.vis_objects:
                 g_id = obj["id"]
                 x1, y1, x2, y2 = obj["bbox"]
 
-                # Lane filter
+                # 차선 필터
                 target_lane = None
                 if has_lane_filter:
                     target_lane = find_target_lane_from_bbox(
@@ -609,7 +634,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                         active_ids.discard(g_id)
                         continue
 
-                # Confirmation
+                # 추적 확정 여부 갱신
                 self.track_confirmed_cnt[g_id] = (
                     self.track_confirmed_cnt.get(g_id, 0) + 1
                 )
@@ -618,7 +643,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
 
                 active_ids.add(g_id)
 
-                # Stabilization
+                # 차선 안정화
                 if g_id in self.vehicle_lane_paths:
                     last_confirmed = self.vehicle_lane_paths[g_id].split("->")[-1]
                     if target_lane != last_confirmed:
@@ -671,7 +696,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                         if current_vel is not None:
                             speed_diff = abs(meas_kmh - current_vel)
                             
-                            # [핵심 1] 화면에 2초(60프레임) 이상 존재하며 '완전 정지' 중인 차량에만 관통 방어 적용
+                            # 화면에 2초(60프레임) 이상 존재하며 '완전 정지' 중인 차량에만 관통 방어 적용
                             if tracking_frames > 60 and current_vel <= 5.0 and meas_kmh >= 15.0:
                                 self.rejected_cnt[g_id] = self.rejected_cnt.get(g_id, 0) + 1
                                 # 1초(30프레임) 연속으로 잡히지 않으면 뒷차 관통 노이즈로 보고 차단
@@ -680,7 +705,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                                 else:
                                     self.rejected_cnt[g_id] = 0
                                     
-                            # [핵심 2] 주행 중 순간적으로 10km/h 이상 튀는 일반 레이더 노이즈 방어
+                            # 주행 중 순간적으로 10km/h 이상 튀는 일반 레이더 노이즈 방어
                             # (단, 초기 진입 후 2초 이내인 차량은 한 번에 50km/h 등으로 뛸 수 있도록 예외 처리)
                             elif speed_diff > 10.0 and tracking_frames > 60:
                                 self.rejected_cnt[g_id] = self.rejected_cnt.get(g_id, 0) + 1
@@ -717,7 +742,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                     "target_pt": target_pt,
                 })
 
-            # Draw
+            # 화면 그리기
             for it in draw_items:
                 x1, y1, x2, y2 = it["bbox"]
                 cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 0, 255), 2)
@@ -742,16 +767,16 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                     cv2.putText(disp, line, (bx1 + pad, cy), font, sc, (255, 255, 255), th)
                     cy += sz[1] + gap
 
-            # Overlay
+            # 상태 오버레이
             self._draw_status_overlay(disp, elapsed_total)
 
-            # Cleanup
+            # 캐시 정리
             visible_ids = {o["id"] for o in self.vis_objects}
             self.track_confirmed_cnt = {k: v for k, v in self.track_confirmed_cnt.items() if k in visible_ids}
             self.radar_track_hist    = {k: v for k, v in self.radar_track_hist.items()    if k in active_ids}
             self.lane_stable_cnt     = {k: v for k, v in self.lane_stable_cnt.items()     if k in visible_ids}
             
-            # [추가] 화면에서 사라진 차량의 오래된 캐시 삭제
+            # 화면에서 사라진 차량의 오래된 캐시 삭제
             if hasattr(self, 'prev_disp_vel'):
                 self.prev_disp_vel = {k: v for k, v in self.prev_disp_vel.items() if k in visible_ids}
             if hasattr(self, 'rejected_cnt'):
@@ -762,10 +787,10 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         except Exception as e:
             rospy.logwarn_throttle(5.0, f"[ConsumerGUI] update_loop error: {e}")
 
-    # ------------------------------------------------------------------
-    # Overlay Helpers
-    # ------------------------------------------------------------------
     def _show_countdown_screen(self, remaining: int, elapsed_total: float, waiting_data: bool = False):
+        """
+        화면에 안내/카운트다운 오버레이를 표시
+        """
         if self.latest_frame is not None and self.latest_frame.get("cv_image") is not None:
             disp = self.latest_frame["cv_image"].copy()
         else:
@@ -779,7 +804,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         font = cv2.FONT_HERSHEY_SIMPLEX
 
         if waiting_data:
-            # [수정] 대기 안내 문구 구체화
+            # 대기 안내 문구 구체화
             cv2.putText(disp, "Waiting for STABLE TRACKS...", (w // 2 - 280, h // 2 - 50),
                         font, 1.2, (0, 165, 255), 3)
             # 포인트뿐만 아니라 '박스'가 잡혀야 함을 안내
@@ -797,7 +822,9 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.viewer.update_image(disp)
 
     def _show_calibrating_screen(self, elapsed_total: float):
-        """Calibration screen (ENGLISH ONLY) - Text Centered"""
+        """
+        보정 진행 화면을 구성하고 중앙 정렬 텍스트를 렌더링
+        """
         if self.latest_frame is not None and self.latest_frame.get("cv_image") is not None:
             disp = self.latest_frame["cv_image"].copy()
         else:
@@ -811,7 +838,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         font = cv2.FONT_HERSHEY_SIMPLEX
         round_str = f"Calibrating... ({self.cal_round + 1} / {self.autocal_rounds} Rounds)"
         
-        # [수정] 텍스트의 실제 너비(tw)와 높이(th)를 계산해서 정중앙(Center) 좌표 구하기
+        # 텍스트의 실제 너비(tw)와 높이(th)를 계산해서 정중앙(Center) 좌표 구하기
         font_scale = 1.2
         thickness = 3
         (tw, th), _ = cv2.getTextSize(round_str, font, font_scale, thickness)
@@ -821,7 +848,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
 
         cv2.putText(disp, round_str, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
 
-        # Progress bar
+        # 진행률 바
         round_elapsed = time.time() - self.cal_start_time
         frac = min(1.0, round_elapsed / max(1.0, self.cal_total_sec))
         
@@ -845,7 +872,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         cv2.putText(disp, pct_str, (pct_x, pct_y),
                     font, 0.65, (255, 255, 255), 2)
 
-        # Last log line
+        # 마지막 로그 라인
         if self._cal_log_buf:
             last = self._cal_log_buf[-1][-80:]
             # 로그 텍스트도 중앙 정렬 (선택 사항)
@@ -860,12 +887,14 @@ class ConsumerGUI(QtWidgets.QMainWindow):
 
     def _draw_status_overlay(self, disp: np.ndarray, elapsed_total: float,
                               mode: str = "view", extra: str = ""):
-        """Top-Right Overlay (ENGLISH ONLY)"""
+        """
+        우측 상단 상태 오버레이를 구성해 누적 시간과 모드를 표시
+        """
         h, w = disp.shape[:2]
         font = cv2.FONT_HERSHEY_SIMPLEX
 
         elapsed_str = _fmt_time(elapsed_total)
-        # ENGLISH STRINGS
+        # 오버레이 텍스트 구성
         lines = [f"Total Time: {elapsed_str}"]
 
         if mode == "countdown":
@@ -883,7 +912,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                 lines.append(f"- AutoCal Done ({self.cal_round} rounds)")
             lines.append("Monitoring Active")
 
-        # Layout
+        # 오버레이 레이아웃
         sc, th = 0.52, 1
         pad = 8
         sizes  = [cv2.getTextSize(ln, font, sc, th)[0] for ln in lines]
@@ -904,19 +933,25 @@ class ConsumerGUI(QtWidgets.QMainWindow):
             cv2.putText(disp, ln, (x0 + pad, ty), font, sc, (255, 255, 255), th)
             ty += line_h
 
-    # ------------------------------------------------------------------
-    # Utils
-    # ------------------------------------------------------------------
     def _load_extrinsic(self):
+        """
+        설정 파일을 읽어 내부 데이터 구조를 갱신
+        """
         calibration_utils.load_extrinsic(self)
 
     def _load_lane_polys(self):
+        """
+        설정 파일을 읽어 내부 데이터 구조를 갱신
+        """
         try:
             self.lane_polys = lane_utils.load_lane_polys(self.lane_json_path)
         except Exception:
             self.lane_polys = {}
 
     def _maybe_reload_extrinsic(self):
+        """
+        파일 변경 여부를 확인해 필요 시 설정을 재로딩
+        """
         if not os.path.exists(self.extrinsic_path):
             return
         try:
@@ -926,25 +961,30 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         if self.extrinsic_mtime is None or mtime > self.extrinsic_mtime:
             self._load_extrinsic()
 
-
-# ==============================================================================
-# Dummy Widgets (Compatibility)
-# ==============================================================================
 class _DummyLog:
-    def clear(self): pass
-    def appendPlainText(self, _): pass
-    def setVisible(self, _): pass
+    def clear(self):
+        pass
+
+    def appendPlainText(self, _):
+        pass
+
+    def setVisible(self, _):
+        pass
 
 class _DummyProgressBar:
-    def setVisible(self, _): pass
-    def setRange(self, *_): pass
-    def setValue(self, _): pass
+    def setVisible(self, _):
+        pass
 
+    def setRange(self, *_):
+        pass
 
-# ==============================================================================
-# Helpers
-# ==============================================================================
+    def setValue(self, _):
+        pass
+
 def _fmt_time(sec: float) -> str:
+    """
+    입력 값을 읽어 표시 가능한 형식으로 변환
+    """
     sec = int(sec)
     h, rem = divmod(sec, 3600)
     m, s   = divmod(rem,  60)
@@ -952,10 +992,6 @@ def _fmt_time(sec: float) -> str:
         return f"{h}h {m:02d}m {s:02d}s"
     return f"{m:02d}m {s:02d}s"
 
-
-# ==============================================================================
-# Main
-# ==============================================================================
 def main():
     app = QtWidgets.QApplication(sys.argv)
 

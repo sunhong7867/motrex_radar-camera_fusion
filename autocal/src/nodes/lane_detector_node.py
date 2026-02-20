@@ -2,168 +2,178 @@
 # -*- coding: utf-8 -*-
 
 """
-lane_detector_node.py (Final)
-
 역할:
-- YOLO에서 나온 DetectionArray를 받아, 설정된 차선(ROI) 안에 있는 차량만 필터링
-- 필터링된 결과만 다음 단계(Association Node)로 전달
-- lane_polys.json 파일 변경 시 실시간 반영 (Hot-Reload)
+- 원본 검출 결과(`DetectionArray`)를 수신하고, 객체 bbox의 기준점이 지정된 차선 ROI 폴리곤 내부에 있는지 판별해 유효 객체만 통과시킨다.
+- `lane_polys.json` 파일 변경을 주기적으로 감시해 런타임 중 차선 다각형을 재로딩하며, 운영 중 ROI 수정 내용을 즉시 반영한다.
+- 필터링된 결과를 다음 단계 연관 노드에서 사용 가능한 `DetectionArray`로 발행하고, 매칭된 차선 이름을 `lane_id`에 기록한다.
 
-데이터 흐름:
-[Object Detector] (/autocal/detections_raw)
-       ⬇
-[Lane Detector]   (필터링 수행)
-       ⬇
-[Association Node] (/autocal/detections)
+입력:
+- `~input_topic` (`autocal/DetectionArray`): 객체 검출 결과 입력 토픽.
+- `~roi_source/path` (`json`): 차선 다각형 좌표 파일 경로.
+- `~policy/target_lanes` (`list[str]`): 통과 허용 차선 목록.
+- `~policy/anchor_point` (`str`): `bbox_bottom_center` 또는 `bbox_center` 기준점 모드.
+
+출력:
+- `~output_topic` (`autocal/DetectionArray`): 차선 필터링이 반영된 검출 결과.
 """
 
-import os
 import json
+import os
 import time
+
 import numpy as np
 import rospy
 import rospkg
-
-from autocal.msg import DetectionArray, Detection, BoundingBox
-from std_msgs.msg import Header
+from autocal.msg import DetectionArray
 
 try:
     import cv2
 except ImportError:
     cv2 = None
 
+# ---------------------------------------------------------
+# 차선 필터링 파라미터
+# ---------------------------------------------------------
+DEFAULT_INPUT_TOPIC = "/autocal/detections_raw"                      # 원본 검출 입력 토픽
+DEFAULT_OUTPUT_TOPIC = "/autocal/detections"                        # 차선 필터링 출력 토픽
+DEFAULT_TARGET_LANES = ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]  # 통과 허용 차선 목록
+DEFAULT_ANCHOR_POINT = "bbox_bottom_center"                         # bbox 기준점 모드
+DEFAULT_RELOAD_SEC = 1.0                                             # ROI 파일 재로딩 최소 주기(초)
+
+
 class LaneDetectorNode:
     def __init__(self):
+        """
+        노드 파라미터, ROI 경로, 입출력 토픽, 내부 상태를 초기화
+        """
         rospy.init_node("lane_detector_node")
 
-        # 1. 토픽 설정
-        # 입력: YOLO가 보낸 원본 검출 결과
-        self.sub_topic = rospy.get_param("~input_topic", "/autocal/detections_raw")
-        # 출력: 차선 필터링이 끝난 결과 (Association 노드가 받을 토픽)
-        self.pub_topic = rospy.get_param("~output_topic", "/autocal/detections")
+        # 입력/출력 토픽 파라미터 로드
+        self.sub_topic = rospy.get_param("~input_topic", DEFAULT_INPUT_TOPIC)
+        self.pub_topic = rospy.get_param("~output_topic", DEFAULT_OUTPUT_TOPIC)
 
-        # 2. ROI 설정 파일 경로
-        # 기본값: 패키지 내 src/nodes/lane_polys.json
+        # ROI 파일 기본 경로 계산
         try:
             rospack = rospkg.RosPack()
             pkg_path = rospack.get_path("autocal")
             default_poly_path = os.path.join(pkg_path, "src", "nodes", "lane_polys.json")
         except Exception:
             default_poly_path = "lane_polys.json"
-            
-        self.poly_path = rospy.get_param("~roi_source/path", default_poly_path)
-        
-        # 3. 파라미터
-        # 검사할 차선 목록 (예: ["IN1"] 이면 IN1 차선 차량만 통과)
-        self.target_lanes = rospy.get_param("~policy/target_lanes", ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"])
-        self.anchor_point = rospy.get_param("~policy/anchor_point", "bbox_bottom_center") # or bbox_center
-        self.reload_sec = 1.0
 
-        # 내부 변수
-        self.lane_polys = {} # { "IN1": np.array([[x,y],...]), ... }
+        self.poly_path = rospy.get_param("~roi_source/path", default_poly_path)
+
+        # 정책 파라미터 로드
+        self.target_lanes = rospy.get_param("~policy/target_lanes", DEFAULT_TARGET_LANES)
+        self.anchor_point = rospy.get_param("~policy/anchor_point", DEFAULT_ANCHOR_POINT)
+        self.reload_sec = float(rospy.get_param("~runtime/reload_sec", DEFAULT_RELOAD_SEC))
+
+        # ROI 캐시 상태
+        self.lane_polys = {}
         self._last_poly_load = 0.0
         self._poly_mtime = 0.0
 
-        # Pub/Sub
+        # 퍼블리셔/서브스크라이버 연결
         self.pub = rospy.Publisher(self.pub_topic, DetectionArray, queue_size=10)
         self.sub = rospy.Subscriber(self.sub_topic, DetectionArray, self.callback, queue_size=10)
 
-        rospy.loginfo(f"[LaneDetector] In: {self.sub_topic}, Out: {self.pub_topic}")
-        rospy.loginfo(f"[LaneDetector] ROI Path: {self.poly_path}")
-        
-        # 초기 로드 시도
+        rospy.loginfo(f"[LaneDetector] Ready. In={self.sub_topic}, Out={self.pub_topic}")
+        rospy.loginfo(f"[LaneDetector] ROI path: {self.poly_path}")
+
+        # 시작 시 ROI 파일 1회 로드
         self._load_polys()
 
     def _load_polys(self):
-        """lane_polys.json 파일이 변경되었으면 다시 로드"""
+        """
+        ROI JSON 파일 변경 여부를 확인하고 변경 시 다각형 캐시를 갱신
+        """
         now = time.time()
-        # 너무 잦은 파일 접근 방지
+
+        # 파일 접근 주기 제한
         if now - self._last_poly_load < self.reload_sec:
             return
-
         self._last_poly_load = now
-        
+
+        # ROI 파일 미존재 시 재시도 대기
         if not os.path.exists(self.poly_path):
-            # 파일이 아직 없으면 경고는 가끔만 출력
-            # rospy.logwarn_throttle(10.0, f"[LaneDetector] Poly file not found: {self.poly_path}")
             return
 
         try:
             mtime = os.stat(self.poly_path).st_mtime
             if mtime <= self._poly_mtime:
-                return # 변경 없음
+                return
 
-            with open(self.poly_path, "r") as f:
+            with open(self.poly_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            
+
+            # 유효한 다각형(점 3개 이상)만 캐시에 반영
             new_polys = {}
-            for name, points in data.items():
+            for lane_name, points in data.items():
                 if points and len(points) > 2:
-                    # cv2.pointPolygonTest를 위해 int32 numpy 배열로 변환
-                    new_polys[name] = np.array(points, dtype=np.int32)
-            
+                    new_polys[lane_name] = np.array(points, dtype=np.int32)
+
             self.lane_polys = new_polys
             self._poly_mtime = mtime
-            rospy.loginfo(f"[LaneDetector] Reloaded {len(new_polys)} lanes from json.")
-            
-        except Exception as e:
-            rospy.logwarn(f"[LaneDetector] Failed to load polys: {e}")
+            rospy.loginfo(f"[LaneDetector] Reloaded {len(new_polys)} lane polygons")
 
-    def is_inside(self, bbox, poly):
-        """bbox의 기준점이 폴리곤 안에 있는지 판별"""
-        if poly is None or cv2 is None: 
+        except Exception as exc:
+            rospy.logwarn(f"[LaneDetector] Failed to load ROI json: {exc}")
+
+    def is_inside(self, bbox, poly) -> bool:
+        """
+        bbox 기준점이 다각형 내부 또는 경계에 위치하는지 판별
+        """
+        if poly is None or cv2 is None:
             return False
 
         xmin, ymin = bbox.xmin, bbox.ymin
         xmax, ymax = bbox.xmax, bbox.ymax
-        
-        # 기준점 계산 (차량의 바닥 중앙 or 박스 중앙)
+
+        # 기준점 모드에 따라 앵커 좌표 계산
         if self.anchor_point == "bbox_center":
             cx = (xmin + xmax) / 2.0
             cy = (ymin + ymax) / 2.0
-        else: # bbox_bottom_center (기본값) - 차량 바퀴 위치 기준이 정확함
+        else:
             cx = (xmin + xmax) / 2.0
             cy = float(ymax)
 
-        # cv2.pointPolygonTest 사용 (dist >= 0 이면 내부 또는 경계)
-        result = cv2.pointPolygonTest(poly, (cx, cy), False)
-        return result >= 0
+        return cv2.pointPolygonTest(poly, (cx, cy), False) >= 0
 
     def callback(self, msg: DetectionArray):
-        # 1. ROI 최신화 체크
+        """
+        입력 검출 리스트를 ROI 기준으로 필터링해 출력 토픽으로 발행
+        """
+        # 최신 ROI 반영
         self._load_polys()
 
-        # 차선 설정이 아예 없으면? -> 안전하게 모두 통과시킬지, 막을지 결정
-        # 여기서는 "설정 전에는 모두 통과" 시켜서 디버깅을 돕습니다.
+        # ROI 미설정 상태에서는 전체 통과
         if not self.lane_polys:
             self.pub.publish(msg)
             return
 
         filtered_dets = []
-        
-        # 2. 각 차량 검사
+
+        # 객체별 차선 포함 여부 검사
         for det in msg.detections:
             is_valid = False
             matched_lane = None
-            
-            # target_lanes에 있는 차선들만 검사
+
             for lane_name in self.target_lanes:
                 poly = self.lane_polys.get(lane_name)
-                if poly is not None:
-                    if self.is_inside(det.bbox, poly):
-                        is_valid = True
-                        matched_lane = lane_name
-                        break # 하나라도 속하면 통과
-            
+                if poly is not None and self.is_inside(det.bbox, poly):
+                    is_valid = True
+                    matched_lane = lane_name
+                    break
+
             if is_valid:
                 det.lane_id = matched_lane if matched_lane is not None else ""
                 filtered_dets.append(det)
 
-        # 3. 결과 발행
+        # 필터링 결과 발행
         out_msg = DetectionArray()
-        out_msg.header = msg.header # 타임스탬프 유지
+        out_msg.header = msg.header
         out_msg.detections = filtered_dets
         self.pub.publish(out_msg)
+
 
 def main():
     try:
@@ -171,6 +181,7 @@ def main():
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
+
 
 if __name__ == "__main__":
     main()

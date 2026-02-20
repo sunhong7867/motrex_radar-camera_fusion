@@ -1,3 +1,6 @@
+# camera_intrinsic.yaml
+# 카메라 스펙 및 캘리브레이션 파라미터 설정.
+
 camera_spec:
   manufacturer: MindVision
   model: MV-GE231GC-M

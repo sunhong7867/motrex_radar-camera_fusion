@@ -1,12 +1,11 @@
 # roi_lanes.yaml
-# 차선 ROI 소스(=lane_polys.json) 경로와 적용 정책
-# lane_polys.json은 ROI 설정/편집 시 "자동으로 갱신"되는 파일
+# 차선 ROI 소스 경로와 적용 정책 설정.
 
 roi_source:
   format: json
   path: "$(find autocal)/src/nodes/lane_polys.json"
-  # lane_polys.json 포맷은 lane_utils.py가 기대하는 구조를 따름
-  # 예: { "IN1": [[u,v], ...], "IN2": [...], "OUT1": [...], "OUT2": [...] }
+  # lane_polys.json은 ROI 편집 시 자동 갱신됨.
+  # 예시: { "IN1": [[u,v], ...], "IN2": [...], "OUT1": [...], "OUT2": [...] }
 
 lane_definition:
   lane_names: ["IN1", "IN2", "IN3", "OUT1", "OUT2", "OUT3"]
@@ -19,14 +18,11 @@ lane_definition:
     OUT3: "out3"
 
 policy:
-  # bbox ROI 판정 기준점
-  anchor_point: bbox_bottom_center     # bbox_bottom_center / bbox_center
-  # 너무 작은 bbox 제거(먼 거리 노이즈)
-  min_bbox_area: 1500
+  anchor_point: bbox_bottom_center     # 옵션: bbox_bottom_center / bbox_center
+  min_bbox_area: 1500                  # 최소 bbox 면적 필터
 
 selection:
-  # 같은 차선/ROI 안에 여러 차량이면 어떤 걸 “선행 1대”로 잡을지
-  mode: nearest_by_radar_range         # nearest_by_radar_range / largest_bbox / closest_to_center
+  mode: nearest_by_radar_range         # 옵션: nearest_by_radar_range / largest_bbox / closest_to_center
   publish_only_one: true
 
 debug:

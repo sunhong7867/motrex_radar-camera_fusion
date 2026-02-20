@@ -2,25 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-real_gui.py (Updated)
+역할:
+- 실차 운영용 GUI에서 영상/레이더/트래킹/연관 결과를 통합 표시하고 수동 외부파라미터 조정 도구를 제공한다.
+- 차선 편집, 캘리브레이션 실행, 진단 결과 수신, 로그 저장 기능을 한 화면에서 제어해 운영 절차를 단일 UI로 통합한다.
+- 클러스터 대표점/자석선/정확도 지표를 시각화해 보정 상태를 직관적으로 확인하고 파라미터 튜닝 결정을 지원한다.
 
-[변경 사항]
-1. UI 레이아웃 재구성 (우측 패널):
-   - 2번: Calibration Accuracy (신설 - 게이지, 이모지, 자석선 토글)
-   - 3번: Lane Editor
-   - 4번: View Options (텍스트 토글 추가)
-   - 5번: Radar Speed Filters (대표 점 토글 추가 - 기본값 True)
-   - (Speed Estimation 그룹 제거 -> 내부 기본값으로 동작 유지)
+입력:
+- 카메라/레이더/CameraInfo 토픽, 연관/트래킹/최종 출력 토픽, 진단 결과 토픽.
+- `extrinsic.json`, `lane_polys.json`, 로그 저장 경로 설정.
 
-2. 시각화 로직 개선:
-   - Magnet Line: BBox 중앙 <-> 레이더 대표 점/클러스터 대표점 토글 연결
-   - Representative Point: BBox 기준점(상/중/하단) 선택 가능
-   - Accuracy/Score: 캘리브레이션 정확도/트랙 속도 점수 분리 표시
-
-3. 데이터 저장 (Data Logging) 수정:
-   - update_loop 내 record_buffer 채우기 로직 추가
-   - 차선/ID별 고유 키 생성 (IN1->IN2 등 경로 반영)
-   - 거리별/ID별 통계 CSV 저장 기능 구현
+출력:
+- Qt 기반 운영 화면, 캘리브레이션 제어, 실시간 오버레이 시각화, 데이터 로그 저장.
 """
 
 import sys
@@ -53,9 +45,9 @@ NODES_DIR = os.path.join(CURRENT_DIR, "nodes")
 if NODES_DIR in sys.path:
     sys.path.remove(NODES_DIR)
 sys.path.insert(0, NODES_DIR)
-from perception_lib.lane_editor import LaneEditorDialog
-from perception_lib.logging_utils import DataLogger
-from perception_lib.speed_utils import (
+from library.lane_editor import LaneEditorDialog
+from library.logging_utils import DataLogger
+from library.speed_utils import (
     build_record_row,
     find_target_lane_from_bbox,
     get_bbox_reference_point,
@@ -67,37 +59,28 @@ from perception_lib.speed_utils import (
 )
 
 from autocal.msg import AssociationArray, DetectionArray
-from perception_lib import calibration_utils
-from perception_lib import lane_utils
+from library import calibration_utils
+from library import lane_utils
 
 os.environ["QT_LOGGING_RULES"] = "qt.gui.painting=false"
 
-# ==============================================================================
-# [PARAMETER SETTINGS] 사용자 설정
-# ==============================================================================
-
+# ---------------------------------------------------------
+# GUI 동작 파라미터
+# ---------------------------------------------------------
 REFRESH_RATE_MS = 33           # 30 FPS
-MAX_REASONABLE_KMH = 100.0   # 육교 고정형 기준 상한
-
-# Radar Coloring & Filtering
+MAX_REASONABLE_KMH = 100.0     # 육교 고정형 기준 상한
 SPEED_THRESHOLD_RED = -0.5     # m/s (이보다 작으면 접근/빨강)
 SPEED_THRESHOLD_BLUE = 0.5     # m/s (이보다 크면 이탈/파랑)
 NOISE_MIN_SPEED_KMH = 5.0      # 정지/저속(노이즈) 필터 기준 (km/h)
-
-# Clustering Parameters (Rviz 스타일)
 CLUSTER_MAX_DIST = 2.5         # 점 사이 거리 (m)
 CLUSTER_MIN_PTS = 3            # 최소 점 개수
-
 CLUSTER_VEL_GATE_MPS = 2.0     # 클러스터 내 속도 일관성 게이트 (m/s)
 BBOX2D_MIN_AREA_PX2 = 250      # 2D bbox 최소 면적 (너무 작은 박스 제거)
 BBOX2D_MARGIN_PX = 6           # 2D bbox 여유 픽셀
-
-# Visualization
-OVERLAY_POINT_RADIUS = 4
-BBOX_LINE_THICKNESS = 2
+OVERLAY_POINT_RADIUS = 4       # 레이더 대표점 시각화 크기
+BBOX_LINE_THICKNESS = 2        # 차량 박스 선 두께
 AXIS_LENGTH = 3.0              # 좌표축 화살표 길이 (m)
 
-# Topics
 TOPIC_IMAGE = "/camera/image_raw"
 TOPIC_RADAR = "/point_cloud"
 TOPIC_CAMERA_INFO = "/camera/camera_info"
@@ -114,6 +97,9 @@ def cluster_radar_points(
     min_pts: int,
     min_speed_mps: float,
 ) -> list:
+    """
+    레이더 점군을 클러스터로 묶어 대표점을 계산
+    """
     if points is None or len(points) == 0:
         return []
 
@@ -142,6 +128,9 @@ def cluster_radar_points(
 
 
 def score_point_to_bbox(target_pt: Tuple[int, int], ref_pt: Tuple[int, int], bbox: Tuple[int, int, int, int]) -> float:
+    """
+    평가 점수를 계산해 정합 품질을 수치화
+    """
     if target_pt is None or ref_pt is None:
         return 0.0
     x1, y1, x2, y2 = bbox
@@ -157,6 +146,9 @@ def select_cluster_point_for_bbox(
     bbox: Tuple[int, int, int, int],
     ref_mode: str = "center",
 ) -> Optional[Tuple[int, int]]:
+    """
+    bbox 기준점과 가장 가까운 클러스터 포인트를 선택
+    """
     if cluster_uvs is None or cluster_uvs.size == 0:
         return None
     x1, y1, x2, y2 = bbox
@@ -166,11 +158,11 @@ def select_cluster_point_for_bbox(
     idx = int(np.argmin(dists))
     return (int(cluster_uvs[idx, 0]), int(cluster_uvs[idx, 1]))
 
-# ==============================================================================
-# UI Classes
-# ==============================================================================
 class ImageCanvasViewer(QtWidgets.QWidget):
     def __init__(self, parent=None):
+        """
+        클래스 상태와 UI/리소스를 초기화
+        """
         super().__init__(parent)
         self.pixmap = None
         self._image_size = None
@@ -182,6 +174,9 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         self.setStyleSheet("background-color: #101010;")
 
     def update_image(self, cv_img):
+        """
+        입력 이미지를 QPixmap으로 변환해 갱신
+        """
         if cv_img is None:
             return
         h, w, ch = cv_img.shape
@@ -192,13 +187,22 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         self.update()
 
     def set_click_callback(self, callback):
+        """
+        클릭 이벤트 콜백 함수를 등록
+        """
         self._click_callback = callback
 
     def set_zoom(self, zoom: float):
+        """
+        뷰어 확대/축소 비율을 설정
+        """
         self.zoom = float(np.clip(zoom, 0.00001, 5.0))
         self.update()
 
     def paintEvent(self, event):
+        """
+        현재 프레임을 위젯에 렌더링
+        """
         painter = QtGui.QPainter(self)
         if self.pixmap:
             target_w = int(self.width() * self.zoom)
@@ -214,6 +218,9 @@ class ImageCanvasViewer(QtWidgets.QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "Waiting for Camera Stream...")
 
     def mousePressEvent(self, event):
+        """
+        마우스 클릭 위치를 처리해 상호작용을 수행
+        """
         if not self._click_callback or not self._scaled_rect or not self._image_size:
             return
         pos = event.position().toPoint()
@@ -225,11 +232,11 @@ class ImageCanvasViewer(QtWidgets.QWidget):
         img_y = (pos.y() - self._scaled_rect.y()) * scale_y
         self._click_callback(int(img_x), int(img_y))
 
-# ==============================================================================
-# ManualCalibWindow
-# ==============================================================================
 class ManualCalibWindow(QtWidgets.QDialog):
     def __init__(self, gui: 'RealWorldGUI'):
+        """
+        클래스 상태와 UI/리소스를 초기화
+        """
         super().__init__(gui, QtCore.Qt.Window | QtCore.Qt.WindowMinMaxButtonsHint | QtCore.Qt.WindowCloseButtonHint)
         self.gui = gui
         self.setWindowTitle("Manual Calibration - Independent Tool")
@@ -255,6 +262,9 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self._timer = QtCore.QTimer(self); self._timer.timeout.connect(self.update_view); self._timer.start(33)
 
     def init_ui(self):
+        """
+        init_ui 함수의 핵심 처리를 수행
+        """
         main_layout = QtWidgets.QHBoxLayout(self)
         
         self.img_view = ImageCanvasViewer(self)
@@ -324,16 +334,25 @@ class ManualCalibWindow(QtWidgets.QDialog):
         main_layout.addWidget(ctrl_panel)
 
     def _create_btn(self, text, bg_color, func, text_color="black"):
+        """
+        공통 스타일 버튼을 생성하고 콜백을 연결
+        """
         btn = QtWidgets.QPushButton(text)
         btn.setStyleSheet(f"background-color: {bg_color}; color: {text_color}; font-size: 12px;")
         btn.clicked.connect(func); return btn
 
     def _move(self, axis, sign):
+        """
+        사용자 입력에 따라 외부파라미터 변환을 적용
+        """
         move_vec = np.zeros(3); move_vec[axis] = sign * self.FIXED_MOV
         self.T_current[:3, 3] += self.T_current[:3, :3] @ move_vec
         self.update_view()
 
     def _rotate(self, axis, sign):
+        """
+        사용자 입력에 따라 외부파라미터 변환을 적용
+        """
         rad = np.deg2rad(sign * self.FIXED_DEG)
         c, s = np.cos(rad), np.sin(rad)
         if axis == 0: R_inc = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
@@ -343,6 +362,9 @@ class ManualCalibWindow(QtWidgets.QDialog):
         self.update_view()
 
     def keyPressEvent(self, event):
+        """
+        키보드 입력을 해석해 대응 동작을 실행
+        """
         k = event.key()
         if k == QtCore.Qt.Key_Q: self._rotate(0, 1)
         elif k == QtCore.Qt.Key_A: self._rotate(0, -1)
@@ -359,6 +381,9 @@ class ManualCalibWindow(QtWidgets.QDialog):
         event.accept()
 
     def update_view(self):
+        """
+        현재 상태를 기반으로 화면 오버레이와 위젯 표시를 갱신
+        """
         try:
             if self.gui.latest_frame is None or self.gui.cam_K is None: return
             raw_img = self.gui.latest_frame.get("cv_image")
@@ -387,33 +412,48 @@ class ManualCalibWindow(QtWidgets.QDialog):
         except Exception: pass
 
     def _draw_grid_and_axis(self, img, K, cx, cy):
+        """
+        화면 오버레이 도형/선을 안전하게 그린다
+        """
         grid_z = -1.5; grid_color = (0, 255, 0)
         for x in np.arange(-15, 16, 3): self._draw_safe_line(img, [x, 0, grid_z], [x, 100, grid_z], K, cx, cy, grid_color)
         for y in range(0, 101, 10): self._draw_safe_line(img, [-15, y, grid_z], [15, y, grid_z], K, cx, cy, grid_color)
 
 
     def _draw_safe_line(self, img, p1, p2, K, cx, cy, color):
+        """
+        화면 오버레이 도형/선을 안전하게 그린다
+        """
         pts = np.vstack([p1, p2]); uv, v = project_points(K, self.T_current[:3,:3], self.T_current[:3,3], pts)
         if v[0] and v[1]: cv2.line(img, (int(uv[0,0]), int(uv[0,1])), (int(uv[1,0]), int(uv[1,1])), color, 1)
 
     def _save_extrinsic(self):
+        """
+        현재 외부파라미터를 파일로 저장
+        """
         data = { "R": self.T_current[:3, :3].tolist(), "t": self.T_current[:3, 3].flatten().tolist() }
         with open(self.gui.extrinsic_path, 'w') as f: json.dump(data, f, indent=4)
         self.gui.load_extrinsic(); self.close()
 
     def _reset_T(self): 
+        """
+        외부파라미터를 초기 상태로 복원
+        """
         self.T_current = self.T_init.copy()
         self.update_view()
 
     def closeEvent(self, e): 
+        """
+        종료 시 리소스를 정리하고 마무리 처리
+        """
         self._timer.stop() 
         super().closeEvent(e)
 
-# ==============================================================================
-# View Options Dialog
-# ==============================================================================
 class ViewOptionsDialog(QtWidgets.QDialog):
     def __init__(self, gui: 'RealWorldGUI'):
+        """
+        클래스 상태와 UI/리소스를 초기화
+        """
         super().__init__(gui)
         self.gui = gui
         self.setWindowTitle("View Options")
@@ -437,6 +477,9 @@ class ViewOptionsDialog(QtWidgets.QDialog):
         self.move(max(main_geo.x(), x), max(main_geo.y(), y))
 
     def closeEvent(self, event):
+        """
+        종료 시 리소스를 정리하고 마무리 처리
+        """
         # [수정] 위젯을 돌려보내지 않고 창만 숨깁니다 (Hide)
         event.ignore()  # 창이 파괴되는 것을 막음
         self.hide()
@@ -446,6 +489,9 @@ class ViewOptionsDialog(QtWidgets.QDialog):
             self.gui.btn_toggle_vis.setText("👁️ Show View Options")
 
     def closeEvent(self, event):
+        """
+        종료 시 리소스를 정리하고 마무리 처리
+        """
         self.gui.gb_vis.setParent(self._original_parent)
         if self._original_layout is not None:
             self._original_layout.addWidget(self.gui.gb_vis)
@@ -454,9 +500,6 @@ class ViewOptionsDialog(QtWidgets.QDialog):
             self.gui.btn_toggle_vis.setText("👁️ Show View Options")
         super().closeEvent(event)
 
-# ==============================================================================
-# Main GUI - [수정됨: 우측 패널 상단 세로 로고 배치, 전체화면]
-# ==============================================================================
 class RealWorldGUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -469,7 +512,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.bridge = CvBridge()
         pkg_path = rospkg.RosPack().get_path("autocal")
         self.nodes_dir = os.path.join(CURRENT_DIR, "nodes")
-        # extrinsic and lane polygon files are stored in the config folder
         self.extrinsic_path = os.path.join(pkg_path, "config", "extrinsic.json")
         self.lane_json_path = os.path.join(pkg_path, "config", "lane_polys.json")
 
@@ -506,7 +548,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.kf_score = {} # 차량 ID별 점수 칼만 필터 (점수 급락 방지용)
         self.bbox_ref_mode = "bottom"
 
-        # ---------------- Speed estimation memory / smoothing ----------------
         self.vel_memory = {}
         self.vel_hold_sec = 0.6
         self.vel_decay_sec = 0.8
@@ -521,20 +562,13 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self._speed_frame_counter = 0
         self.speed_hard_max_kmh = 280.0
         self.speed_soft_max_kmh = 100.0
-
-        # Data Recording Buffer
         self.data_logger = DataLogger()
-
-        # Buffer for the latest synchronized frame
         self.latest_frame = None
 
         self.load_extrinsic()
         self.load_lane_polys()
         self.init_ui()
 
-        # -------------------------------------------------------------
-        # Time Synchronizer
-        # -------------------------------------------------------------
         image_sub = message_filters.Subscriber(TOPIC_IMAGE, Image)
         radar_sub = message_filters.Subscriber(TOPIC_RADAR, PointCloud2)
 
@@ -562,8 +596,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         
-        # [수정] 전체 레이아웃: 가로 배치 (좌: 뷰어 | 우: 패널)
-        # 상단 헤더 없이 꽉 차게 사용
+        # 전체 레이아웃: 가로 배치 (좌: 뷰어 | 우: 패널)
         layout = QtWidgets.QHBoxLayout(central)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
@@ -611,9 +644,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         vbox.setAlignment(Qt.AlignTop)
         vbox.setSpacing(15)
 
-        # ---------------------------------------------------------
-        # [수정] 로고 영역 (우측 패널 최상단, 세로 배치)
-        # ---------------------------------------------------------
         try:
             rp = rospkg.RosPack()
             pkg_path = rp.get_path("autocal")
@@ -625,16 +655,15 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             pix_skku = QtGui.QPixmap(os.path.join(img_dir, "SKKU.png"))
             pix_motrex = QtGui.QPixmap(os.path.join(img_dir, "Motrex.jpeg"))
             
-            # [수정] 세로 배치이므로 너비 기준으로 스케일링
             # 패널 너비(400) 안쪽으로 들어오게 설정
             if not pix_skku.isNull():
-                # 성대 로고 크게
+                # 성대 로고
                 scaled_skku = pix_skku.scaledToWidth(400, Qt.SmoothTransformation)
                 lbl_skku.setPixmap(scaled_skku)
                 lbl_skku.setAlignment(Qt.AlignCenter)
             
             if not pix_motrex.isNull():
-                # 모트렉스 로고는 상대적으로 작게
+                # 모트렉스 로고
                 scaled_motrex = pix_motrex.scaledToWidth(300, Qt.SmoothTransformation)
                 lbl_motrex.setPixmap(scaled_motrex)
                 lbl_motrex.setAlignment(Qt.AlignCenter)
@@ -647,11 +676,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             
         except Exception as e:
             print(f"Logo load error: {e}")
-
-
-        # ---------------------------------------------------------
-        # 컨트롤 위젯들
-        # ---------------------------------------------------------
 
         # 1. Calibration
         gb_calib = QtWidgets.QGroupBox("1. Calibration")
@@ -764,7 +788,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         self.btn_main_record = QtWidgets.QPushButton("🔴 START MAIN RECORDING")
         self.btn_main_record.setCheckable(True)
-        # 연한 초록색(#CCFFCC) 기본 스타일 설정
         self.btn_main_record.setStyleSheet("""
             QPushButton { 
                 min-height: 50px; font-size: 20px; 
@@ -906,11 +929,17 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.spin_ema_alpha = type('obj', (object,), {'value': lambda: 0.35})
 
     def reset_ids(self):
+        """
+        트래킹/로깅 식별자 상태를 초기화
+        """
         self.lane_counters = {name: 0 for name in self.lane_counters.keys()}
         self.global_to_local_ids = {}
         self.vehicle_lane_paths = {}
 
     def _toggle_view_options(self):
+        """
+        뷰 옵션 토글 상태를 반영
+        """
         # 1. 다이얼로그가 없으면 딱 한 번만 생성
         if self.view_options_dialog is None:
             self.view_options_dialog = ViewOptionsDialog(self)
@@ -930,6 +959,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 self.btn_toggle_vis.setText("👁️ Hide View Options")
 
     def _start_diagnostic_ros(self):
+        """
+        백그라운드 작업 또는 프로세스를 시작
+        """
         if hasattr(self, "btn_diag") and self.btn_diag is not None:
             self.btn_diag.setEnabled(False)
         if hasattr(self, "txt_diag_log") and self.txt_diag_log is not None:
@@ -937,6 +969,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.pub_diag_start.publish(String(data=str(self.bbox_ref_mode)))
 
     def _on_diag_msg(self, msg):
+        """
+        진단 결과 메시지를 수신해 UI에 표시
+        """
         self.latest_diag_msg = msg.data
         self.diag_dirty = True
         if hasattr(self, "btn_diag") and self.btn_diag is not None:
@@ -967,8 +1002,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             return
         self.lbl_record_status.setText("Status: Error")
 
-    # ------------------ Callback (Synchronized) ------------------
     def cb_sync(self, img_msg, radar_msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         # 1) 이미지
         try:
             cv_image = self.bridge.imgmsg_to_cv2(img_msg, "bgr8")
@@ -992,10 +1029,16 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.latest_frame = frame
 
     def cb_info(self, msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         if self.cam_K is None:
             self.cam_K = np.array(msg.K).reshape(3, 3)
 
     def cb_final_result(self, msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         objects = []
         for obj in msg.objects:
             speed_kph = obj.speed_kph
@@ -1012,6 +1055,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.last_update_time = time.time()
 
     def cb_association_result(self, msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         assoc_speeds = {}
         for obj in msg.objects:
             if np.isfinite(obj.speed_kph):
@@ -1020,6 +1066,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.assoc_last_update_time = time.time()
 
     def cb_tracker_result(self, msg):
+        """
+        ROS 콜백 입력 메시지를 내부 상태로 반영
+        """
         if time.time() - self.last_update_time > 0.3:
             objects = []
             for det in msg.detections:
@@ -1031,13 +1080,18 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             self.vis_objects = objects
 
     def get_text_position(self, pts):
+        """
+        텍스트 오버레이 표시 좌표를 계산
+        """
         sorted_indices = np.argsort(pts[:, 1])[::-1]
         bottom_two = pts[sorted_indices[:2]]
         left_idx = np.argmin(bottom_two[:, 0])
         return tuple(bottom_two[left_idx])
 
-    # ------------------ Update Loops ------------------
     def update_loop(self):
+        """
+        현재 상태를 기반으로 화면 오버레이와 위젯 표시를 갱신
+        """
         try:
             self._maybe_reload_extrinsic()
             self._speed_frame_counter += 1
@@ -1199,7 +1253,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 rep_pt = None
                 rep_vel_raw = None
                 score = 0
-                radar_dist = -1.0 # 거리 저장용 변수 초기화
+                radar_dist = -1.0
                 cluster_pt = None
                 cluster_score = 0.0
 
@@ -1253,7 +1307,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 if score_out > 0:
                     speed_scores.append(score_out)
 
-                # --- [DATA LOGGING] ---
                 if self.data_logger.is_recording:
                     data_row = build_record_row(
                         now_ts,
@@ -1300,14 +1353,12 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                  self.lbl_record_status.setText(f"Recording... [{self.data_logger.record_count} pts]")
 
             # 6. 그리기 (Draw)
-            # [수정] "Show Radar Points"가 켜져 있을 때만 노이즈 필터링된 점들을 그림
             if self.chk_show_radar.isChecked() and proj_uvs is not None:
                 for i in range(len(proj_uvs)):
                     if not proj_valid[i]: continue
                     u, v = int(proj_uvs[i, 0]), int(proj_uvs[i, 1])
                     spd = dop_raw[i] * 3.6
                     
-                    # [수정] UI 변수 대신 고정값 사용
                     if abs(spd) < NOISE_MIN_SPEED_KMH: continue
                     
                     col = (0, 255, 255)
@@ -1353,7 +1404,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     cv2.circle(disp, it["cluster_pt"], 6, (255, 255, 255), 1)
 
                 if it["rep_pt"] is not None and self.chk_show_rep_points.isChecked():
-                    # [수정] 대표점은 체크박스 없이 항상 그림 (단, 속도가 노이즈 이상일 때)
                     rv = it["rep_vel"]
                     if rv is not None and abs(rv) >= NOISE_MIN_SPEED_KMH:
                         col = (0, 255, 255)
@@ -1405,27 +1455,41 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             traceback.print_exc()
             
     def open_lane_editor(self):
+        """
+        차선 편집 다이얼로그를 연다
+        """
         if self.cv_image is None:
             return
         dlg = LaneEditorDialog(self.cv_image, self.lane_polys, self)
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             self.lane_polys = dlg.get_polys()
             self.save_lane_polys()
-            # self.lbl_log.setText("Lane Polygons Updated.") (로그 라벨 제거됨)
 
     def save_lane_polys(self):
+        """
+        현재 차선 폴리곤을 파일로 저장
+        """
         lane_utils.save_lane_polys(self.lane_json_path, self.lane_polys)
 
     def load_lane_polys(self):
+        """
+        설정 파일을 읽어 내부 데이터 구조를 갱신
+        """
         try:
             self.lane_polys = lane_utils.load_lane_polys(self.lane_json_path)
         except Exception:
             self.lane_polys = {}
 
     def load_extrinsic(self):
+        """
+        설정 파일을 읽어 내부 데이터 구조를 갱신
+        """
         calibration_utils.load_extrinsic(self)
 
     def bbox_ref_label(self) -> str:
+        """
+        현재 bbox 기준점 모드 라벨을 반환
+        """
         if self.bbox_ref_mode == "top":
             return "Top Center"
         if self.bbox_ref_mode == "center":
@@ -1433,6 +1497,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         return "Bottom Center"
 
     def set_bbox_ref_mode_from_label(self, label: str) -> None:
+        """
+        라벨 문자열을 기준점 모드로 변환해 적용
+        """
         label = (label or "").lower()
         if "top" in label:
             self.bbox_ref_mode = "top"
@@ -1446,12 +1513,21 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 self.cmb_bbox_ref.setCurrentText(target_label)
 
     def run_calibration(self):
+        """
+        캘리브레이션 실행 절차를 시작
+        """
         calibration_utils.run_calibration(self, ManualCalibWindow)
 
     def run_autocalibration(self):
+        """
+        캘리브레이션 실행 절차를 시작
+        """
         calibration_utils.run_autocalibration(self)
 
     def _on_extrinsic_stdout(self):
+        """
+        외부 프로세스 표준출력 로그를 수신해 화면에 반영
+        """
         if not hasattr(self, "extrinsic_proc") or self.extrinsic_proc is None:
             return
         data = bytes(self.extrinsic_proc.readAllStandardOutput()).decode("utf-8", errors="ignore")
@@ -1460,6 +1536,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.txt_extrinsic_log.appendPlainText(data.rstrip())
 
     def _on_extrinsic_stderr(self):
+        """
+        외부 프로세스 표준에러 로그를 수신해 화면에 반영
+        """
         if not hasattr(self, "extrinsic_proc") or self.extrinsic_proc is None:
             return
         data = bytes(self.extrinsic_proc.readAllStandardError()).decode("utf-8", errors="ignore")
@@ -1468,15 +1547,24 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.txt_extrinsic_log.appendPlainText(data.rstrip())
 
     def _on_extrinsic_finished(self):
+        """
+        외부 프로세스 종료 결과를 처리하고 후속 상태를 갱신
+        """
         if hasattr(self, "pbar_extrinsic") and self.pbar_extrinsic is not None:
             self.pbar_extrinsic.setVisible(False)
         # 오류 수정: 문자열 내 실제 줄바꿈 제거
         self.txt_extrinsic_log.appendPlainText("[Extrinsic] DONE.")
 
     def run_intrinsic_calibration(self):
+        """
+        캘리브레이션 실행 절차를 시작
+        """
         calibration_utils.run_intrinsic_calibration(self)
 
     def _on_intrinsic_stdout(self):
+        """
+        외부 프로세스 표준출력 로그를 수신해 화면에 반영
+        """
         if not hasattr(self, "intrinsic_proc") or self.intrinsic_proc is None:
             return
         data = bytes(self.intrinsic_proc.readAllStandardOutput()).decode("utf-8", errors="ignore")
@@ -1491,6 +1579,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             self.pbar_intrinsic.setValue(min(selected, 45))
 
     def _on_intrinsic_stderr(self):
+        """
+        외부 프로세스 표준에러 로그를 수신해 화면에 반영
+        """
         if not hasattr(self, "intrinsic_proc") or self.intrinsic_proc is None:
             return
         data = bytes(self.intrinsic_proc.readAllStandardError()).decode("utf-8", errors="ignore")
@@ -1499,6 +1590,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.txt_intrinsic_log.appendPlainText(data.rstrip())
 
     def _on_intrinsic_finished(self, exit_code, exit_status):
+        """
+        외부 프로세스 종료 결과를 처리하고 후속 상태를 갱신
+        """
         try:
             self.pbar_intrinsic.setVisible(False)
             rp = rospkg.RosPack()
@@ -1518,6 +1612,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             traceback.print_exc()
 
     def _maybe_reload_extrinsic(self):
+        """
+        파일 변경 여부를 확인해 필요 시 설정을 재로딩
+        """
         if not os.path.exists(self.extrinsic_path):
             return
         try:

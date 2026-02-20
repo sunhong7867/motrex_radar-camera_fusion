@@ -1,4 +1,5 @@
-# config/detector.yaml
+# detector.yaml
+# 객체 검출기 모델/런타임/토픽 설정.
 
 detector:
   weights: "$(find autocal)/models/yolo11m.pt"
@@ -6,11 +7,11 @@ detector:
   conf_thres: 0.25                            
   iou_thres: 0.45
   device: "cuda:0"
-  classes: [2, 3, 5, 7] # car, motorcycle, bus, truck
+  classes: [2, 3, 5, 7] # COCO 클래스: car, motorcycle, bus, truck
 
 runtime:
   half: true
-  agnostic_nms: true  # false -> true (클래스 무관하게 겹치면 제거)
+  agnostic_nms: true  # 클래스 무관 NMS 사용
   verbose: false
   brightness_enable: false
   brightness_gain: 1.0

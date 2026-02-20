@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+역할:
+- 레이더 포인트를 전처리하고 클러스터링해 차량 후보를 추출한 뒤 bbox 마커를 생성한다.
+- 속도/거리/형상 조건으로 클러스터를 선별해 차량 유사 객체만 시각화한다.
+- 디버그 마커, 윤곽선, 텍스트를 함께 발행해 파라미터 튜닝과 검증을 지원한다.
+
+입력:
+- `~in_topic` (`sensor_msgs/PointCloud2`): 레이더 포인트 입력.
+- `~*` 파라미터: 전처리, 클러스터링, 차량 유사 필터, 마커 렌더링 설정.
+
+출력:
+- `~pub` (`visualization_msgs/MarkerArray`): 포인트/박스/텍스트 시각화 결과.
+"""
+
 import rospy
 import numpy as np
 
@@ -11,34 +25,27 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 
 
-# -------------------------
-# Defaults (can be overridden by ROS params)
-# -------------------------
-DEFAULT_MIN_SPEED_MPS = 1.0
-DEFAULT_MIN_POWER = None
-DEFAULT_MAX_FORWARD_M = 200.0
-DEFAULT_MIN_FORWARD_M = 0.0
-
-DEFAULT_CLUSTER_MAX_DIST_M = 1.0
-DEFAULT_CLUSTER_MIN_POINTS = 4 
-
-# Vehicle-like filter defaults
-DEFAULT_USE_VEHICLE_FILTER = True
-DEFAULT_VEH_MIN_WIDTH_M  = 0.6
-DEFAULT_VEH_MAX_WIDTH_M  = 4.0
-DEFAULT_VEH_MIN_LENGTH_M = 1.2
-DEFAULT_VEH_MAX_LENGTH_M = 12.0
-DEFAULT_MIN_ASPECT_YX = 1.4
-DEFAULT_MAX_DOPPLER_STD = 3.0 
+# ---------------------------------------------------------
+# 레이더 클러스터 bbox 파라미터
+# ---------------------------------------------------------
+DEFAULT_MIN_SPEED_MPS = 1.0          # 이동점으로 간주할 최소 속도(m/s)
+DEFAULT_MIN_POWER = None             # 최소 파워 필터(None이면 미사용)
+DEFAULT_MAX_FORWARD_M = 200.0        # 전방 최대 거리 제한(m)
+DEFAULT_MIN_FORWARD_M = 0.0          # 전방 최소 거리 제한(m)
+DEFAULT_CLUSTER_MAX_DIST_M = 1.0     # 클러스터 이웃 거리 임계값(m)
+DEFAULT_CLUSTER_MIN_POINTS = 4       # 클러스터 최소 포인트 수
+DEFAULT_USE_VEHICLE_FILTER = True    # 차량 유사 필터 사용 여부
+DEFAULT_VEH_MIN_WIDTH_M  = 0.6       # 차량 폭 하한(m)
+DEFAULT_VEH_MAX_WIDTH_M  = 4.0       # 차량 폭 상한(m)
+DEFAULT_VEH_MIN_LENGTH_M = 1.2       # 차량 길이 하한(m)
+DEFAULT_VEH_MAX_LENGTH_M = 12.0      # 차량 길이 상한(m)
+DEFAULT_MIN_ASPECT_YX = 1.4          # 최소 세로/가로 비율
+DEFAULT_MAX_DOPPLER_STD = 3.0        # 도플러 표준편차 상한(m/s)
 DEFAULT_MIN_MEDIAN_SPEED = 0.4 / 3.6  # m/s
-
-# BBox shaping defaults
-DEFAULT_BBOX_PADDING_X = 0.30
-DEFAULT_BBOX_PADDING_Y = 0.80
-DEFAULT_TARGET_ASPECT_YX = 2.2
-
-# Doppler robust stats
-DEFAULT_TRIM_RATIO = 0.2  # 상하 20% 제거
+DEFAULT_BBOX_PADDING_X = 0.30        # bbox 가로 패딩(m)
+DEFAULT_BBOX_PADDING_Y = 0.80        # bbox 세로 패딩(m)
+DEFAULT_TARGET_ASPECT_YX = 2.2       # 목표 세로/가로 비율
+DEFAULT_TRIM_RATIO = 0.2             # 상하 20% 제거
 
 
 def trimmed_mean(arr: np.ndarray, trim_ratio: float = 0.2) -> float:
@@ -68,7 +75,9 @@ def trimmed_mean(arr: np.ndarray, trim_ratio: float = 0.2) -> float:
 
 
 def cluster_points_xy(points_xy: np.ndarray, max_dist: float, min_points: int):
-    """Light BFS clustering for small N."""
+    """
+    XY 평면에서 BFS 방식으로 인접 포인트 클러스터를 구성
+    """
     n = points_xy.shape[0]
     if n == 0:
         return []
@@ -103,43 +112,46 @@ def cluster_points_xy(points_xy: np.ndarray, max_dist: float, min_points: int):
 
 class RadarClusterBBoxViz:
     def __init__(self):
-        # topics / frames
+        """
+        파라미터, 토픽, 렌더링 옵션, 구독/발행 객체를 초기화
+        """
+        # 토픽 및 좌표계 설정
         self.in_topic = rospy.get_param("~in_topic", "/point_cloud")
         self.pub_topic = rospy.get_param("~pub", "/radar/cluster_viz")
 
-        # frame policy
+        # 프레임 선택 정책
         self.frame_id_param = rospy.get_param("~frame_id", "retina_link")
         self.use_msg_frame = rospy.get_param("~use_msg_frame", True)  # 권장: True
 
-        # rendering params
+        # 렌더링 파라미터
         self.point_scale = rospy.get_param("~point_scale", 0.8)
         self.z_value = rospy.get_param("~z", 0.0)
         self.bbox_line_width = rospy.get_param("~bbox_width", 0.12)
         self.bbox_alpha = rospy.get_param("~bbox_alpha", 0.18)
         self.draw_text = rospy.get_param("~draw_text", False)
         self.text_size = rospy.get_param("~text_size", 3)
-        self.marker_lifetime = rospy.get_param("~lifetime", 0.25)  # seconds
+        self.marker_lifetime = rospy.get_param("~lifetime", 0.25)  # 마커 유지 시간(초)
 
-        # selection options
+        # 선택 표시 옵션
         self.only_nearest = rospy.get_param("~only_nearest", False)
         self.max_boxes = rospy.get_param("~max_boxes", 20)
 
-        # debug / viz options
+        # 디버그 및 시각화 옵션
         self.debug = rospy.get_param("~debug", True)
         self.show_all_clusters = rospy.get_param("~show_all_clusters", True)
         self.use_vehicle_filter = rospy.get_param("~use_vehicle_filter", DEFAULT_USE_VEHICLE_FILTER)
 
-        # preprocessing params
+        # 전처리 파라미터
         self.min_speed_mps = float(rospy.get_param("~min_speed_mps", DEFAULT_MIN_SPEED_MPS))
         self.min_power = rospy.get_param("~min_power", DEFAULT_MIN_POWER)
         self.max_forward_m = float(rospy.get_param("~max_forward_m", DEFAULT_MAX_FORWARD_M))
         self.min_forward_m = float(rospy.get_param("~min_forward_m", DEFAULT_MIN_FORWARD_M))
 
-        # clustering params
+        # 클러스터링 파라미터
         self.cluster_max_dist_m = float(rospy.get_param("~cluster_max_dist_m", DEFAULT_CLUSTER_MAX_DIST_M))
         self.cluster_min_points = int(rospy.get_param("~cluster_min_points", DEFAULT_CLUSTER_MIN_POINTS))
 
-        # vehicle-like params
+        # 차량 유사 필터 파라미터
         self.veh_min_w = float(rospy.get_param("~veh_min_width_m", DEFAULT_VEH_MIN_WIDTH_M))
         self.veh_max_w = float(rospy.get_param("~veh_max_width_m", DEFAULT_VEH_MAX_WIDTH_M))
         self.veh_min_l = float(rospy.get_param("~veh_min_length_m", DEFAULT_VEH_MIN_LENGTH_M))
@@ -148,10 +160,10 @@ class RadarClusterBBoxViz:
         self.max_doppler_std = float(rospy.get_param("~max_doppler_std", DEFAULT_MAX_DOPPLER_STD))
         self.min_median_speed = float(rospy.get_param("~min_median_speed_mps", DEFAULT_MIN_MEDIAN_SPEED))
 
-        # robust doppler
+        # 도플러 강건 통계 파라미터
         self.trim_ratio = float(rospy.get_param("~trim_ratio", DEFAULT_TRIM_RATIO))
 
-        # bbox shaping
+        # bbox 형상 보정 파라미터
         self.pad_x = float(rospy.get_param("~bbox_padding_x", DEFAULT_BBOX_PADDING_X))
         self.pad_y = float(rospy.get_param("~bbox_padding_y", DEFAULT_BBOX_PADDING_Y))
         self.target_aspect_yx = float(rospy.get_param("~target_aspect_yx", DEFAULT_TARGET_ASPECT_YX))
@@ -160,11 +172,17 @@ class RadarClusterBBoxViz:
         self.pub = rospy.Publisher(self.pub_topic, MarkerArray, queue_size=1)
 
     def _header(self, msg):
+        """
+        마커 발행에 사용할 frame_id와 stamp를 결정
+        """
         frame_id = msg.header.frame_id if self.use_msg_frame and msg.header.frame_id else self.frame_id_param
         stamp = msg.header.stamp
         return frame_id, stamp
 
     def _mk_deleteall(self, frame_id, stamp):
+        """
+        이전 프레임 마커를 삭제하기 위한 DELETEALL 마커 생성
+        """
         m = Marker()
         m.header.frame_id = frame_id
         m.header.stamp = stamp
@@ -174,6 +192,9 @@ class RadarClusterBBoxViz:
         return m
 
     def _mk_points_marker(self, frame_id, stamp, mid, ns, xs, ys, rgba):
+        """
+        포인트 집합을 POINTS 마커로 생성
+        """
         m = Marker()
         m.header.frame_id = frame_id
         m.header.stamp = stamp
@@ -193,6 +214,9 @@ class RadarClusterBBoxViz:
         return m
 
     def _mk_bbox_cube(self, frame_id, stamp, mid, ns, cx, cy, w, l, rgba):
+        """
+        중심/크기 기반 bbox CUBE 마커를 생성
+        """
         m = Marker()
         m.header.frame_id = frame_id
         m.header.stamp = stamp
@@ -214,6 +238,9 @@ class RadarClusterBBoxViz:
         return m
 
     def _mk_bbox_outline(self, frame_id, stamp, mid, ns, xmin, xmax, ymin, ymax, rgba):
+        """
+        bbox 사각 외곽선을 LINE_STRIP 마커로 생성
+        """
         m = Marker()
         m.header.frame_id = frame_id
         m.header.stamp = stamp
@@ -232,6 +259,9 @@ class RadarClusterBBoxViz:
         return m
 
     def _mk_text(self, frame_id, stamp, mid, ns, x, y, text, rgba):
+        """
+        클러스터 정보 텍스트 마커를 생성
+        """
         m = Marker()
         m.header.frame_id = frame_id
         m.header.stamp = stamp
@@ -252,7 +282,10 @@ class RadarClusterBBoxViz:
         return m
 
     def _vehicle_like_filter(self, width, length, npts, v_rep, v_std):
-        # v_rep: 대표 속도(지금은 trimmed mean)
+        """
+        폭/길이/속도 통계로 차량 유사 클러스터 여부를 판정
+        """
+        # v_rep: 대표 속도(현재는 trimmed mean 사용)
         if npts < self.cluster_min_points:
             return False
         if width < self.veh_min_w or width > self.veh_max_w:
@@ -268,6 +301,9 @@ class RadarClusterBBoxViz:
         return True
 
     def _make_vertical_bbox(self, xmin, xmax, ymin, ymax):
+        """
+        패딩과 목표 종횡비를 반영해 세로형 bbox를 보정
+        """
         xmin2 = xmin - self.pad_x
         xmax2 = xmax + self.pad_x
         ymin2 = ymin - self.pad_y
@@ -285,9 +321,12 @@ class RadarClusterBBoxViz:
         return xmin2, xmax2, ymin2, ymax2
 
     def cb(self, msg: PointCloud2):
+        """
+        포인트 전처리, 클러스터링, bbox 계산 후 MarkerArray를 발행
+        """
         frame_id, stamp = self._header(msg)
 
-        # 항상 DELETEALL 먼저 publish (잔상 제거 확실)
+        # 잔상 제거를 위해 DELETEALL 마커를 먼저 추가
         ma = MarkerArray()
         ma.markers.append(self._mk_deleteall(frame_id, stamp))
 
@@ -305,7 +344,7 @@ class RadarClusterBBoxViz:
         power = pts[:, 3]
         doppler = pts[:, 4]
 
-        # ROI
+        # ROI 필터 적용
         roi = (y >= self.min_forward_m) & (y <= self.max_forward_m)
         if self.min_power is not None:
             roi &= (power >= float(self.min_power))
@@ -317,7 +356,7 @@ class RadarClusterBBoxViz:
             self.pub.publish(ma)
             return
 
-        # moving
+        # 이동점 필터 적용
         moving = (np.abs(doppler) >= self.min_speed_mps)
         xv = x[moving]; yv = y[moving]; zv = z[moving]; dv = doppler[moving]
         moving_pts = int(xv.size)
@@ -331,7 +370,7 @@ class RadarClusterBBoxViz:
             self.pub.publish(ma)
             return
 
-        # clustering
+        # 클러스터링 수행
         pts_xy = np.column_stack((xv, yv))
         clusters = cluster_points_xy(pts_xy, self.cluster_max_dist_m, self.cluster_min_points)
         n_clusters = int(len(clusters))
@@ -356,7 +395,7 @@ class RadarClusterBBoxViz:
             width = xmax - xmin
             length = ymax - ymin
 
-            # ★ 변경: 대표 속도 = 상하 trim_ratio 제거 후 평균
+            # 대표 속도는 상하 trim_ratio 제거 평균으로 계산
             v_rep = trimmed_mean(cd, trim_ratio=self.trim_ratio)
             v_std = float(np.std(cd))
 
@@ -414,7 +453,7 @@ class RadarClusterBBoxViz:
             xmid = 0.5 * (xmin2 + xmax2)
             ymid = 0.5 * (ymin2 + ymax2)
 
-            # green bbox
+            # 녹색 bbox 마커 추가
             ma.markers.append(self._mk_bbox_cube(
                 frame_id, stamp, bbox_id, "bbox_fill",
                 xmid, ymid, w2, l2,
@@ -430,7 +469,7 @@ class RadarClusterBBoxViz:
             outline_id += 1
 
             if self.draw_text:
-                # ★ 변경: v_rep 사용
+                # 텍스트에는 대표 속도 v_rep를 사용
                 txt = f"r={r:.1f}m v={v_rep*3.6:.1f}km/h n={npts}"
                 ma.markers.append(self._mk_text(
                     frame_id, stamp, text_id, "bbox_text",
@@ -439,7 +478,7 @@ class RadarClusterBBoxViz:
                 ))
                 text_id += 1
 
-        # points
+        # 포인트 마커 추가
         if len(pts_app_x) > 0:
             ma.markers.append(self._mk_points_marker(
                 frame_id, stamp, 1, "approaching_pts",
