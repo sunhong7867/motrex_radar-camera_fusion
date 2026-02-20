@@ -1,0 +1,14 @@
+{
+  "active_source": "default",
+  "sources": {
+    "default": {
+      "bag_path": "$(find autocal)/models/rosbag/overbridge0.bag",
+      "intrinsic_path": "$(find autocal)/config/camera_intrinsic.yaml",
+      "bag_image_topic": "/camera/image_raw",
+      "bag_radar_topic": "/point_cloud",
+      "out_image_topic": "/camera/image_raw",
+      "out_radar_topic": "/point_cloud",
+      "out_info_topic": "/camera/camera_info"
+    }
+  }
+}

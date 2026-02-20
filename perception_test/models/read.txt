@@ -1,3 +1,0 @@
-cd ~/motrex/catkin_ws/src/perception_test/models
-rosparam set use_sim_time true
-rosbag play --clock my_test_data.bag

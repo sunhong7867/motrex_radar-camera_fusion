@@ -1,0 +1,55 @@
+[Perception Test Package - Offline Mode]
+
+1. Build Package
+cd ~/motrex/catkin_ws
+catkin_make
+
+2. Source Environment
+source devel/setup.bash
+
+3. Execution Steps
+
+   (A) One-shot Consumer Calibration (Perception + Consumer GUI together)
+roslaunch autocal autocal.launch
+
+   (B) Developer flow (Perception + real_gui together)
+roslaunch autocal autocal_dev.launch
+
+4. Notes
+   - Ensure 'test_video.mp4' and 'log.csv' are in the 'models' folder.
+   - If permission denied:
+
+chmod +x src/autocal/src/nodes/*.py
+chmod +x src/autocal/src/*.py
+
+chmod +x ~/motrex/catkin_ws/src/autocal/src/nodes/radar_cluster_bbox_viz.py
+rosrun autocal radar_cluster_bbox_viz.py _frame_id:=retina_link _point_scale:=0.8 _bbox_width:=0.15
+rosrun autocal radar_cluster_bbox_viz.py _frame_id:=retina_link _draw_text:=true _text_size:=3
+___________________________________________________________________________
+cd ~/motrex/catkin_ws/src/autocal/models
+rosparam set use_sim_time true
+rosbag play --clock test0.bag
+
+RROR bag unindexed
+rosbag reindex /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/test0.bag
+rosbag info /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/test0.bag
+___________________________________________________________________________
+
+
+그래프 용
+rosrun plotjuggler plotjuggler
+
+
+업그레이드
+pip3 install --upgrade pandas
+pip3 install --upgrade numexpr
+
+5. Live sensor / Rosbag 전환 (주석으로 전환)
+   - 기본은 Rosbag 모드(offline_provider 노드 활성)
+     roslaunch autocal autocal_dev.launch
+
+   - 실센서 모드는 launch 파일에서 offline_provider 노드 블록을 주석 처리 후 실행
+     roslaunch autocal autocal_dev.launch
+
+6. Consumer GUI 포함 실행
+   roslaunch autocal autocal.launch

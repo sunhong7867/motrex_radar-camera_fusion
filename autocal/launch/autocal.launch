@@ -1,0 +1,28 @@
+<launch>
+  <arg name="image_topic" default="/camera/image_raw"/>
+  <arg name="radar_topic" default="/point_cloud"/>
+  <arg name="output_topic" default="/autocal/output"/>
+  <arg name="tracks_topic" default="/autocal/tracks"/>
+  <arg name="extrinsic_path" default="$(find autocal)/config/extrinsic.json"/>
+  <arg name="autocal_rounds" default="1"/>
+  <arg name="bbox_ref_mode" default="bottom"/>
+
+  <include file="$(find autocal)/launch/autocal_dev.launch">
+    <arg name="image_topic" value="$(arg image_topic)"/>
+    <arg name="radar_topic" value="$(arg radar_topic)"/>
+    <arg name="launch_real_gui" value="false"/>
+  </include>
+
+  <node pkg="autocal"
+        type="gui.py"
+        name="consumer_gui"
+        output="screen">
+    <param name="image_topic" value="$(arg image_topic)"/>
+    <param name="output_topic" value="$(arg output_topic)"/>
+    <param name="tracks_topic" value="$(arg tracks_topic)"/>
+    <param name="extrinsic_path" value="$(arg extrinsic_path)"/>
+    <param name="autocal_rounds" value="$(arg autocal_rounds)"/>
+    <param name="bbox_ref_mode" value="$(arg bbox_ref_mode)"/>
+    <param name="autostart" value="true"/>
+  </node>
+</launch>
