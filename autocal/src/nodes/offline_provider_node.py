@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import json
-import yaml
 import rospy
 import rosbag
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2
@@ -30,7 +29,7 @@ class OfflineProvider:
         
         # 기본값 설정 (launch 파일에서 변경 가능)
         self.bag_path = rospy.get_param('~bag_path', os.path.join(pkg_path, 'models/my_test_data.bag'))
-        self.intrinsic_path = rospy.get_param('~intrinsic_path', os.path.join(pkg_path, 'config/camera_intrinsic.yaml'))
+        self.intrinsic_path = rospy.get_param('~intrinsic_path', os.path.join(pkg_path, 'config/intrinsic.json'))
         
         # 토픽 이름 설정 (Bag 파일 내부의 토픽 명 -> 발행할 토픽 명)
         # 만약 Bag 파일 안의 토픽 이름과 시스템에서 쓰는 이름이 다르면 여기서 매칭해줍니다.
@@ -78,23 +77,29 @@ class OfflineProvider:
         except Exception as exc:
             rospy.logwarn(f"Failed to load sources_json '{self.sources_json}': {exc}")
             
-    def load_camera_info(self, yaml_path):
-        """camera_intrinsic.yaml 파일을 읽어 CameraInfo 메시지 생성"""
+    def load_camera_info(self, json_path):
+        """intrinsic.json 파일을 읽어 CameraInfo 메시지 생성"""
         ci = CameraInfo()
         try:
-            with open(yaml_path, 'r') as f:
-                calib_data = yaml.safe_load(f)
-                
-            info_sec = calib_data.get('camera_info', {})
-            ci.width = calib_data.get('camera_spec', {}).get('resolution', {}).get('width', 1920)
-            ci.height = calib_data.get('camera_spec', {}).get('resolution', {}).get('height', 1200)
-            ci.distortion_model = info_sec.get('distortion_model', 'plumb_bob')
-            ci.D = info_sec.get('D', [0]*5)
-            ci.K = info_sec.get('K', [0]*9)
-            ci.R = info_sec.get('R', [1,0,0, 0,1,0, 0,0,1])
-            ci.P = info_sec.get('P', [0]*12)
+            with open(json_path, 'r', encoding='utf-8') as f:
+                calib_data = json.load(f)
+
+            image_size = calib_data.get('image_size', {}) if isinstance(calib_data, dict) else {}
+            ci.width = int(image_size.get('width', 1920))
+            ci.height = int(image_size.get('height', 1200))
+            ci.distortion_model = calib_data.get('distortion_model', 'plumb_bob')
+
+            d = calib_data.get('D', [0.0] * 5)
+            k = calib_data.get('K', [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+            r = calib_data.get('R', [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+            p = calib_data.get('P', [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+
+            ci.D = [float(x) for x in d]
+            ci.K = [float(x) for row in k for x in row]
+            ci.R = [float(x) for row in r for x in row]
+            ci.P = [float(x) for row in p for x in row]
         except Exception as e:
-            rospy.logwarn(f"Failed to parse camera_intrinsic.yaml: {e}. Using empty CameraInfo.")
+            rospy.logwarn(f"Failed to parse intrinsic.json: {e}. Using empty CameraInfo.")
         return ci
 
     def run(self):

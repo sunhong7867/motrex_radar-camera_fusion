@@ -1,4 +1,24 @@
-[Perception Test Package - Offline Mode]
+radar:
+  model: RETINA-4FN
+  pointcloud_topic: /point_cloud
+  frame_id: retina_link
+  fields:
+    - { name: x,       type: float32, unit: m }
+    - { name: y,       type: float32, unit: m }
+    - { name: z,       type: float32, unit: m }
+    - { name: power,   type: float32, unit: arbitrary }
+    - { name: doppler, type: float32, unit: mps }
+
+camera:
+  model: MV-GE231GC-M
+  image_topic: /camera/image_raw
+  camera_info_topic: /camera/camera_info
+  optical_frame_id: camera_optical_frame
+
+frames:
+  radar_frame: retina_link
+  camera_frame: camera_optical_frame
+
 
 1. Build Package
 cd ~/motrex/catkin_ws
@@ -15,10 +35,6 @@ roslaunch autocal autocal.launch
    (B) Developer flow (Perception + real_gui together)
 roslaunch autocal autocal_dev.launch
 
-4. Notes
-   - Ensure 'test_video.mp4' and 'log.csv' are in the 'models' folder.
-   - If permission denied:
-
 chmod +x src/autocal/src/nodes/*.py
 chmod +x src/autocal/src/*.py
 
@@ -28,28 +44,13 @@ rosrun autocal radar_cluster_bbox_viz.py _frame_id:=retina_link _draw_text:=true
 ___________________________________________________________________________
 cd ~/motrex/catkin_ws/src/autocal/models
 rosparam set use_sim_time true
-rosbag play --clock test0.bag
+rosbag play --clock test.bag
 
 RROR bag unindexed
-rosbag reindex /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/test0.bag
-rosbag info /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/test0.bag
+rosbag reindex /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/test.bag
+rosbag info /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/test.bag
 ___________________________________________________________________________
-
-
-그래프 용
-rosrun plotjuggler plotjuggler
-
 
 업그레이드
 pip3 install --upgrade pandas
 pip3 install --upgrade numexpr
-
-5. Live sensor / Rosbag 전환 (주석으로 전환)
-   - 기본은 Rosbag 모드(offline_provider 노드 활성)
-     roslaunch autocal autocal_dev.launch
-
-   - 실센서 모드는 launch 파일에서 offline_provider 노드 블록을 주석 처리 후 실행
-     roslaunch autocal autocal_dev.launch
-
-6. Consumer GUI 포함 실행
-   roslaunch autocal autocal.launch

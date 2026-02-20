@@ -69,7 +69,7 @@ def run_intrinsic_calibration(gui):
         rp = rospkg.RosPack()
         pkg_path = rp.get_path("autocal")
         image_dir = os.path.join(pkg_path, "image")
-        out_yaml = os.path.join(pkg_path, "config", "camera_intrinsic.yaml")
+        out_json = os.path.join(pkg_path, "config", "intrinsic.json")
 
         if not os.path.isdir(image_dir):
             print(f"[Intrinsic] image dir not found: {image_dir}")
@@ -107,7 +107,7 @@ def run_intrinsic_calibration(gui):
             f"source {setup_bash} && "
             f"rosrun autocal calibration_in_node.py "
             f"_image_dir:={image_dir} "
-            f"_output_path:={out_yaml} "
+            f"_output_path:={out_json} "
             f"_board/width:=10 _board/height:=7 _board/square_size:=0.025 "
             f"_min_samples:=20 _max_selected:=45 _grid_size_mm:=50 "
             f"_save_selected:=true _save_undistort:=true"

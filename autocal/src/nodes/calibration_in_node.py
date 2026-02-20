@@ -16,7 +16,7 @@ Key improvements:
   * In offline calibration, logs a message just before running
     `cv2.calibrateCamera` to indicate that computation is in progress.
   * Retains all original functionality, including AutoImagePicker
-    behavior and YAML/JSON writing.
+    behavior and intrinsic.json writing.
 
 Usage parameters mirror the original `calibration_in_node.py`.
 """
@@ -32,7 +32,6 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import rospy
-import yaml
 
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
@@ -247,11 +246,8 @@ class CameraIntrinsicCalibrator:
 
         self.image_dir = rospy.get_param('~image_dir', '')
 
-        default_yaml = os.path.join(RosPack().get_path('autocal'), 'config', 'camera_intrinsic.yaml')
-        self.output_path = resolve_ros_path(rospy.get_param('~output_path', default_yaml))
-
-        self.json_output_path = rospy.get_param('~json_output_path', '')
-        self.json_output_path = resolve_ros_path(self.json_output_path) if self.json_output_path else ''
+        default_json = os.path.join(RosPack().get_path('autocal'), 'config', 'intrinsic.json')
+        self.output_path = resolve_ros_path(rospy.get_param('~output_path', default_json))
 
         self.save_selected = bool(rospy.get_param('~save_selected', True))
         self.save_undistort = bool(rospy.get_param('~save_undistort', True))
@@ -296,50 +292,9 @@ class CameraIntrinsicCalibrator:
         a = np.array(arr).reshape(-1)
         return [float(x) for x in a.tolist()]
 
-    def _write_yaml_and_json(self, K: np.ndarray, D: np.ndarray, img_w: int, img_h: int) -> None:
-        # YAML 업데이트
-        data = {}
-        if os.path.exists(self.output_path):
-            with open(self.output_path, 'r', encoding='utf-8') as f:
-                try:
-                    data = yaml.safe_load(f) or {}
-                except Exception:
-                    data = {}
-
-        data.setdefault('camera_spec', {})
-        data.setdefault('camera_info', {})
-        data['camera_spec'].setdefault('resolution', {})
-        data['camera_spec']['resolution']['width'] = int(img_w)
-        data['camera_spec']['resolution']['height'] = int(img_h)
-
-        data['camera_info']['distortion_model'] = data['camera_info'].get('distortion_model', 'plumb_bob')
-
+    def _write_intrinsic_json(self, K: np.ndarray, D: np.ndarray, img_w: int, img_h: int) -> None:
         fx, fy = float(K[0, 0]), float(K[1, 1])
         cx, cy = float(K[0, 2]), float(K[1, 2])
-
-        data['camera_info']['K'] = self._safe_float_list(K.reshape(9))
-        data['camera_info']['D'] = self._safe_float_list(D.reshape(-1))
-
-        data['camera_info'].setdefault('R', [1.0, 0.0, 0.0,
-                                             0.0, 1.0, 0.0,
-                                             0.0, 0.0, 1.0])
-
-        data['camera_info']['P'] = [
-            fx, 0.0, cx, 0.0,
-            0.0, fy, cy, 0.0,
-            0.0, 0.0, 1.0, 0.0
-        ]
-
-        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
-        with open(self.output_path, 'w', encoding='utf-8') as f:
-            yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
-
-        rospy.loginfo(f"[Intrinsic] YAML saved: {self.output_path}")
-
-        # JSON: 기본은 yaml 옆 intrinsic.json
-        json_path = self.json_output_path
-        if not json_path:
-            json_path = os.path.join(os.path.dirname(self.output_path), "intrinsic.json")
 
         K3 = [[float(K[r, c]) for c in range(3)] for r in range(3)]
         P3x4 = [
@@ -349,7 +304,8 @@ class CameraIntrinsicCalibrator:
         ]
         Dlist = self._safe_float_list(D.reshape(-1))
 
-        with open(json_path, 'w', encoding='utf-8') as f:
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        with open(self.output_path, 'w', encoding='utf-8') as f:
             json.dump({
                 "image_size": {"width": int(img_w), "height": int(img_h)},
                 "distortion_model": "plumb_bob",
@@ -359,7 +315,7 @@ class CameraIntrinsicCalibrator:
                 "P": P3x4
             }, f, indent=2)
 
-        rospy.loginfo(f"[Intrinsic] JSON saved: {json_path}")
+        rospy.loginfo(f"[Intrinsic] JSON saved: {self.output_path}")
 
     def _undistort_and_save(self, img_paths: List[str], out_dir: str, K: np.ndarray, D: np.ndarray, img_size: Tuple[int, int]):
         os.makedirs(out_dir, exist_ok=True)
@@ -462,8 +418,7 @@ class CameraIntrinsicCalibrator:
         rospy.loginfo(
             f"[Intrinsic] Calibration done. Selected={len(used_color_paths)} | image_size=({img_w},{img_h})"
         )
-        # float 캐스팅 + safe_dump + JSON 저장
-        self._write_yaml_and_json(K, D, img_w, img_h)
+        self._write_intrinsic_json(K, D, img_w, img_h)
         if self.save_undistort:
             self._undistort_and_save(used_color_paths, undist_dir, K, D, (img_w, img_h))
         rospy.loginfo("[Intrinsic] Offline calibration complete.")
@@ -508,7 +463,7 @@ class CameraIntrinsicCalibrator:
         if not ret:
             rospy.logerr("[Intrinsic] cv2.calibrateCamera failed (online).")
             return
-        self._write_yaml_and_json(K, D, img_w, img_h)
+        self._write_intrinsic_json(K, D, img_w, img_h)
         base_dir = os.path.join(RosPack().get_path('autocal'), 'calibration_images')
         selected_dir, undist_dir = self._get_output_dirs(base_dir)
         if self.save_selected:

@@ -147,8 +147,9 @@ def score_point_to_bbox(target_pt: Tuple[int, int], ref_pt: Tuple[int, int], bbo
     x1, y1, x2, y2 = bbox
     dist_px = np.hypot(target_pt[0] - ref_pt[0], target_pt[1] - ref_pt[1])
     diag_len = np.hypot(x2 - x1, y2 - y1)
-    err_ratio = dist_px / max(1, diag_len)
-    return float(max(0, min(100, 100 - (err_ratio * 200))))
+    norm_len = max(120.0, float(diag_len))
+    err_ratio = dist_px / norm_len
+    return float(max(0, min(100, 100 - (err_ratio * 120))))
 
 
 def select_cluster_point_for_bbox(
@@ -1222,7 +1223,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     cluster_pt = select_cluster_point_for_bbox(valid_clusters, (x1, y1, x2, y2), self.bbox_ref_mode)
                     if cluster_pt is not None:
                         cluster_score = score_point_to_bbox(target_pt, cluster_pt, (x1, y1, x2, y2))
-                        if cluster_score < 50:
+                        if cluster_score < 30:
                             cluster_pt = None
                             cluster_score = 0.0
 
@@ -1502,15 +1503,13 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             self.pbar_intrinsic.setVisible(False)
             rp = rospkg.RosPack()
             pkg_path = rp.get_path("autocal")
-            out_yaml = os.path.join(pkg_path, "config", "camera_intrinsic.yaml")
+            out_json = os.path.join(pkg_path, "config", "intrinsic.json")
 
-            if exit_code == 0 and os.path.exists(out_yaml):
-                import yaml
-                with open(out_yaml, "r", encoding="utf-8") as f:
-                    y = yaml.safe_load(f) or {}
-                ci = (y.get("camera_info") or {})
-                # 오류 수정: 줄바꿈 문자 처리 방식 변경
-                self.txt_intrinsic_log.appendPlainText("[Intrinsic] DONE. camera_intrinsic.yaml updated.")
+            if exit_code == 0 and os.path.exists(out_json):
+                import json
+                with open(out_json, "r", encoding="utf-8") as f:
+                    ci = json.load(f) or {}
+                self.txt_intrinsic_log.appendPlainText("[Intrinsic] DONE. intrinsic.json updated.")
             else:
                 self.txt_intrinsic_log.appendPlainText(f"[Intrinsic] FAILED exit_code={exit_code}")
 

@@ -7,15 +7,13 @@
     <arg name="offline_source_name" default="default" />
     <arg name="launch_real_gui" default="true" />
 
-    <!-- Rosbag 모드: 아래 offline_provider 노드를 켭니다. -->
+    <!-- 실센서 모드: 아래 offline_provider 노드 블록을 XML 주석으로 감싸 비활성화하면 됩니다.-->
     <node pkg="autocal" type="offline_provider_node.py" name="offline_provider" output="screen">
         <param name="sources_json" value="$(arg offline_sources_json)" />
         <param name="source_name" value="$(arg offline_source_name)" />
         <param name="out_image_topic" value="$(arg image_topic)" />
         <param name="out_radar_topic" value="$(arg radar_topic)" />
     </node>
-
-    <!-- 실센서 모드: 위 offline_provider 노드 블록을 XML 주석으로 감싸 비활성화하면 됩니다. -->
 
     <node pkg="autocal" type="object_detector_node.py" name="object_detector" output="screen">
         <rosparam command="load" file="$(arg detector_yaml)" />
@@ -55,7 +53,7 @@
         <param name="board/height" value="5"/>
         <param name="board/square_size" value="0.10"/>
         <param name="min_samples" value="30"/>
-        <param name="output_path" value="$(find autocal)/config/camera_intrinsic.yaml"/>
+        <param name="output_path" value="$(find autocal)/config/intrinsic.json"/>
         <param name="save_images/enable" value="true"/>
         <param name="save_images/path" value="$(find autocal)/calibration_images"/>
     </node>
