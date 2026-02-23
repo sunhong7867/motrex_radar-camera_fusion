@@ -41,7 +41,6 @@ try:
 except Exception:
     cv2 = None
 
-
 _FIND_RE = re.compile(r"\$\(\s*find\s+([A-Za-z0-9_]+)\s*\)")
 
 # ---------------------------------------------------------

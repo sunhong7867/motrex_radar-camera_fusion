@@ -2,7 +2,7 @@
   "active_source": "default",
   "sources": {
     "default": {
-      "bag_path": "$(find autocal)/models/rosbag/overbridge0.bag",
+      "bag_path": "$(find autocal)/models/rosbag/overbridge1.bag",
       "intrinsic_path": "$(find autocal)/config/intrinsic.json",
       "bag_image_topic": "/camera/image_raw",
       "bag_radar_topic": "/point_cloud",

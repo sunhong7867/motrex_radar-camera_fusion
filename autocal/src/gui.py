@@ -43,6 +43,7 @@ if NODES_DIR in sys.path:
 sys.path.insert(0, NODES_DIR)
 
 from library.speed_utils import (
+    assign_points_to_bboxes,
     find_target_lane_from_bbox,
     get_bbox_reference_point,
     parse_radar_pointcloud,
@@ -579,28 +580,13 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                     self.cam_K, self.Extr_R, self.Extr_t.flatten(), pts_raw
                 )
             
-            # 겹치는 BBox(가림 현상) 필터링
-            num_pts = len(proj_uvs) if proj_uvs is not None else 0
-            point_owner = np.full(num_pts, -1, dtype=int)
-
-            if num_pts > 0 and proj_valid is not None:
-                # 카메라에 가까운 차량부터 선점하되, 박스 전체가 아닌 '핵심 영역(Core)'만 사용
-                sorted_objs = sorted(self.vis_objects, key=lambda o: o['bbox'][3], reverse=True)
-                for s_obj in sorted_objs:
-                    s_id = s_obj['id']
-                    x1, y1, x2, y2 = s_obj['bbox']
-                    
-                    # 좌우 15%, 상단 20%를 제외한 안쪽 알맹이 영역만 자기 포인트로 강력하게 소유
-                    w, h = x2 - x1, y2 - y1
-                    cx1, cx2 = x1 + w * 0.15, x2 - w * 0.15
-                    cy1, cy2 = y1 + h * 0.2, y2 
-                    
-                    u = proj_uvs[:, 0]
-                    v = proj_uvs[:, 1]
-                    in_box = (u >= cx1) & (u <= cx2) & (v >= cy1) & (v <= cy2)
-                    unowned = (point_owner == -1)
-                    point_owner[in_box & unowned & proj_valid] = s_id
-
+            # 겹치는 bbox 포인트는 전방 차량(y2가 큰 차량)이 우선 소유
+            point_owner = assign_points_to_bboxes(
+                proj_uvs,
+                proj_valid,
+                self.vis_objects,
+            )
+            
             disp = self.cv_image.copy()
 
             # 차선 상태 갱신

@@ -9,9 +9,7 @@ GUI 기록 버퍼 관리 유틸리티
 
 from dataclasses import dataclass, field
 from typing import Dict, List
-
 from log_saver_node import save_sequential_data
-
 
 @dataclass
 # 기록 상태와 버퍼를 관리하는 데이터 로거

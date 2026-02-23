@@ -18,7 +18,6 @@
 """
 
 import re
-
 import cv2
 import rospkg
 import rospy

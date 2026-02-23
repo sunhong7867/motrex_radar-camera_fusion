@@ -10,7 +10,6 @@
 import numpy as np
 from PySide6 import QtWidgets, QtGui, QtCore
 
-
 # 차선 폴리곤을 그리고 편집하는 캔버스 위젯
 class LaneCanvas(QtWidgets.QWidget):
 

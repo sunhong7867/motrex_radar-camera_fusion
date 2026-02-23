@@ -48,6 +48,7 @@ sys.path.insert(0, NODES_DIR)
 from library.lane_editor import LaneEditorDialog
 from library.logging_utils import DataLogger
 from library.speed_utils import (
+    assign_points_to_bboxes,
     build_record_row,
     find_target_lane_from_bbox,
     get_bbox_reference_point,
@@ -1156,7 +1157,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                         cluster_uvs = cuv
                         cluster_valid = cvalid
 
-            # 3. 차선 필터 준비
+            # 3. 겹침 영역 포인트 소유권 계산 (전방 차량 우선)
+            point_owner = assign_points_to_bboxes(
+                proj_uvs,
+                proj_valid,
+                self.vis_objects,
+            )
+
+            # 4. 차선 필터 준비
             active_lane_polys = {}
             for name, chk in self.chk_lanes.items():
                 if chk.isChecked():
@@ -1170,7 +1178,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             speed_scores = []
             now_ts = time.time()
 
-            # 4. 객체별 데이터 처리 루프
+            # 5. 객체별 데이터 처리 루프
             confirmed_objects = [] # 실제로 2초 이상 검증된 객체들만 담을 리스트
             active_ids = set()
             
@@ -1258,9 +1266,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 cluster_score = 0.0
 
                 if proj_uvs is not None and dop_raw is not None:
+                    my_proj_valid = proj_valid & (point_owner == g_id)
                     meas_kmh, rep_pt, rep_vel_raw, score, radar_dist = select_representative_point(
                         proj_uvs,
-                        proj_valid,
+                        my_proj_valid,
                         dop_raw,
                         (x1, y1, x2, y2),
                         pts_raw,
@@ -1318,6 +1327,9 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                         meas_kmh,
                         vel_out,
                         score,
+                        (x1, y1, x2, y2),
+                        target_pt,
+                        cluster_pt,
                     )
                     self.data_logger.add_record(data_row)
 

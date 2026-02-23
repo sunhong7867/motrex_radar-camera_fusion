@@ -14,6 +14,53 @@ from typing import Dict, Iterable, Optional, Tuple
 import cv2
 import numpy as np
 
+# 투영된 레이더 포인트를 객체 bbox에 소유권 할당
+def assign_points_to_bboxes(
+    proj_uvs: np.ndarray,
+    proj_valid: np.ndarray,
+    objects: Iterable[Dict[str, object]],
+) -> np.ndarray:
+
+    if proj_uvs is None or proj_valid is None:
+        return np.zeros(0, dtype=int)
+
+    num_pts = len(proj_uvs)
+    point_owner = np.full(num_pts, -1, dtype=int)
+    if num_pts == 0:
+        return point_owner
+
+    objs = list(objects)
+    if not objs:
+        return point_owner
+
+    valid_idxs = np.where(proj_valid)[0]
+    if valid_idxs.size == 0:
+        return point_owner
+
+    for i in valid_idxs:
+        u = float(proj_uvs[i, 0])
+        v = float(proj_uvs[i, 1])
+
+        candidates = []
+        for obj in objs:
+            g_id = int(obj["id"])
+            x1, y1, x2, y2 = obj["bbox"]
+            if not (x1 <= u <= x2 and y1 <= v <= y2):
+                continue
+
+            ref_u = 0.5 * (x1 + x2)
+            ref_v = float(y2)
+            diag = float(np.hypot(max(1, x2 - x1), max(1, y2 - y1)))
+            norm_dist = float(np.hypot(u - ref_u, v - ref_v) / max(diag, 1.0))
+            candidates.append((norm_dist, -float(y2), g_id))
+
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda t: (t[0], t[1]))
+        point_owner[i] = candidates[0][2]
+
+    return point_owner
 
 # 3D 포인트(N, 3)를 2D 픽셀(N, 2)로 투영
 def project_points(K, R, t, points_3d):
@@ -437,8 +484,25 @@ def build_record_row(
     radar_dist: float,
     meas_kmh: Optional[float],
     vel_out: Optional[float],
-    score: float,
+    bbox: Tuple[int, int, int, int],
+    target_pt: Tuple[int, int],
+    cluster_pt: Optional[Tuple[int, int]],
 ) -> Dict[str, float]:
+    x1, y1, x2, y2 = bbox
+    bbox_w = float(max(1, x2 - x1))
+    bbox_h = float(max(1, y2 - y1))
+
+    ref_u, ref_v = float(target_pt[0]), float(target_pt[1])
+    matched = int(cluster_pt is not None)
+    proj_u = float(cluster_pt[0]) if cluster_pt is not None else np.nan
+    proj_v = float(cluster_pt[1]) if cluster_pt is not None else np.nan
+
+    du = (proj_u - ref_u) if matched else np.nan
+    dv = (proj_v - ref_v) if matched else np.nan
+    pixel_err = float(np.hypot(du, dv)) if matched else np.nan
+    ru = (du / bbox_w) if matched else np.nan
+    rv = (dv / bbox_h) if matched else np.nan
+
     return {
         "Time": now_ts,
         "Global_ID": g_id,
@@ -449,5 +513,17 @@ def build_record_row(
         "Radar_Dist": radar_dist,
         "Radar_Vel": meas_kmh if meas_kmh is not None else np.nan,
         "Track_Vel": vel_out if vel_out is not None else np.nan,
-        "Score": score
+        "Score": score,
+        "BBox_W": bbox_w,
+        "BBox_H": bbox_h,
+        "Ref_U": ref_u,
+        "Ref_V": ref_v,
+        "Proj_U": proj_u,
+        "Proj_V": proj_v,
+        "Delta_U": du,
+        "Delta_V": dv,
+        "Pixel_Error": pixel_err,
+        "RU": ru,
+        "RV": rv,
+        "Is_Matched": matched,
     }

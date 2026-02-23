@@ -32,7 +32,7 @@ from autocal.msg import DetectionArray
 from sensor_msgs.msg import CameraInfo, PointCloud2
 from std_msgs.msg import String
 
-_FIND_RE = re.compile(r"\$\(\s*find\s+([A-Za-z0-9_]+)\s*\)")
+_FIND_RE = re.compile(r"\$\(\s*find\s+([A-Za-z0-9_]+)\s*\)") 
 
 # ---------------------------------------------------------
 # 보정 파라미터
