@@ -256,7 +256,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
         
         self.T_current = self.T_init.copy()
         
-        self.FIXED_DEG = 0.5   
+        self.FIXED_DEG = 0.1
         self.FIXED_MOV = 0.1   
 
         self.init_ui()
@@ -313,7 +313,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
         vbox.addWidget(gb_trans)
 
         # (3) Rotation Pad
-        gb_rot = QtWidgets.QGroupBox("3. Rotation (0.5°)")
+        gb_rot = QtWidgets.QGroupBox("3. Rotation (0.1°)")
         r_grid = QtWidgets.QGridLayout(gb_rot)
         r_grid.addWidget(self._create_btn("Pitch+ ⇈ (Q)", L_GRAY, lambda: self._rotate(0, 1)), 0, 1)
         r_grid.addWidget(self._create_btn("Yaw+ ↶ (W)", L_GRAY, lambda: self._rotate(1, -1)), 1, 0)

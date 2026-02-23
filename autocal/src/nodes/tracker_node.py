@@ -306,6 +306,9 @@ class TrackerNode:
         out_msg = DetectionArray()
         out_msg.header = msg.header
 
+        # 입력 detection lane_id를 트랙 결과로 전달하기 위한 준비
+        det_boxes = np.array([[d.bbox.xmin, d.bbox.ymin, d.bbox.xmax, d.bbox.ymax] for d in msg.detections], dtype=np.float64) if len(msg.detections) > 0 else np.zeros((0, 4), dtype=np.float64)
+
         for trk in trackers:
             d = Detection()
             d.id = int(trk[4])
@@ -317,6 +320,25 @@ class TrackerNode:
             bbox.xmax = int(trk[2])
             bbox.ymax = int(trk[3])
             d.bbox = bbox
+
+            # 트랙 bbox와 가장 가까운 입력 detection의 lane_id 계승
+            if det_boxes.shape[0] > 0:
+                trk_box = np.array([bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax], dtype=np.float64)
+                ious = iou_batch(trk_box.reshape(1, 4), det_boxes).reshape(-1)
+                best_idx = int(np.argmax(ious))
+
+                lane_val = msg.detections[best_idx].lane_id if best_idx < len(msg.detections) else ""
+                if not lane_val:
+                    # IoU가 낮거나 빈 lane_id일 때 중심점 최근접으로 재선택
+                    tcx = (trk_box[0] + trk_box[2]) * 0.5
+                    tcy = (trk_box[1] + trk_box[3]) * 0.5
+                    det_cx = (det_boxes[:, 0] + det_boxes[:, 2]) * 0.5
+                    det_cy = (det_boxes[:, 1] + det_boxes[:, 3]) * 0.5
+                    d2 = (det_cx - tcx) ** 2 + (det_cy - tcy) ** 2
+                    near_idx = int(np.argmin(d2))
+                    lane_val = msg.detections[near_idx].lane_id if near_idx < len(msg.detections) else ""
+
+                d.lane_id = lane_val if lane_val else "UNKNOWN"
 
             out_msg.detections.append(d)
 

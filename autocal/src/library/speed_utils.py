@@ -484,6 +484,7 @@ def build_record_row(
     radar_dist: float,
     meas_kmh: Optional[float],
     vel_out: Optional[float],
+    score: float,
     bbox: Tuple[int, int, int, int],
     target_pt: Tuple[int, int],
     cluster_pt: Optional[Tuple[int, int]],
