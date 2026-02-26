@@ -6,6 +6,8 @@
     <arg name="offline_sources_json" default="$(find autocal)/config/offline_sources.json" />
     <arg name="offline_source_name" default="default" />
     <arg name="launch_real_gui" default="true" />
+    <arg name="autostart_extrinsic_delay_sec" default="-1.0" />
+    <arg name="autostart_min_tracks" default="1" />
 
     <!-- 실센서 모드: 아래 offline_provider 노드 블록을 XML 주석으로 감싸 비활성화하면 됩니다.-->
     <node pkg="autocal" type="offline_provider_node.py" name="offline_provider" output="screen">
@@ -59,5 +61,8 @@
     </node>
 
     <node pkg="autocal" type="calibration_diagnosis_node.py" name="trajectory_eval" output="screen" />
-    <node if="$(arg launch_real_gui)" pkg="autocal" type="real_gui.py" name="real_gui" output="screen" />
+    <node if="$(arg launch_real_gui)" pkg="autocal" type="real_gui.py" name="real_gui" output="screen" >
+        <param name="autostart_extrinsic_delay_sec" value="$(arg autostart_extrinsic_delay_sec)" />
+        <param name="autostart_min_tracks" value="$(arg autostart_min_tracks)" />
+    </node>
 </launch>

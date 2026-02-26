@@ -34,6 +34,7 @@ from std_msgs.msg import String
 # 진단 파라미터
 # ---------------------------------------------------------
 COLLECTION_DURATION_SEC = 30.0      # 진단 데이터 수집 시간(초)
+MAX_COLLECTION_DURATION_SEC = 120.0 # 트랙 부족 시 최대 재시도 포함 총 수집 시간(초)
 MIN_TRACK_LEN = 15                  # 유효 트랙 최소 길이(프레임)
 MIN_TRACKS = 3                      # 리포트 생성 최소 트랙 수
 CLUSTER_TOL_M = 3.0                 # 레이더 XY 클러스터 반경(m)
@@ -67,6 +68,17 @@ class TrajectoryEvaluationNode:
         self.extrinsic_path = rospy.get_param("~extrinsic_path", default_ext_path)
 
         self.collection_duration = float(rospy.get_param("~collection_duration", COLLECTION_DURATION_SEC))
+        self.max_collection_duration = float(
+            rospy.get_param("~max_collection_duration", MAX_COLLECTION_DURATION_SEC)
+        )
+        self.keep_collecting_until_min_tracks = bool(
+            rospy.get_param("~keep_collecting_until_min_tracks", True)
+        )
+        if self.max_collection_duration <= self.collection_duration:
+            self.max_collection_duration = max(self.collection_duration * 4.0, self.collection_duration + 30.0)
+            rospy.logwarn(
+                f"[TrajectoryEval] max_collection_duration must be > collection_duration; auto-adjust to {self.max_collection_duration:.1f}s"
+            )
         self.min_track_len = int(rospy.get_param("~min_track_len", MIN_TRACK_LEN))
         self.min_tracks = int(rospy.get_param("~min_tracks", MIN_TRACKS))
         self.cluster_tol = float(rospy.get_param("~cluster_tol", CLUSTER_TOL_M))
@@ -458,11 +470,10 @@ class TrajectoryEvaluationNode:
             return None
         return vec / norm
 
-    def analyze_and_report(self):
+    def analyze_and_report(self, force_finalize: bool = False) -> bool:
         """
         수집된 트랙 대응쌍으로 RMSE와 방향 오차를 계산해 리포트 발행
         """
-        self.collecting = False
         summaries = []
 
         for tid, pairs in self.track_pairs.items():
@@ -542,13 +553,21 @@ class TrajectoryEvaluationNode:
             )
 
         if len(summaries) < self.min_tracks:
+            if (not force_finalize) or self.keep_collecting_until_min_tracks:
+                rospy.logwarn_throttle(
+                    2.0,
+                    f"[TrajectoryEval] valid_tracks={len(summaries)} < min_tracks={self.min_tracks}; keep collecting...",
+                )
+                return False
+
             msg = (
                 f"⚠ [평가 실패] 유효 트랙 부족 ({len(summaries)}개)\n"
                 f"- 최소 트랙 수: {self.min_tracks}\n"
                 f"- 트랙 기준 길이: {self.min_track_len} 프레임"
             )
             self.pub_result.publish(msg)
-            return
+            self.collecting = False
+            return False
 
         rmses_abs = np.array([s["rmse_abs"] for s in summaries], dtype=np.float64)
         rmses_db = np.array([s["rmse_db"] for s in summaries], dtype=np.float64)
@@ -682,6 +701,8 @@ class TrajectoryEvaluationNode:
                 lines.append(f"- {lane}: RMSE {rmse_lane:.2f}px, Bias({bu:.2f},{bv:.2f}) (N={len(errs_lane)})")
 
         self.pub_result.publish("\n".join(lines))
+        self.collecting = False
+        return True
 
     def run(self):
         """
@@ -692,7 +713,24 @@ class TrajectoryEvaluationNode:
             if self.collecting:
                 elapsed = (rospy.Time.now() - self.start_time).to_sec()
                 if elapsed > self.collection_duration:
-                    self.analyze_and_report()
+                    force_finalize = elapsed >= self.max_collection_duration
+                    done = self.analyze_and_report(force_finalize=force_finalize)
+                    if not done and not force_finalize:
+                        rospy.loginfo_throttle(
+                            2.0,
+                            f"[TrajectoryEval] waiting for more valid tracks... elapsed={elapsed:.1f}s/{self.max_collection_duration:.1f}s"
+                        )
+                    if not done and force_finalize and self.keep_collecting_until_min_tracks:
+                        rospy.logwarn_throttle(
+                            2.0,
+                            "[TrajectoryEval] max duration reached but still waiting for min tracks; extending collection window"
+                        )
+                        self.start_time = rospy.Time.now()
+                        continue
+                    if not done and force_finalize:
+                        rospy.logwarn(
+                            "[TrajectoryEval] finalize with insufficient tracks after max collection duration"
+                        )
             rate.sleep()
 
 

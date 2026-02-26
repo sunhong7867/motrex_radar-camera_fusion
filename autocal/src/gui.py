@@ -19,6 +19,7 @@ import sys
 import os
 import json
 import time
+import re
 import traceback
 from collections import deque
 from typing import Optional
@@ -73,6 +74,9 @@ TOPIC_CAMERA_INFO = "/camera/camera_info"
 TOPIC_FINAL_OUT   = "/autocal/output"
 TOPIC_ASSOCIATED  = "/autocal/associated"
 TOPIC_TRACKS      = "/autocal/tracks"
+
+_RE_CAL_PROGRESS = re.compile(r"Collection progress:\s*(\d+)\s*/\s*(\d+)")
+_RE_CAL_ELAPSED = re.compile(r"elapsed:\s*([0-9]+(?:\.[0-9]+)?)s")
 
 class StartupDialog(QtWidgets.QDialog):
     def __init__(self):
@@ -201,7 +205,8 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.app_start_time   = time.time()
         self.cal_round        = 0
         self.cal_start_time   = 0.0
-        self.cal_total_sec    = 100.0
+        self.cal_req_duration = float(rospy.get_param("~cal_req_duration", 30.0))
+        self.cal_progress_frac = 0.0
         self.countdown_start  = 0.0
         self.extrinsic_proc   = None
         self.extrinsic_mtime  = None
@@ -308,6 +313,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         """
         self.state = self.STATE_CALIBING
         self.cal_start_time = time.time()
+        self.cal_progress_frac = 0.0
         self._cal_log_buf = []
 
         if not hasattr(self, "_cal_candidates"):
@@ -834,9 +840,8 @@ class ConsumerGUI(QtWidgets.QMainWindow):
 
         cv2.putText(disp, round_str, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
 
-        # 진행률 바
-        round_elapsed = time.time() - self.cal_start_time
-        frac = min(1.0, round_elapsed / max(1.0, self.cal_total_sec))
+        # 진행률 바: ex_node 로그의 실제 수집 진행도를 우선 사용
+        frac = self._estimate_calibration_progress()
         
         # 바(Bar)도 중앙 정렬
         bar_w = 600
@@ -870,6 +875,46 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self._draw_status_overlay(disp, elapsed_total, mode="calibrating",
                                   extra=f"Round {self.cal_round + 1}/{self.autocal_rounds}")
         self.viewer.update_image(disp)
+
+    def _estimate_calibration_progress(self) -> float:
+        """
+        extrinsic 노드 로그에서 실제 진행도(샘플 수/시간)를 파싱해 0~1로 반환
+        """
+        progress_ratio = 0.0
+        elapsed_ratio = 0.0
+
+        for chunk in reversed(self._cal_log_buf):
+            lines = chunk.splitlines()
+            for ln in reversed(lines):
+                m = _RE_CAL_PROGRESS.search(ln)
+                if m and int(m.group(2)) > 0:
+                    cur = int(m.group(1))
+                    tot = int(m.group(2))
+                    progress_ratio = min(1.0, max(0.0, cur / float(tot)))
+                    break
+            if progress_ratio > 0.0:
+                break
+
+        for chunk in reversed(self._cal_log_buf):
+            lines = chunk.splitlines()
+            for ln in reversed(lines):
+                m = _RE_CAL_ELAPSED.search(ln)
+                if m:
+                    elapsed = float(m.group(1))
+                    elapsed_ratio = min(1.0, max(0.0, elapsed / max(1.0, self.cal_req_duration)))
+                    break
+            if elapsed_ratio > 0.0:
+                break
+
+        observed = max(progress_ratio, elapsed_ratio)
+        if observed <= 0.0:
+            # 로그가 아직 없을 때만 시간 기반 fallback(초기 대기구간 표시)
+            round_elapsed = time.time() - self.cal_start_time
+            observed = min(0.99, round_elapsed / max(1.0, self.cal_req_duration))
+
+        # 바가 역행하지 않도록 단조 증가
+        self.cal_progress_frac = max(self.cal_progress_frac, observed)
+        return min(1.0, self.cal_progress_frac)
 
     def _draw_status_overlay(self, disp: np.ndarray, elapsed_total: float,
                               mode: str = "view", extra: str = ""):

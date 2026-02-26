@@ -45,6 +45,8 @@ CLUSTER_TOL_M = 5.0                 # 레이더 XY 클러스터 반경(m)
 MATCH_MAX_DIST_PX = 1000.0          # 영상 매칭 허용 거리(px)
 RANSAC_ITERATIONS = 1000            # RANSAC 반복 횟수
 RANSAC_THRESHOLD_DEG = 0.3          # 인라이어 각도 임계값(도)
+RANSAC_SAMPLE_SIZE = 5              # RANSAC 최소 샘플 수
+RANSAC_CONFIDENCE = 0.999           # 목표 성공 확률
 
 
 def resolve_ros_path(path: str) -> str:
@@ -91,6 +93,8 @@ class ExtrinsicCalibrationManager:
         self.match_max_dist_px = float(rospy.get_param("~match_max_dist_px", MATCH_MAX_DIST_PX))
         self.ransac_iterations = int(rospy.get_param("~ransac_iterations", RANSAC_ITERATIONS))
         self.ransac_threshold_deg = float(rospy.get_param("~ransac_threshold_deg", RANSAC_THRESHOLD_DEG))
+        self.ransac_sample_size = int(rospy.get_param("~ransac_sample_size", RANSAC_SAMPLE_SIZE))
+        self.ransac_confidence = float(rospy.get_param("~ransac_confidence", RANSAC_CONFIDENCE))
 
         rp = rospkg.RosPack()
         default_path = os.path.join(rp.get_path("autocal"), "config", "extrinsic.json")
@@ -220,7 +224,7 @@ class ExtrinsicCalibrationManager:
 
         total = sum(len(d) for d in self.track_buffer.values() if len(d) >= self.min_track_len)
         elapsed = (rospy.Time.now() - self.collection_start_time).to_sec()
-        rospy.loginfo_throttle(2.0, f"[Autocal] Collection progress: {total}/{self.min_samples} | {elapsed:.1f}s")
+        rospy.loginfo_throttle(2.0, f"[Autocal] Collection progress: {total}/{self.min_samples}\n- elapsed: {elapsed:.1f}s")
 
         if elapsed >= self.req_duration and total >= self.min_samples:
             self.run_robust_optimization()
@@ -240,16 +244,26 @@ class ExtrinsicCalibrationManager:
                 for nc, rv_3d, uv_2d in data:
                     unit_pairs.append((rv_3d / np.linalg.norm(rv_3d), nc, uv_2d, rv_3d))
 
-            if len(unit_pairs) < 100:
-                rospy.logwarn("[Autocal] Insufficient valid pairs, continue collecting")
+            if len(unit_pairs) < 3:
+                rospy.logwarn("[Autocal] Too few valid pairs, continue collecting")
                 return
 
-            best_R = self.curr_R
+            sample_size = max(3, min(self.ransac_sample_size, len(unit_pairs)))
+            confidence = float(np.clip(self.ransac_confidence, 0.5, 0.999999))
+            log_conf = np.log(1.0 - confidence)
+
+            best_R = self.curr_R.copy()
             max_inliers = -1
             final_inlier_mask = None
+            max_trials = max(1, self.ransac_iterations)
+            min_trials = min(max_trials, 200)
+            trial = 0
+            rv_units = np.array([p[0] for p in unit_pairs], dtype=np.float64)
+            nc_units = np.array([p[1] for p in unit_pairs], dtype=np.float64)
+            best_errs = None
 
-            for _ in range(self.ransac_iterations):
-                idx = np.random.choice(len(unit_pairs), 5, replace=False)
+            while trial < max_trials:
+                idx = np.random.choice(len(unit_pairs), sample_size, replace=False)
                 a_sub = np.array([unit_pairs[i][0] for i in idx]).T
                 b_sub = np.array([unit_pairs[i][1] for i in idx]).T
 
@@ -260,42 +274,92 @@ class ExtrinsicCalibrationManager:
                     vt[2, :] *= -1
                     r_cand = vt.T @ u.T
 
-                inlier_mask = []
-                for rv_u, nc_u, _, _ in unit_pairs:
-                    err = np.rad2deg(np.arccos(np.clip(np.dot(r_cand @ rv_u, nc_u), -1.0, 1.0)))
-                    inlier_mask.append(err < self.ransac_threshold_deg)
+                aligned = (r_cand @ rv_units.T).T
+                dots = np.sum(aligned * nc_units, axis=1)
+                errs = np.rad2deg(np.arccos(np.clip(dots, -1.0, 1.0)))
+                inlier_mask = errs < self.ransac_threshold_deg
 
-                num_in = sum(inlier_mask)
+                num_in = int(np.sum(inlier_mask))
                 if num_in > max_inliers:
                     max_inliers = num_in
                     best_R = r_cand
                     final_inlier_mask = inlier_mask
+                    best_errs = errs
+
+                    inlier_ratio = max(num_in / float(len(unit_pairs)), 1e-6)
+                    denom = np.log(max(1e-12, 1.0 - (inlier_ratio ** sample_size)))
+                    if denom < 0.0:
+                        required = int(np.ceil(log_conf / denom))
+                        max_trials = min(max_trials, max(required, min_trials, trial + 1))
+                trial += 1
+
+            if final_inlier_mask is None:
+                rospy.logwarn("[Autocal] RANSAC failed to produce a valid model, fallback to all pairs")
+                final_inlier_mask = np.ones(len(unit_pairs), dtype=bool)
+                if best_errs is None:
+                    aligned = (best_R @ rv_units.T).T
+                    dots = np.sum(aligned * nc_units, axis=1)
+                    best_errs = np.rad2deg(np.arccos(np.clip(dots, -1.0, 1.0)))
 
             inlier_indices = np.where(final_inlier_mask)[0]
+            if inlier_indices.size < sample_size:
+                rospy.logwarn(f"[Autocal] Not enough strict inliers after RANSAC: {inlier_indices.size}. Relax threshold")
+                if best_errs is not None:
+                    relaxed_mask = best_errs < (self.ransac_threshold_deg * 2.0)
+                    inlier_indices = np.where(relaxed_mask)[0]
+
+            if inlier_indices.size < sample_size:
+                if best_errs is None:
+                    aligned = (best_R @ rv_units.T).T
+                    dots = np.sum(aligned * nc_units, axis=1)
+                    best_errs = np.rad2deg(np.arccos(np.clip(dots, -1.0, 1.0)))
+                topk = max(sample_size, min(60, len(unit_pairs)))
+                inlier_indices = np.argsort(best_errs)[:topk]
+                rospy.logwarn(f"[Autocal] Fallback to top-{topk} residual samples for refinement")
+
+            # 인라이어 전부로 회전 재추정
+            a_all = rv_units[inlier_indices].T
+            b_all = nc_units[inlier_indices].T
+            h_all = a_all @ b_all.T
+            u_all, _, vt_all = np.linalg.svd(h_all)
+            best_R = vt_all.T @ u_all.T
+            if np.linalg.det(best_R) < 0:
+                vt_all[2, :] *= -1
+                best_R = vt_all.T @ u_all.T
+
             v_obj = np.array([unit_pairs[i][3] for i in inlier_indices], dtype=np.float32)
             v_img = np.array([unit_pairs[i][2] for i in inlier_indices], dtype=np.float32)
 
-            r_fix, _ = cv2.Rodrigues(best_R)
-            t_ref = self.curr_t.copy().astype(np.float32)
+            if v_obj.shape[0] < 4:
+                rospy.logwarn(f"[Autocal] Insufficient points for solvePnP: {v_obj.shape[0]}, keep previous t")
+                success = False
+                t_final = self.curr_t.copy()
+            else:
+                r_fix, _ = cv2.Rodrigues(best_R)
+                t_ref = self.curr_t.copy().astype(np.float32)
 
-            success, _, t_final = cv2.solvePnP(
-                v_obj,
-                v_img,
-                self.K,
-                self.D,
-                r_fix,
-                t_ref,
-                useExtrinsicGuess=True,
-                flags=cv2.SOLVEPNP_ITERATIVE,
-            )
+                success, _, t_final = cv2.solvePnP(
+                    v_obj,
+                    v_img,
+                    self.K,
+                    self.D,
+                    r_fix,
+                    t_ref,
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
 
             if success and np.linalg.norm(t_final - self.curr_t) < 2.0:
                 self.curr_t = t_final.reshape(3, 1)
+            elif success:
+                rospy.logwarn("[Autocal] solvePnP translation jump too large, keep previous t")
+            else:
+                rospy.logwarn("[Autocal] solvePnP failed, rotation-only update applied")
 
             self.curr_R = best_R
             self._save_result(self.curr_R, self.curr_t)
             self.pub_diag_start.publish(String(data=str(self.bbox_ref_mode)))
-            rospy.loginfo(f"[Autocal] Optimization done: inlier {max_inliers}/{len(unit_pairs)}")
+            rospy.loginfo(f"[Autocal] Optimization done: inlier {max_inliers}/{len(unit_pairs)}\n- used pairs: {len(inlier_indices)}")
             rospy.signal_shutdown("extrinsic calibration complete")
 
         except Exception as exc:

@@ -35,6 +35,10 @@ roslaunch autocal autocal.launch
    (B) Developer flow (Perception + real_gui together)
 roslaunch autocal autocal_dev.launch
 
+
+rosrun autocal autocal_batch_runner.py _iterations:=1
+
+
 chmod +x src/autocal/src/nodes/*.py
 chmod +x src/autocal/src/*.py
 

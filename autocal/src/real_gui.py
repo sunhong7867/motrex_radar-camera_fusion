@@ -589,6 +589,20 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.timer.timeout.connect(self.update_loop)
         self.timer.start(REFRESH_RATE_MS)
 
+        # 배치 모드용: 박스(트랙) 관측 후 자동으로 "Run Extrinsic (Auto)" 실행
+        self._latest_track_count = 0
+        self._autostart_armed = False
+        self._autostart_triggered = False
+        self._autostart_poll_timer = None
+        self.autostart_extrinsic_delay_sec = float(rospy.get_param("~autostart_extrinsic_delay_sec", -1.0))
+        self.autostart_min_tracks = int(rospy.get_param("~autostart_min_tracks", 1))
+        if self.autostart_extrinsic_delay_sec >= 0.0:
+            QtCore.QTimer.singleShot(int(self.autostart_extrinsic_delay_sec * 1000.0), self._arm_autostart_extrinsic)
+            rospy.loginfo(
+                f"[real_gui] autostart extrinsic enabled: delay={self.autostart_extrinsic_delay_sec:.1f}s, "
+                f"min_tracks={self.autostart_min_tracks}"
+            )
+
         self.last_update_time = time.time()
         self.view_options_dialog = None
 
@@ -1070,6 +1084,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         """
         ROS 콜백 입력 메시지를 내부 상태로 반영
         """
+        self._latest_track_count = len(msg.detections)
         if time.time() - self.last_update_time > 0.3:
             objects = []
             for det in msg.detections:
@@ -1079,6 +1094,31 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     'vel': float('nan')
                 })
             self.vis_objects = objects
+
+    def _arm_autostart_extrinsic(self):
+        """지연 시간 후 자동 시작 상태를 활성화하고 트랙 수를 폴링"""
+        if self._autostart_triggered:
+            return
+        self._autostart_armed = True
+        self._try_autostart_extrinsic()
+        if self._autostart_triggered:
+            return
+        self._autostart_poll_timer = QtCore.QTimer(self)
+        self._autostart_poll_timer.timeout.connect(self._try_autostart_extrinsic)
+        self._autostart_poll_timer.start(500)
+
+    def _try_autostart_extrinsic(self):
+        """트랙 수 조건을 만족하면 자동으로 Extrinsic(Auto) 실행"""
+        if not self._autostart_armed or self._autostart_triggered:
+            return
+        if self._latest_track_count < max(1, int(self.autostart_min_tracks)):
+            return
+        self._autostart_triggered = True
+        if self._autostart_poll_timer is not None:
+            self._autostart_poll_timer.stop()
+            self._autostart_poll_timer = None
+        rospy.loginfo(f"[real_gui] autostart trigger: tracks={self._latest_track_count}")
+        self.run_autocalibration()
 
     def get_text_position(self, pts):
         """

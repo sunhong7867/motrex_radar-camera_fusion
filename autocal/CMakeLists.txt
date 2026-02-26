@@ -66,6 +66,7 @@ catkin_install_python(PROGRAMS
   src/nodes/tracker_node.py
   src/gui.py
   src/real_gui.py
+  src/autocal_batch_runner.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
