@@ -523,6 +523,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.last_radar_dop = None
         self.last_radar_ts = 0.0
         self.radar_hold_threshold = 0.06
+        self.projection_visual_z_offset_m = float(rospy.get_param("~projection_visual_z_offset_m", 0.6))
         self.cam_K = None
         self.lane_polys = {}
         self.Extr_R = np.eye(3)
@@ -844,7 +845,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.chk_show_targets.setChecked(True)
 
         self.chk_show_radar = QtWidgets.QCheckBox("Show Radar Points")
-        self.chk_show_radar.setChecked(False)
+        self.chk_show_radar.setChecked(True)
         
         self.chk_show_rep_points = QtWidgets.QCheckBox("Show Speed Radar Points")
         self.chk_show_rep_points.setChecked(False)
@@ -1172,6 +1173,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             # 2. 레이더 투영
             proj_uvs = None
             proj_valid = None
+            proj_uvs_vis = None
+            proj_valid_vis = None
             projected_count = 0 
             cluster_uvs = None
             cluster_valid = None
@@ -1181,6 +1184,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 proj_uvs = uvs
                 proj_valid = valid
                 projected_count = int(np.sum(valid))
+
+                # 화면 표시용 투영(z 오프셋 적용)
+                pts_vis = np.asarray(pts_raw, dtype=np.float64).copy()
+                if pts_vis.ndim == 2 and pts_vis.shape[1] >= 3:
+                    pts_vis[:, 2] += self.projection_visual_z_offset_m
+                uvs_vis, valid_vis = project_points(self.cam_K, self.Extr_R, self.Extr_t, pts_vis)
+                proj_uvs_vis = uvs_vis
+                proj_valid_vis = valid_vis
 
                 if self.Extr_R is not None and self.Extr_t is not None:
                     min_speed_mps = NOISE_MIN_SPEED_KMH / 3.6
@@ -1405,10 +1416,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                  self.lbl_record_status.setText(f"Recording... [{self.data_logger.record_count} pts]")
 
             # 6. 그리기 (Draw)
-            if self.chk_show_radar.isChecked() and proj_uvs is not None:
-                for i in range(len(proj_uvs)):
-                    if not proj_valid[i]: continue
-                    u, v = int(proj_uvs[i, 0]), int(proj_uvs[i, 1])
+            if self.chk_show_radar.isChecked() and proj_uvs_vis is not None:
+                for i in range(len(proj_uvs_vis)):
+                    if not proj_valid_vis[i]: continue
+                    u, v = int(proj_uvs_vis[i, 0]), int(proj_uvs_vis[i, 1])
                     spd = dop_raw[i] * 3.6
                     
                     if abs(spd) < NOISE_MIN_SPEED_KMH: continue

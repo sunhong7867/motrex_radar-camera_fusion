@@ -6,6 +6,7 @@
     <arg name="offline_sources_json" default="$(find autocal)/config/offline_sources.json" />
     <arg name="offline_source_name" default="default" />
     <arg name="launch_real_gui" default="true" />
+    <arg name="projection_visual_z_offset_m" default="0.6" />
     <arg name="autostart_extrinsic_delay_sec" default="-1.0" />
     <arg name="autostart_min_tracks" default="1" />
 
@@ -64,5 +65,6 @@
     <node if="$(arg launch_real_gui)" pkg="autocal" type="real_gui.py" name="real_gui" output="screen" >
         <param name="autostart_extrinsic_delay_sec" value="$(arg autostart_extrinsic_delay_sec)" />
         <param name="autostart_min_tracks" value="$(arg autostart_min_tracks)" />
+        <param name="projection_visual_z_offset_m" value="$(arg projection_visual_z_offset_m)" />
     </node>
 </launch>

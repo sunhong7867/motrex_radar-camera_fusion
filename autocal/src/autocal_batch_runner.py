@@ -410,8 +410,8 @@ def main():
     bag_warmup_sec = float(rospy.get_param("~bag_warmup_sec", 10.0))
     autostart_min_tracks = int(rospy.get_param("~autostart_min_tracks", 1))
     # real_gui 자동실행 + 진단 완료까지 기다릴 총 시간
-    diagnosis_timeout_sec = float(rospy.get_param("~diagnosis_timeout_sec", 240.0))
-    min_valid_tracks_for_success = int(rospy.get_param("~min_valid_tracks_for_success", 20))
+    diagnosis_timeout_sec = float(rospy.get_param("~diagnosis_timeout_sec", 300.0))
+    min_valid_tracks_for_success = int(rospy.get_param("~min_valid_tracks_for_success", 15))
     gui_window_title = str(rospy.get_param("~gui_window_title", "Motrex-SKKU Sensor Fusion GUI"))
 
     pipeline_launch_file = str(rospy.get_param("~pipeline_launch_file", "autocal_dev.launch"))

@@ -40,14 +40,13 @@ _FIND_RE = re.compile(r"\$\(\s*find\s+([A-Za-z0-9_]+)\s*\)")
 MIN_SAMPLES = 1000                  # 최적화 시작 최소 대응점 수
 REQUIRED_DURATION_SEC = 30.0        # 데이터 수집 최소 시간(초)
 MIN_TRACK_LEN = 20                  # 유효 트랙 최소 길이(프레임)
-MIN_SPEED_MPS = 4.0                 # 정적 물체 제거용 최소 속도(m/s)
-CLUSTER_TOL_M = 5.0                 # 레이더 XY 클러스터 반경(m)
+MIN_SPEED_MPS = 3.0                 # 정적 물체 제거용 최소 속도(m/s)
+CLUSTER_TOL_M = 10.0                # 레이더 XY 클러스터 반경(m)
 MATCH_MAX_DIST_PX = 1000.0          # 영상 매칭 허용 거리(px)
-RANSAC_ITERATIONS = 1000            # RANSAC 반복 횟수
-RANSAC_THRESHOLD_DEG = 0.3          # 인라이어 각도 임계값(도)
+RANSAC_ITERATIONS = 1200            # RANSAC 반복 횟수
+RANSAC_THRESHOLD_DEG = 0.25         # 인라이어 각도 임계값(도)
 RANSAC_SAMPLE_SIZE = 5              # RANSAC 최소 샘플 수
 RANSAC_CONFIDENCE = 0.999           # 목표 성공 확률
-
 
 def resolve_ros_path(path: str) -> str:
     """
