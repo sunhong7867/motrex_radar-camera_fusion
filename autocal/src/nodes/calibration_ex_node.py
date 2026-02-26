@@ -39,7 +39,7 @@ _FIND_RE = re.compile(r"\$\(\s*find\s+([A-Za-z0-9_]+)\s*\)")
 # ---------------------------------------------------------
 MIN_SAMPLES = 1000                  # 최적화 시작 최소 대응점 수
 REQUIRED_DURATION_SEC = 30.0        # 데이터 수집 최소 시간(초)
-MIN_TRACK_LEN = 20                  # 유효 트랙 최소 길이(프레임)
+MIN_TRACK_LEN = 15                  # 유효 트랙 최소 길이(프레임)
 MIN_SPEED_MPS = 3.0                 # 정적 물체 제거용 최소 속도(m/s)
 CLUSTER_TOL_M = 10.0                # 레이더 XY 클러스터 반경(m)
 MATCH_MAX_DIST_PX = 1000.0          # 영상 매칭 허용 거리(px)
@@ -116,7 +116,7 @@ class ExtrinsicCalibrationManager:
         self.ts.registerCallback(self._callback)
 
         rospy.Subscriber(self.camera_info_topic, CameraInfo, self._info_callback)
-        self.pub_diag_start = rospy.Publisher("/autocal/diagnosis/start", String, queue_size=1)
+        self.pub_diag_start = rospy.Publisher("/autocal/diagnosis/start", String, queue_size=1, latch=True)
         rospy.loginfo("[Autocal] Extrinsic calibration node started")
 
     def _load_extrinsic(self):
@@ -357,7 +357,7 @@ class ExtrinsicCalibrationManager:
 
             self.curr_R = best_R
             self._save_result(self.curr_R, self.curr_t)
-            self.pub_diag_start.publish(String(data=str(self.bbox_ref_mode)))
+            self._publish_diagnosis_start()
             rospy.loginfo(f"[Autocal] Optimization done: inlier {max_inliers}/{len(unit_pairs)}\n- used pairs: {len(inlier_indices)}")
             rospy.signal_shutdown("extrinsic calibration complete")
 
@@ -366,6 +366,27 @@ class ExtrinsicCalibrationManager:
         finally:
             self.is_calibrating = False
             self.collection_start_time = None
+
+    def _publish_diagnosis_start(self):
+        """
+        진단 시작 트리거를 유실되지 않도록 안전하게 발행
+        - 진단 노드 구독 연결을 짧게 대기
+        - 동일 메시지를 수회 재발행
+        """
+        msg = String(data=str(self.bbox_ref_mode))
+
+        wait_deadline = rospy.Time.now().to_sec() + 1.5
+        while not rospy.is_shutdown() and self.pub_diag_start.get_num_connections() == 0:
+            if rospy.Time.now().to_sec() >= wait_deadline:
+                break
+            rospy.sleep(0.05)
+
+        publish_count = 3
+        for i in range(publish_count):
+            self.pub_diag_start.publish(msg)
+            rospy.sleep(0.05)
+
+        rospy.loginfo(f"[Autocal] diagnosis start trigger published ({publish_count}x), subscribers={self.pub_diag_start.get_num_connections()}, ref={self.bbox_ref_mode}")
 
     def _save_result(self, r_mat: np.ndarray, t_vec: np.ndarray):
         """

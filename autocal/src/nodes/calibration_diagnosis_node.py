@@ -35,12 +35,12 @@ from std_msgs.msg import String
 # ---------------------------------------------------------
 COLLECTION_DURATION_SEC = 30.0      # 진단 데이터 수집 시간(초)
 MAX_COLLECTION_DURATION_SEC = 120.0 # 트랙 부족 시 최대 재시도 포함 총 수집 시간(초)
-MIN_TRACK_LEN = 15                  # 유효 트랙 최소 길이(프레임)
-MIN_TRACKS = 3                      # 리포트 생성 최소 트랙 수
+MIN_TRACK_LEN = 10                  # 유효 트랙 최소 길이(프레임)
+MIN_TRACKS = 1                      # 리포트 생성 최소 트랙 수
 CLUSTER_TOL_M = 3.0                 # 레이더 XY 클러스터 반경(m)
 MIN_SPEED_MPS = 2.0                 # 정적 물체 제거 속도 임계값(m/s)
 MATCH_MAX_DIST_PX = 160.0           # bbox 기준점-투영점 매칭 허용 거리(px)
-MIN_TRACK_DISPLACEMENT_PX = 20.0    # 정지/저이동 트랙 제외를 위한 최소 기준점 이동량(px)
+MIN_TRACK_DISPLACEMENT_PX = 15.0    # 정지/저이동 트랙 제외를 위한 최소 기준점 이동량(px)
 OCCLUSION_MARGIN_PX = 4.0           # 가림 판정 시 bbox 내부 여유 픽셀
 MAX_U_BIAS_RATIO = 0.6              # bbox 폭 대비 허용 수평 편차 비율
 MAX_V_BIAS_RATIO = 1.0              # bbox 높이 대비 허용 수직 편차 비율
@@ -68,25 +68,17 @@ class TrajectoryEvaluationNode:
         self.extrinsic_path = rospy.get_param("~extrinsic_path", default_ext_path)
 
         self.collection_duration = float(rospy.get_param("~collection_duration", COLLECTION_DURATION_SEC))
-        self.max_collection_duration = float(
-            rospy.get_param("~max_collection_duration", MAX_COLLECTION_DURATION_SEC)
-        )
-        self.keep_collecting_until_min_tracks = bool(
-            rospy.get_param("~keep_collecting_until_min_tracks", True)
-        )
+        self.max_collection_duration = float(rospy.get_param("~max_collection_duration", MAX_COLLECTION_DURATION_SEC))
+        self.keep_collecting_until_min_tracks = bool(rospy.get_param("~keep_collecting_until_min_tracks", True))
         if self.max_collection_duration <= self.collection_duration:
             self.max_collection_duration = max(self.collection_duration * 4.0, self.collection_duration + 30.0)
-            rospy.logwarn(
-                f"[TrajectoryEval] max_collection_duration must be > collection_duration; auto-adjust to {self.max_collection_duration:.1f}s"
-            )
+            rospy.logwarn(f"[TrajectoryEval] max_collection_duration must be > collection_duration; auto-adjust to {self.max_collection_duration:.1f}s")
         self.min_track_len = int(rospy.get_param("~min_track_len", MIN_TRACK_LEN))
         self.min_tracks = int(rospy.get_param("~min_tracks", MIN_TRACKS))
         self.cluster_tol = float(rospy.get_param("~cluster_tol", CLUSTER_TOL_M))
         self.min_speed_mps = float(rospy.get_param("~min_speed_mps", MIN_SPEED_MPS))
         self.match_max_dist_px = float(rospy.get_param("~match_max_dist_px", MATCH_MAX_DIST_PX))
-        self.min_track_displacement_px = float(
-            rospy.get_param("~min_track_displacement_px", MIN_TRACK_DISPLACEMENT_PX)
-        )
+        self.min_track_displacement_px = float(rospy.get_param("~min_track_displacement_px", MIN_TRACK_DISPLACEMENT_PX))
         self.occlusion_margin_px = float(rospy.get_param("~occlusion_margin_px", OCCLUSION_MARGIN_PX))
         self.skip_occluded_refs = bool(rospy.get_param("~skip_occluded_refs", True))
 
