@@ -386,17 +386,21 @@ class ManualCalibWindow(QtWidgets.QDialog):
         현재 상태를 기반으로 화면 오버레이와 위젯 표시를 갱신
         """
         try:
-            if self.gui.latest_frame is None or self.gui.cam_K is None: return
+            if self.gui.latest_frame is None:
+                return
             raw_img = self.gui.latest_frame.get("cv_image")
             pts_r = self.gui.latest_frame.get("radar_points")
             dops = self.gui.latest_frame.get("radar_doppler")
-            if raw_img is None: return
+            if raw_img is None:
+                return
 
             disp = raw_img.copy()
             K = self.gui.cam_K
-            uvs_man, valid_man = project_points(K, self.T_current[:3, :3], self.T_current[:3, 3], pts_r)
+            uvs_man, valid_man = None, None
+            if K is not None and pts_r is not None:
+                uvs_man, valid_man = project_points(K, self.T_current[:3, :3], self.T_current[:3, 3], pts_r)
 
-            if self.chk_grid.isChecked():
+            if self.chk_grid.isChecked() and K is not None:
                 self._draw_grid_and_axis(disp, K, K[0, 2], K[1, 2])
             if self.chk_bbox.isChecked() and self.gui.vis_objects:
                 for obj in self.gui.vis_objects:
@@ -627,7 +631,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         # 2. 오른쪽: 컨트롤 패널
         panel = QtWidgets.QWidget()
-        panel.setFixedWidth(400) # 너비 고정
+        panel_width = 400
+        panel.setFixedWidth(panel_width)
         
         # 스타일시트 적용
         panel.setStyleSheet("""
@@ -671,16 +676,17 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             pix_skku = QtGui.QPixmap(os.path.join(img_dir, "SKKU.png"))
             pix_motrex = QtGui.QPixmap(os.path.join(img_dir, "Motrex.jpeg"))
             
-            # 패널 너비(400) 안쪽으로 들어오게 설정
+            # 패널 너비 안쪽으로 들어오게 설정
             if not pix_skku.isNull():
                 # 성대 로고
-                scaled_skku = pix_skku.scaledToWidth(400, Qt.SmoothTransformation)
+                scaled_skku = pix_skku.scaledToWidth(panel_width, Qt.SmoothTransformation)
                 lbl_skku.setPixmap(scaled_skku)
                 lbl_skku.setAlignment(Qt.AlignCenter)
             
             if not pix_motrex.isNull():
                 # 모트렉스 로고
-                scaled_motrex = pix_motrex.scaledToWidth(300, Qt.SmoothTransformation)
+                motrex_logo_width = 300
+                scaled_motrex = pix_motrex.scaledToWidth(motrex_logo_width, Qt.SmoothTransformation)
                 lbl_motrex.setPixmap(scaled_motrex)
                 lbl_motrex.setAlignment(Qt.AlignCenter)
             
@@ -937,7 +943,15 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 
         # 하단 여백 추가
         vbox.addStretch()
-        layout.addWidget(panel, stretch=0)
+        panel_scroll = QtWidgets.QScrollArea()
+        panel_scroll.setWidgetResizable(True)
+        panel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        panel_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        panel_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        panel_scroll.setFixedWidth(panel_width + 16)
+        panel_scroll.setWidget(panel)
+
+        layout.addWidget(panel_scroll, stretch=0)
                 
         # 내부적으로 사용하는 speed parameter 들 (UI에는 없지만 로직 유지를 위해 필요)
         self.spin_hold_sec = type('obj', (object,), {'value': lambda: 10.0})

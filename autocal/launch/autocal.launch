@@ -6,11 +6,13 @@
   <arg name="extrinsic_path" default="$(find autocal)/config/extrinsic.json"/>
   <arg name="autocal_rounds" default="1"/>
   <arg name="bbox_ref_mode" default="bottom"/>
+  <arg name="use_offline_provider" default="true"/>
 
   <include file="$(find autocal)/launch/autocal_dev.launch">
     <arg name="image_topic" value="$(arg image_topic)"/>
     <arg name="radar_topic" value="$(arg radar_topic)"/>
     <arg name="launch_real_gui" value="false"/>
+    <arg name="use_offline_provider" value="$(arg use_offline_provider)"/>
   </include>
 
   <node pkg="autocal"

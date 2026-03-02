@@ -65,7 +65,7 @@ class OfflineProvider:
         self.sources_json = _resolve_ros_path(rospy.get_param("~sources_json", default_sources_json))
         self.source_name = rospy.get_param("~source_name", DEFAULT_SOURCE_NAME)
 
-        self.bag_path = rospy.get_param("~bag_path", os.path.join(pkg_path, "models/my_test_data.bag"))
+        self.bag_path = rospy.get_param("~bag_path", os.path.join(pkg_path, "models/test1.bag"))
         self.intrinsic_path = rospy.get_param("~intrinsic_path", os.path.join(pkg_path, "config/intrinsic.json"))
 
         # bag 토픽과 출력 토픽 매핑 로드

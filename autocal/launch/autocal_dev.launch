@@ -3,15 +3,16 @@
     <arg name="roi_lanes_yaml" default="$(find autocal)/config/roi_lanes.yaml" />
     <arg name="image_topic" default="/camera/image_raw" />
     <arg name="radar_topic" default="/point_cloud" />
+    <arg name="camera_info_topic" default="/camera/camera_info" />
     <arg name="offline_sources_json" default="$(find autocal)/config/offline_sources.json" />
     <arg name="offline_source_name" default="default" />
+    <arg name="use_offline_provider" default="true" />
     <arg name="launch_real_gui" default="true" />
     <arg name="projection_visual_z_offset_m" default="0.6" />
     <arg name="autostart_extrinsic_delay_sec" default="-1.0" />
     <arg name="autostart_min_tracks" default="1" />
 
-    <!-- 실센서 모드: 아래 offline_provider 노드 블록을 XML 주석으로 감싸 비활성화하면 됩니다.-->
-    <node pkg="autocal" type="offline_provider_node.py" name="offline_provider" output="screen">
+    <node if="$(arg use_offline_provider)" pkg="autocal" type="offline_provider_node.py" name="offline_provider" output="screen">
         <param name="sources_json" value="$(arg offline_sources_json)" />
         <param name="source_name" value="$(arg offline_source_name)" />
         <param name="out_image_topic" value="$(arg image_topic)" />
@@ -63,6 +64,9 @@
 
     <node pkg="autocal" type="calibration_diagnosis_node.py" name="trajectory_eval" output="screen" />
     <node if="$(arg launch_real_gui)" pkg="autocal" type="real_gui.py" name="real_gui" output="screen" >
+        <param name="image_topic" value="$(arg image_topic)" />
+        <param name="radar_topic" value="$(arg radar_topic)" />
+        <param name="camera_info_topic" value="$(arg camera_info_topic)" />
         <param name="autostart_extrinsic_delay_sec" value="$(arg autostart_extrinsic_delay_sec)" />
         <param name="autostart_min_tracks" value="$(arg autostart_min_tracks)" />
         <param name="projection_visual_z_offset_m" value="$(arg projection_visual_z_offset_m)" />

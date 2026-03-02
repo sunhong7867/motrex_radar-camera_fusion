@@ -1,0 +1,13 @@
+<launch>
+  <arg name="radar_ip_addr" default="192.168.137.15"/>
+  <arg name="radar_z_offset" default="0"/>
+
+  <!-- Radar topic publisher -->
+  <node pkg="4fn_basic_viewer" type="radar_node" name="radar_node" output="screen">
+    <param name="ip_addr" value="$(arg radar_ip_addr)"/>
+    <param name="z_offset" value="$(arg radar_z_offset)"/>
+  </node>
+
+  <!-- Camera topic publisher -->
+  <node pkg="mv_camera" type="camera_node.py" name="mindvision_camera_node" output="screen"/>
+</launch>

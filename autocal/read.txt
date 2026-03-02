@@ -29,12 +29,35 @@ source devel/setup.bash
 
 3. Execution Steps
 
-   (A) One-shot Consumer Calibration (Perception + Consumer GUI together)
+(A) One-shot Consumer Calibration (Perception + Consumer GUI together)
 roslaunch autocal autocal.launch
 
-   (B) Developer flow (Perception + real_gui together)
+(B) Developer flow (Perception + real_gui together)
 roslaunch autocal autocal_dev.launch
 
+(C) Real sensor topics only launch (Radar + Camera topic publisher)
+roslaunch autocal autocal_real_sensors.launch
+
+(C-1) Calibration GUI / pipeline launch (run in another terminal)
+roslaunch autocal autocal.launch
+or
+roslaunch autocal autocal_dev.launch
+
+(D) Topic-only quick check (without calibration pipeline)
+roscore
+rosrun mv_camera camera_node.py
+rosrun 4fn_basic_viewer radar_node _ip_addr:=192.168.137.15 _z_offset:=0
+rostopic list
+rostopic hz /camera/image_raw
+rostopic hz /point_cloud
+
+
+실센서 사용 시 빌드는 워크스페이스 루트에서 1회만 수행하면 됩니다.
+catkin_make는 패키지(autocal, mv_camera, 4fn_basic_viewer)별로 따로 실행할 필요가 없습니다.
+변경이 잦거나 개별 빌드가 필요하면 아래처럼 특정 패키지만 빌드할 수 있습니다.
+catkin_make --pkg autocal
+catkin_make --pkg mv_camera
+catkin_make --pkg 4fn_basic_viewer
 
 rosrun autocal autocal_batch_runner.py _iterations:=1
 
