@@ -7,10 +7,12 @@
     <arg name="offline_sources_json" default="$(find autocal)/config/offline_sources.json" />
     <arg name="offline_source_name" default="default" />
     <arg name="use_offline_provider" default="True" />
+    <arg name="use_sim_time" default="false" />
     <arg name="launch_real_gui" default="true" />
     <arg name="projection_visual_z_offset_m" default="0.6" />
     <arg name="autostart_extrinsic_delay_sec" default="-1.0" />
     <arg name="autostart_min_tracks" default="1" />
+    <param name="/use_sim_time" value="$(arg use_sim_time)" />
 
     <node if="$(arg use_offline_provider)" pkg="autocal" type="offline_provider_node.py" name="offline_provider" output="screen">
         <param name="sources_json" value="$(arg offline_sources_json)" />

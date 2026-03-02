@@ -290,7 +290,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
         # (1) Visual Options
         gb_vis = QtWidgets.QGroupBox("1. Visual Options")
         g_vis = QtWidgets.QGridLayout(gb_vis)
-        self.chk_grid = QtWidgets.QCheckBox("Purple Grid"); self.chk_grid.setChecked(True)
+        self.chk_grid = QtWidgets.QCheckBox("Grid + XYZ Axis"); self.chk_grid.setChecked(True)
         self.chk_bbox = QtWidgets.QCheckBox("Vehicle Box"); self.chk_bbox.setChecked(True)
         self.chk_raw = QtWidgets.QCheckBox("Raw Radar Pts"); self.chk_raw.setChecked(True)
         self.chk_noise_filter = QtWidgets.QCheckBox("Noise Filter (<5km/h)"); self.chk_noise_filter.setChecked(True)
@@ -418,11 +418,43 @@ class ManualCalibWindow(QtWidgets.QDialog):
 
     def _draw_grid_and_axis(self, img, K, cx, cy):
         """
-        화면 오버레이 도형/선을 안전하게 그린다
+        바닥 그리드와 XYZ 축 오버레이를 함께 그린다
         """
-        grid_z = -1.5; grid_color = (0, 255, 0)
-        for x in np.arange(-15, 16, 3): self._draw_safe_line(img, [x, 0, grid_z], [x, 100, grid_z], K, cx, cy, grid_color)
-        for y in range(0, 101, 10): self._draw_safe_line(img, [-15, y, grid_z], [15, y, grid_z], K, cx, cy, grid_color)
+        grid_z = -1.5
+        grid_color = (0, 255, 0)
+        for x in np.arange(-15, 16, 3):
+            self._draw_safe_line(img, [x, 0, grid_z], [x, 100, grid_z], K, cx, cy, grid_color)
+        for y in range(0, 101, 10):
+            self._draw_safe_line(img, [-15, y, grid_z], [15, y, grid_z], K, cx, cy, grid_color)
+
+        axis_len = AXIS_LENGTH
+        axis_specs = [
+            ("X", [axis_len, 0, 0], (0, 0, 255)),
+            ("Y", [0, axis_len, 0], (0, 255, 0)),
+            ("Z", [0, 0, axis_len], (255, 0, 0)),
+        ]
+        for axis_name, p_end, color in axis_specs:
+            uv, valid = project_points(
+                K,
+                self.T_current[:3, :3],
+                self.T_current[:3, 3],
+                np.array([[0.0, 0.0, 0.0], p_end], dtype=np.float64),
+            )
+            if not (valid[0] and valid[1]):
+                continue
+            p0 = (int(uv[0, 0]), int(uv[0, 1]))
+            p1 = (int(uv[1, 0]), int(uv[1, 1]))
+            cv2.arrowedLine(img, p0, p1, color, 3, tipLength=0.2)
+            cv2.putText(
+                img,
+                axis_name,
+                (p1[0] + 4, p1[1] - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
 
 
     def _draw_safe_line(self, img, p1, p2, K, cx, cy, color):
@@ -770,39 +802,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_diag.setLayout(v_diag)
         vbox.addWidget(gb_diag)
 
-        # 3. Calibration Accuracy (New)
-        gb2 = QtWidgets.QGroupBox("3. Accuracy / Score")
-        v2 = QtWidgets.QVBoxLayout()
-        
-        h_acc = QtWidgets.QHBoxLayout()
-        lbl_calib = QtWidgets.QLabel("Calibration Accuracy")
-        self.bar_calib_acc = QtWidgets.QProgressBar()
-        self.bar_calib_acc.setRange(0, 100)
-        self.bar_calib_acc.setValue(0)
-        self.bar_calib_acc.setStyleSheet("QProgressBar::chunk { background-color: #4CAF50; }")
-        lbl_emoji = QtWidgets.QLabel("😐")
-        lbl_emoji.setStyleSheet("font-size: 30px;")
-        self.lbl_emoji = lbl_emoji
-        h_acc.addWidget(lbl_calib)
-        h_acc.addStretch(1)
-        h_acc.addWidget(self.lbl_emoji)
-
-        h_score = QtWidgets.QHBoxLayout()
-        lbl_speed_score = QtWidgets.QLabel("Track Speed Score")
-        self.bar_speed_score = QtWidgets.QProgressBar()
-        self.bar_speed_score.setRange(0, 100)
-        self.bar_speed_score.setValue(0)
-        self.bar_speed_score.setStyleSheet("QProgressBar::chunk { background-color: #2196F3; }")
-        h_score.addWidget(lbl_speed_score)
-        
-        v2.addLayout(h_acc)
-        v2.addWidget(self.bar_calib_acc)
-        v2.addLayout(h_score)
-        v2.addWidget(self.bar_speed_score)
-        gb2.setLayout(v2); vbox.addWidget(gb2)
-
-        # 4. Lane Editor
-        gb_lane = QtWidgets.QGroupBox("4. Lane Editor")
+        # 3. Lane Editor
+        gb_lane = QtWidgets.QGroupBox("3. Lane Editor")
         v_l = QtWidgets.QVBoxLayout()
         btn_edit = QtWidgets.QPushButton("🖌️ Open Editor")
         btn_edit.setStyleSheet("background-color: #FFD700; color: black; font-weight: bold; padding: 10px;")
@@ -811,8 +812,8 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         gb_lane.setLayout(v_l)
         vbox.addWidget(gb_lane)
 
-        # 5. Data Logging
-        gb_logging = QtWidgets.QGroupBox("5. Data Logging")
+        # 4. Data Logging
+        gb_logging = QtWidgets.QGroupBox("4. Data Logging")
         v_log = QtWidgets.QVBoxLayout()
         v_log.setSpacing(10)
 
@@ -839,14 +840,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         
         vbox.addWidget(gb_logging)
 
-        # 6. View Options
-        gb_vis = QtWidgets.QGroupBox("6. View Options")
+        # 5. View Options
+        btn_view_options = QtWidgets.QPushButton("👁️ Open View Options")
+        btn_view_options.clicked.connect(self.open_view_options)
+        vbox.addWidget(btn_view_options)
+
+        gb_vis = QtWidgets.QGroupBox("View Options")
         v_vis = QtWidgets.QVBoxLayout()
-        gb_vis.setVisible(False)
-        self._gb_vis_parent_layout = vbox
-        self.btn_toggle_vis = QtWidgets.QPushButton("👁️ Show View Options")
-        self.btn_toggle_vis.clicked.connect(self._toggle_view_options)
-        vbox.addWidget(self.btn_toggle_vis)
+        gb_vis.setVisible(True)
         
         self.chk_show_id = QtWidgets.QCheckBox("Show ID Text")
         self.chk_show_id.setChecked(True)
@@ -884,7 +885,12 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             "Cluster Center (Calibration)",
         ])
 
-        v_vis.addWidget(QtWidgets.QLabel("Text / Labels"))
+        def _make_section_label(text: str) -> QtWidgets.QLabel:
+            lbl = QtWidgets.QLabel(text)
+            lbl.setStyleSheet("font-weight: bold;")
+            return lbl
+
+        v_vis.addWidget(_make_section_label("Text / Labels"))
         v_vis.addWidget(self.chk_show_id)
         v_vis.addWidget(self.chk_show_speed)
 
@@ -893,7 +899,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         sep1.setFrameShadow(QtWidgets.QFrame.Sunken)
         v_vis.addWidget(sep1)
 
-        v_vis.addWidget(QtWidgets.QLabel("Boxes / Reference"))
+        v_vis.addWidget(_make_section_label("Boxes / Reference"))
         v_vis.addWidget(self.chk_show_boxes)
         v_vis.addWidget(self.chk_show_targets)
 
@@ -902,7 +908,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         sep2.setFrameShadow(QtWidgets.QFrame.Sunken)
         v_vis.addWidget(sep2)
 
-        v_vis.addWidget(QtWidgets.QLabel("Radar / Tracks"))
+        v_vis.addWidget(_make_section_label("Radar / Tracks"))
         v_vis.addWidget(self.chk_show_radar)
         v_vis.addWidget(self.chk_show_rep_points)
         v_vis.addWidget(self.chk_show_cluster_points)
@@ -914,18 +920,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         sep3.setFrameShadow(QtWidgets.QFrame.Sunken)
         v_vis.addWidget(sep3)
 
-        v_vis.addWidget(QtWidgets.QLabel("Association Settings"))
-        v_vis.addWidget(QtWidgets.QLabel("BBox Reference (Auto)"))
-        v_vis.addWidget(self.cmb_bbox_ref)
-        v_vis.addWidget(QtWidgets.QLabel("Magnet Source"))
-        v_vis.addWidget(self.cmb_magnet_mode)
-
-        sep4 = QtWidgets.QFrame()
-        sep4.setFrameShape(QtWidgets.QFrame.HLine)
-        sep4.setFrameShadow(QtWidgets.QFrame.Sunken)
-        v_vis.addWidget(sep4)
-
-        v_vis.addWidget(QtWidgets.QLabel("Lane Overlay"))
+        v_vis.addWidget(_make_section_label("Lane Overlay"))
         v_vis.addWidget(self.chk_show_poly)
 
         self.chk_lanes = {}
@@ -940,6 +935,17 @@ class RealWorldGUI(QtWidgets.QMainWindow):
             g_vis.addWidget(chk, i // 2, i % 2)
 
         v_vis.addLayout(g_vis)
+        
+        sep4 = QtWidgets.QFrame()
+        sep4.setFrameShape(QtWidgets.QFrame.HLine)
+        sep4.setFrameShadow(QtWidgets.QFrame.Sunken)
+        v_vis.addWidget(sep4)
+
+        v_vis.addWidget(_make_section_label("Association Settings"))
+        v_vis.addWidget(QtWidgets.QLabel("BBox Reference (Auto)"))
+        v_vis.addWidget(self.cmb_bbox_ref)
+        v_vis.addWidget(QtWidgets.QLabel("Magnet Source"))
+        v_vis.addWidget(self.cmb_magnet_mode)
 
         btn_reset_id = QtWidgets.QPushButton("Reset Local IDs")
         btn_reset_id.clicked.connect(self.reset_ids)
@@ -947,7 +953,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         
         gb_vis.setLayout(v_vis)
         self.gb_vis = gb_vis
-        vbox.addWidget(gb_vis)
 
         # 하단 여백 추가
         vbox.addStretch()
@@ -973,28 +978,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.lane_counters = {name: 0 for name in self.lane_counters.keys()}
         self.global_to_local_ids = {}
         self.vehicle_lane_paths = {}
-
-    def _toggle_view_options(self):
-        """
-        뷰 옵션 토글 상태를 반영
-        """
-        # 1. 다이얼로그가 없으면 딱 한 번만 생성
-        if self.view_options_dialog is None:
-            self.view_options_dialog = ViewOptionsDialog(self)
-        
-        # 2. 이미 열려있으면 숨김
-        if self.view_options_dialog.isVisible():
-            self.view_options_dialog.hide()
-            if hasattr(self, "btn_toggle_vis"):
-                self.btn_toggle_vis.setText("👁️ Show View Options")
-        
-        # 3. 닫혀있으면 보임
-        else:
-            self.view_options_dialog.show()
-            self.view_options_dialog.raise_()
-            self.view_options_dialog.activateWindow()
-            if hasattr(self, "btn_toggle_vis"):
-                self.btn_toggle_vis.setText("👁️ Hide View Options")
 
     def _start_diagnostic_ros(self):
         """
@@ -1420,20 +1403,6 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                     self.radar_track_hist.setdefault(g_id, deque(maxlen=self.track_hist_len)).append(cluster_pt)
 
             # 5. 전역 UI 업데이트
-            if calib_scores:
-                avg = sum(calib_scores) / len(calib_scores)
-                self.bar_calib_acc.setValue(int(avg))
-                self.lbl_emoji.setText("😊" if avg >= 80 else "😐" if avg >= 50 else "😟")
-            else:
-                self.bar_calib_acc.setValue(0)
-                self.lbl_emoji.setText("😐")
-
-            if speed_scores:
-                avg_speed = sum(speed_scores) / len(speed_scores)
-                self.bar_speed_score.setValue(int(avg_speed))
-            else:
-                self.bar_speed_score.setValue(0)
-
             if self.data_logger.is_recording:
                  self.lbl_record_status.setText(f"Recording... [{self.data_logger.record_count} pts]")
 
@@ -1538,7 +1507,29 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         except Exception as e:
             print(f"[GUI Error] update_loop failed: {e}")
             traceback.print_exc()
-            
+    
+    def open_view_options(self):
+        """
+        뷰 옵션 다이얼로그를 중앙에 열기
+        """
+        if self.view_options_dialog is None:
+            self.view_options_dialog = ViewOptionsDialog(self)
+        else:
+            if self.gb_vis.parent() is not self.view_options_dialog:
+                self.gb_vis.setParent(self.view_options_dialog)
+                self.gb_vis.setVisible(True)
+                self.view_options_dialog.layout().addWidget(self.gb_vis)
+            self.view_options_dialog.adjustSize()
+
+        main_geo = self.geometry()
+        frame_geo = self.view_options_dialog.frameGeometry()
+        frame_geo.moveCenter(main_geo.center())
+        self.view_options_dialog.move(frame_geo.topLeft())
+
+        self.view_options_dialog.show()
+        self.view_options_dialog.raise_()
+        self.view_options_dialog.activateWindow()
+
     def open_lane_editor(self):
         """
         차선 편집 다이얼로그를 연다
@@ -1546,6 +1537,10 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         if self.cv_image is None:
             return
         dlg = LaneEditorDialog(self.cv_image, self.lane_polys, self)
+        dlg.adjustSize()
+        frame_geo = dlg.frameGeometry()
+        frame_geo.moveCenter(self.geometry().center())
+        dlg.move(frame_geo.topLeft())
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             self.lane_polys = dlg.get_polys()
             self.save_lane_polys()

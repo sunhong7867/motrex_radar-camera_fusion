@@ -20,6 +20,7 @@
 import json
 import os
 import re
+import time
 from collections import deque
 
 import cv2
@@ -107,6 +108,8 @@ class ExtrinsicCalibrationManager:
         self.curr_t = np.array([[0.0], [0.0], [0.0]], dtype=np.float64)
 
         self.collection_start_time = None
+        self.collection_start_wall = None
+        self._warned_stuck_sim_time = False
         self.is_calibrating = False
         self._load_extrinsic()
 
@@ -177,6 +180,7 @@ class ExtrinsicCalibrationManager:
 
         if self.collection_start_time is None:
             self.collection_start_time = rospy.Time.now()
+            self.collection_start_wall = time.monotonic()
 
         radar_raw = np.array(list(pc2.read_points(rad_msg, field_names=("x", "y", "z", "doppler"), skip_nans=True)))
         if radar_raw.shape[0] == 0:
@@ -222,7 +226,12 @@ class ExtrinsicCalibrationManager:
             self.track_buffer[det.id].append((nc, obj_3d_pts[idx], (u_target, v_target)))
 
         total = sum(len(d) for d in self.track_buffer.values() if len(d) >= self.min_track_len)
-        elapsed = (rospy.Time.now() - self.collection_start_time).to_sec()
+        elapsed_ros = (rospy.Time.now() - self.collection_start_time).to_sec()
+        elapsed_wall = time.monotonic() - (self.collection_start_wall or time.monotonic())
+        if elapsed_ros <= 0.0 and bool(rospy.get_param("/use_sim_time", False)) and not self._warned_stuck_sim_time:
+            rospy.logwarn("[Autocal] ROS sim time is not advancing; fallback to wall-clock for req_duration gating")
+            self._warned_stuck_sim_time = True
+        elapsed = elapsed_ros if elapsed_ros > 0.0 else elapsed_wall
         rospy.loginfo_throttle(2.0, f"[Autocal] Collection progress: {total}/{self.min_samples}\n- elapsed: {elapsed:.1f}s")
 
         if elapsed >= self.req_duration and total >= self.min_samples:
