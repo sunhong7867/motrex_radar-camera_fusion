@@ -74,8 +74,8 @@ rosparam set use_sim_time true
 rosbag play --clock test.bag
 
 RROR bag unindexed
-rosbag reindex /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/test.bag
-rosbag info /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/test.bag
+rosbag reindex /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/*.bag
+rosbag info /home/sh/motrex/catkin_ws/src/autocal/models/rosbag/skku_overpass_03.bag
 ___________________________________________________________________________
 
 업그레이드

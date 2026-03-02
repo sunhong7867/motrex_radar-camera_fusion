@@ -264,17 +264,30 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         # UI 초기화
         self._init_ui()
 
+        # 런치에서 전달되는 토픽 파라미터를 우선 사용 (기본값은 기존 상수 유지)
+        self.topic_image = rospy.get_param("~image_topic", TOPIC_IMAGE)
+        self.topic_radar = rospy.get_param("~radar_topic", TOPIC_RADAR)
+        self.topic_camera_info = rospy.get_param("~camera_info_topic", TOPIC_CAMERA_INFO)
+
         # ROS 구독 설정
-        img_sub   = message_filters.Subscriber(TOPIC_IMAGE,  Image)
-        radar_sub = message_filters.Subscriber(TOPIC_RADAR,  PointCloud2)
+        img_sub   = message_filters.Subscriber(self.topic_image,  Image)
+        radar_sub = message_filters.Subscriber(self.topic_radar,  PointCloud2)
         self.ts   = message_filters.ApproximateTimeSynchronizer(
             [img_sub, radar_sub], 10, 0.1
         )
         self.ts.registerCallback(self._cb_sync)
-        rospy.Subscriber(TOPIC_CAMERA_INFO, CameraInfo,       self._cb_info,             queue_size=1)
-        rospy.Subscriber(TOPIC_FINAL_OUT,   AssociationArray, self._cb_final_result,      queue_size=1)
-        rospy.Subscriber(TOPIC_ASSOCIATED,  AssociationArray, self._cb_association_result,queue_size=1)
-        rospy.Subscriber(TOPIC_TRACKS,      DetectionArray,   self._cb_tracker_result,    queue_size=1)
+        info_cb = getattr(self, "_cb_info", None) or getattr(self, "cb_info", None)
+        if info_cb is None:
+            raise AttributeError("ConsumerGUI camera_info callback is not defined")
+        rospy.Subscriber(self.topic_camera_info, CameraInfo, info_cb, queue_size=1)
+        final_cb = getattr(self, "_cb_final_result", None) or getattr(self, "cb_final_result", None)
+        assoc_cb = getattr(self, "_cb_association_result", None) or getattr(self, "cb_association_result", None)
+        track_cb = getattr(self, "_cb_tracker_result", None) or getattr(self, "cb_tracker_result", None)
+        if final_cb is None or assoc_cb is None or track_cb is None:
+            raise AttributeError("ConsumerGUI result callbacks are not fully defined")
+        rospy.Subscriber(TOPIC_FINAL_OUT, AssociationArray, final_cb, queue_size=1)
+        rospy.Subscriber(TOPIC_ASSOCIATED, AssociationArray, assoc_cb, queue_size=1)
+        rospy.Subscriber(TOPIC_TRACKS, DetectionArray, track_cb, queue_size=1)
 
         # 주기 타이머
         self.timer = QtCore.QTimer()
@@ -468,6 +481,12 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         if self.cam_K is None:
             self.cam_K = np.array(msg.K).reshape(3, 3)
 
+    def cb_info(self, msg):
+        """
+        하위 호환용 래퍼: 외부 코드가 cb_info를 참조해도 동작하도록 유지
+        """
+        self._cb_info(msg)
+
     def _cb_final_result(self, msg):
         """
         ROS 콜백 입력 메시지를 내부 상태로 반영
@@ -488,6 +507,12 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.vis_objects = objects
         self.last_update_time = time.time()
 
+    def cb_final_result(self, msg):
+        """
+        하위 호환용 래퍼: 외부 코드가 cb_final_result를 참조해도 동작하도록 유지
+        """
+        self._cb_final_result(msg)
+
     def _cb_association_result(self, msg):
         """
         ROS 콜백 입력 메시지를 내부 상태로 반영
@@ -496,6 +521,12 @@ class ConsumerGUI(QtWidgets.QMainWindow):
             if np.isfinite(obj.speed_kph):
                 self.assoc_speed_by_id[obj.id] = obj.speed_kph
         self.assoc_last_update_time = time.time()
+
+    def cb_association_result(self, msg):
+        """
+        하위 호환용 래퍼: 외부 코드가 cb_association_result를 참조해도 동작하도록 유지
+        """
+        self._cb_association_result(msg)
 
     def _cb_tracker_result(self, msg):
         """
@@ -511,6 +542,12 @@ class ConsumerGUI(QtWidgets.QMainWindow):
                     "vel":  float("nan"),
                 })
             self.vis_objects = objects
+
+    def cb_tracker_result(self, msg):
+        """
+        하위 호환용 래퍼: 외부 코드가 cb_tracker_result를 참조해도 동작하도록 유지
+        """
+        self._cb_tracker_result(msg)
 
     def _update_loop(self):
         """
@@ -1024,20 +1061,29 @@ def _fmt_time(sec: float) -> str:
     return f"{m:02d}m {s:02d}s"
 
 def main():
-    app = QtWidgets.QApplication(sys.argv)
+    try:
+        app = QtWidgets.QApplication(sys.argv)
 
-    def _qt_msg_handler(mode, context, msg):
-        if not msg.startswith("QPainter::end"):
-            sys.stderr.write(msg + "\n")
-    QtCore.qInstallMessageHandler(_qt_msg_handler)
+        def _qt_msg_handler(mode, context, msg):
+            if not msg.startswith("QPainter::end"):
+                sys.stderr.write(msg + "\n")
+        QtCore.qInstallMessageHandler(_qt_msg_handler)
 
-    dlg = StartupDialog()
-    result = dlg.exec()
-    do_autocal = (result == QtWidgets.QDialog.Accepted)
+        dlg = StartupDialog()
+        result = dlg.exec()
+        do_autocal = (result == QtWidgets.QDialog.Accepted)
 
-    gui = ConsumerGUI(do_autocal=do_autocal)
-    gui.show()
-    sys.exit(app.exec())
+        gui = ConsumerGUI(do_autocal=do_autocal)
+        gui.show()
+        sys.exit(app.exec())
+    except Exception:
+        err = traceback.format_exc()
+        try:
+            rospy.logfatal(f"[consumer_gui] startup failed:\n{err}")
+        except Exception:
+            pass
+        sys.stderr.write(err + "\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

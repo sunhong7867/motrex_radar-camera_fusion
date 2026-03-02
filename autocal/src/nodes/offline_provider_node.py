@@ -21,10 +21,12 @@
 
 import json
 import os
+import time
 
 import rosbag
 import rospy
 from rospkg import RosPack
+from rosbag.bag import ROSBagException, ROSBagFormatException, ROSBagUnindexedException
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 
 # ---------------------------------------------------------
@@ -85,6 +87,12 @@ class OfflineProvider:
 
         rospy.loginfo(f"[OfflineProvider] Loading CameraInfo: {self.intrinsic_path}")
         self.camera_info = self.load_camera_info(self.intrinsic_path)
+
+        if bool(rospy.get_param("/use_sim_time", False)):
+            rospy.logwarn(
+                "[OfflineProvider] /use_sim_time is true. "
+                "This node replays with wall-clock timing; leave /use_sim_time false when not using rosbag --clock."
+            )
 
     def _apply_source_config_from_json(self):
         """
@@ -161,33 +169,70 @@ class OfflineProvider:
         rospy.loginfo(f"[OfflineProvider] Start playback: {self.bag_path}")
 
         while not rospy.is_shutdown():
-            with rosbag.Bag(self.bag_path) as bag:
-                start_time_real = None
-                start_time_ros = None
+            try:
+                with rosbag.Bag(self.bag_path, mode="r", allow_unindexed=True) as bag:
+                    topic_info = bag.get_type_and_topic_info().topics
+                    available_topics = set(topic_info.keys())
+                    requested_topics = {self.bag_image_topic, self.bag_radar_topic}
+                    missing_topics = [t for t in requested_topics if t not in available_topics]
+                    if missing_topics:
+                        rospy.logerr(
+                            "[OfflineProvider] Requested bag topics not found. "
+                            f"missing={missing_topics}, available={sorted(available_topics)}"
+                        )
+                        return
 
-                for topic, msg, t in bag.read_messages(topics=[self.bag_image_topic, self.bag_radar_topic]):
-                    if rospy.is_shutdown():
-                        break
+                    start_time_wall = None
+                    start_time_ros = None
+                    published_count = 0
 
-                    if start_time_real is None:
-                        start_time_real = rospy.Time.now().to_sec()
-                        start_time_ros = t.to_sec()
+                    for topic, msg, t in bag.read_messages(topics=[self.bag_image_topic, self.bag_radar_topic]):
+                        if rospy.is_shutdown():
+                            break
 
-                    elapsed_ros = t.to_sec() - start_time_ros
-                    target_real = start_time_real + elapsed_ros
-                    now_real = rospy.Time.now().to_sec()
-                    sleep_dt = target_real - now_real
-                    if sleep_dt > 0:
-                        rospy.sleep(sleep_dt)
+                        if start_time_wall is None:
+                            start_time_wall = time.time()
+                            start_time_ros = t.to_sec()
 
-                    if topic == self.bag_image_topic:
-                        msg.header.stamp = rospy.Time.now()
-                        self.camera_info.header = msg.header
-                        self.pub_img.publish(msg)
-                        self.pub_info.publish(self.camera_info)
-                    elif topic == self.bag_radar_topic:
-                        msg.header.stamp = rospy.Time.now()
-                        self.pub_radar.publish(msg)
+                        elapsed_ros = t.to_sec() - start_time_ros
+                        target_wall = start_time_wall + elapsed_ros
+                        now_wall = time.time()
+                        sleep_dt = target_wall - now_wall
+                        if sleep_dt > 0:
+                            time.sleep(sleep_dt)
+
+                        # 이미지/레이더가 동일한 재생 기준시각을 공유하도록 목표 시각으로 stamp 고정
+                        stamp = rospy.Time.from_sec(target_wall)
+
+                        if topic == self.bag_image_topic:
+                            msg.header.stamp = stamp
+                            self.camera_info.header = msg.header
+                            self.pub_img.publish(msg)
+                            self.pub_info.publish(self.camera_info)
+                            published_count += 1
+                        elif topic == self.bag_radar_topic:
+                            msg.header.stamp = stamp
+                            self.pub_radar.publish(msg)
+                            published_count += 1
+
+                    if published_count == 0:
+                        rospy.logwarn(
+                            "[OfflineProvider] No messages were replayed in this pass. "
+                            "Check bag topics and filters."
+                        )
+                        time.sleep(1.0)
+            except ROSBagUnindexedException:
+                rospy.logerr(
+                    f"[OfflineProvider] Bag is unindexed: {self.bag_path}. "
+                    f"Run: rosbag reindex {self.bag_path}"
+                )
+                return
+            except ROSBagFormatException as exc:
+                rospy.logerr(f"[OfflineProvider] Invalid/corrupted bag format: {self.bag_path} ({exc})")
+                return
+            except ROSBagException as exc:
+                rospy.logerr(f"[OfflineProvider] Failed to read bag: {self.bag_path} ({exc})")
+                return
 
             rospy.loginfo("[OfflineProvider] Replaying bag from beginning")
 

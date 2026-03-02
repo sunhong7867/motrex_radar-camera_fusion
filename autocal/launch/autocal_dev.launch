@@ -6,7 +6,7 @@
     <arg name="camera_info_topic" default="/camera/camera_info" />
     <arg name="offline_sources_json" default="$(find autocal)/config/offline_sources.json" />
     <arg name="offline_source_name" default="default" />
-    <arg name="use_offline_provider" default="true" />
+    <arg name="use_offline_provider" default="True" />
     <arg name="launch_real_gui" default="true" />
     <arg name="projection_visual_z_offset_m" default="0.6" />
     <arg name="autostart_extrinsic_delay_sec" default="-1.0" />

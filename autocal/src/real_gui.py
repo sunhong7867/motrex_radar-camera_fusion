@@ -520,6 +520,14 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.extrinsic_path = os.path.join(pkg_path, "config", "extrinsic.json")
         self.lane_json_path = os.path.join(pkg_path, "config", "lane_polys.json")
 
+        # 런치에서 전달되는 토픽 파라미터를 우선 사용 (기본값은 기존 상수 유지)
+        self.topic_image = rospy.get_param("~image_topic", TOPIC_IMAGE)
+        self.topic_radar = rospy.get_param("~radar_topic", TOPIC_RADAR)
+        self.topic_camera_info = rospy.get_param("~camera_info_topic", TOPIC_CAMERA_INFO)
+        rospy.loginfo(
+            f"[real_gui] topics image={self.topic_image}, radar={self.topic_radar}, info={self.topic_camera_info}"
+        )
+
         self.cv_image = None
         self.radar_points = None
         self.radar_doppler = None
@@ -575,13 +583,13 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.load_lane_polys()
         self.init_ui()
 
-        image_sub = message_filters.Subscriber(TOPIC_IMAGE, Image)
-        radar_sub = message_filters.Subscriber(TOPIC_RADAR, PointCloud2)
+        image_sub = message_filters.Subscriber(self.topic_image, Image)
+        radar_sub = message_filters.Subscriber(self.topic_radar, PointCloud2)
 
         self.ts = message_filters.ApproximateTimeSynchronizer([image_sub, radar_sub], 10, 0.1)
         self.ts.registerCallback(self.cb_sync)
 
-        rospy.Subscriber(TOPIC_CAMERA_INFO, CameraInfo, self.cb_info, queue_size=1)
+        rospy.Subscriber(self.topic_camera_info, CameraInfo, self.cb_info, queue_size=1)
         rospy.Subscriber(TOPIC_FINAL_OUT, AssociationArray, self.cb_final_result, queue_size=1)
         rospy.Subscriber(TOPIC_ASSOCIATED, AssociationArray, self.cb_association_result, queue_size=1)
         rospy.Subscriber(TOPIC_TRACKS, DetectionArray, self.cb_tracker_result, queue_size=1)
@@ -1704,17 +1712,24 @@ class RealWorldGUI(QtWidgets.QMainWindow):
 def main():
     try:
         app = QtWidgets.QApplication(sys.argv)
+
         def _qt_msg_handler(mode, context, message):
             if message.startswith("QPainter::end: Painter ended with"):
                 return
-            sys.stderr.write(message + " ")
+            sys.stderr.write(message + "\n")
 
         QtCore.qInstallMessageHandler(_qt_msg_handler)
         gui = RealWorldGUI()
         gui.show()
         sys.exit(app.exec())
     except Exception:
-        traceback.print_exc()
+        err = traceback.format_exc()
+        try:
+            rospy.logfatal(f"[real_gui] startup failed:\n{err}")
+        except Exception:
+            pass
+        sys.stderr.write(err + "\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
