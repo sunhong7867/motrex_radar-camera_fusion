@@ -136,7 +136,7 @@ class LaneEditorDialog(QtWidgets.QDialog):
         scroll = QtWidgets.QScrollArea()
         self.canvas = LaneCanvas(bg_img, self.polys)
         scroll.setWidget(self.canvas)
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(False)
         scroll.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(scroll)
         btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)

@@ -481,7 +481,7 @@ class ManualCalibWindow(QtWidgets.QDialog):
 
     def closeEvent(self, e): 
         """
-        종료 시 리소스를 정리하고 마무리 처리
+        종료 버튼 클릭 시 창을 숨김 처리
         """
         self._timer.stop() 
         super().closeEvent(e)
@@ -509,33 +509,17 @@ class ViewOptionsDialog(QtWidgets.QDialog):
         self.setFixedSize(size.width() + 40, size.height() + 40)
         
         main_geo = gui.geometry()
-        x = main_geo.x() + main_geo.width() - self.width() - 20
+        x = main_geo.x() + main_geo.width() - self.width() - 20        # 5. View Options
+
         y = main_geo.y() + main_geo.height() - self.height() - 60
         self.move(max(main_geo.x(), x), max(main_geo.y(), y))
 
     def closeEvent(self, event):
         """
-        종료 시 리소스를 정리하고 마무리 처리
+        종료 버튼 클릭 시 창을 숨김 처리
         """
-        # [수정] 위젯을 돌려보내지 않고 창만 숨깁니다 (Hide)
-        event.ignore()  # 창이 파괴되는 것을 막음
+        event.ignore()
         self.hide()
-        
-        # 메인 윈도우 버튼 텍스트 복구
-        if hasattr(self.gui, "btn_toggle_vis"):
-            self.gui.btn_toggle_vis.setText("👁️ Show View Options")
-
-    def closeEvent(self, event):
-        """
-        종료 시 리소스를 정리하고 마무리 처리
-        """
-        self.gui.gb_vis.setParent(self._original_parent)
-        if self._original_layout is not None:
-            self._original_layout.addWidget(self.gui.gb_vis)
-        self.gui.gb_vis.setVisible(False)
-        if hasattr(self.gui, "btn_toggle_vis"):
-            self.gui.btn_toggle_vis.setText("👁️ Show View Options")
-        super().closeEvent(event)
 
 class RealWorldGUI(QtWidgets.QMainWindow):
     def __init__(self):
@@ -610,6 +594,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         self.speed_soft_max_kmh = 100.0
         self.data_logger = DataLogger()
         self.latest_frame = None
+        self.exit_process_group_on_close = bool(rospy.get_param("~exit_process_group_on_close", True))
 
         self.load_extrinsic()
         self.load_lane_polys()
@@ -840,14 +825,18 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         
         vbox.addWidget(gb_logging)
 
-        # 5. View Options
-        btn_view_options = QtWidgets.QPushButton("👁️ Open View Options")
-        btn_view_options.clicked.connect(self.open_view_options)
-        vbox.addWidget(btn_view_options)
+        # 5. Visualization
+        gb_view = QtWidgets.QGroupBox("5. Visualization")
+        v_view = QtWidgets.QVBoxLayout()
+        self.btn_view_options = QtWidgets.QPushButton("👁️ Open View Options")
+        self.btn_view_options.clicked.connect(self.open_view_options)
+        v_view.addWidget(self.btn_view_options)
+        gb_view.setLayout(v_view)
+        vbox.addWidget(gb_view)
 
-        gb_vis = QtWidgets.QGroupBox("View Options")
+        gb_vis = QtWidgets.QGroupBox("View Options", panel)
         v_vis = QtWidgets.QVBoxLayout()
-        gb_vis.setVisible(True)
+        gb_vis.setVisible(False)
         
         self.chk_show_id = QtWidgets.QCheckBox("Show ID Text")
         self.chk_show_id.setChecked(True)
@@ -963,6 +952,7 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         panel_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         panel_scroll.setFixedWidth(panel_width + 16)
         panel_scroll.setWidget(panel)
+        self.panel_scroll = panel_scroll
 
         layout.addWidget(panel_scroll, stretch=0)
                 
@@ -1510,10 +1500,11 @@ class RealWorldGUI(QtWidgets.QMainWindow):
     
     def open_view_options(self):
         """
-        뷰 옵션 다이얼로그를 중앙에 열기
+        뷰 옵션 다이얼로그를 설정 패널 왼쪽에 열기
         """
         if self.view_options_dialog is None:
             self.view_options_dialog = ViewOptionsDialog(self)
+            self.gb_vis.setVisible(True)
         else:
             if self.gb_vis.parent() is not self.view_options_dialog:
                 self.gb_vis.setParent(self.view_options_dialog)
@@ -1521,10 +1512,19 @@ class RealWorldGUI(QtWidgets.QMainWindow):
                 self.view_options_dialog.layout().addWidget(self.gb_vis)
             self.view_options_dialog.adjustSize()
 
-        main_geo = self.geometry()
         frame_geo = self.view_options_dialog.frameGeometry()
-        frame_geo.moveCenter(main_geo.center())
-        self.view_options_dialog.move(frame_geo.topLeft())
+        if hasattr(self, "panel_scroll") and self.panel_scroll is not None:
+            panel_top_left = self.panel_scroll.mapToGlobal(QtCore.QPoint(0, 0))
+            anchor_y = panel_top_left.y()
+            if hasattr(self, "btn_view_options") and self.btn_view_options is not None:
+                anchor_y = self.btn_view_options.mapToGlobal(QtCore.QPoint(0, 0)).y()
+            x = panel_top_left.x() - frame_geo.width() + 4
+            y = max(0, anchor_y)
+            self.view_options_dialog.move(x, y)
+        else:
+            main_geo = self.geometry()
+            frame_geo.moveCenter(main_geo.center())
+            self.view_options_dialog.move(frame_geo.topLeft())
 
         self.view_options_dialog.show()
         self.view_options_dialog.raise_()
@@ -1537,10 +1537,37 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         if self.cv_image is None:
             return
         dlg = LaneEditorDialog(self.cv_image, self.lane_polys, self)
-        dlg.adjustSize()
+        dlg.setWindowState(QtCore.Qt.WindowNoState)
+        dlg.showNormal()
+
+        screen = QtGui.QGuiApplication.screenAt(self.mapToGlobal(self.rect().center()))
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+
+        img_h, img_w = self.cv_image.shape[:2]
+        preferred_w = img_w + 80
+        preferred_h = img_h + 170
+
+        if screen is not None:
+            avail = screen.availableGeometry()
+            max_w = int(avail.width() * 0.95)
+            max_h = int(avail.height() * 0.95)
+            target_w = min(preferred_w, max_w)
+            target_h = min(preferred_h, max_h)
+            final_w = min(max_w, max(900, target_w))
+            final_h = min(max_h, max(600, target_h))
+            dlg.resize(final_w, final_h)
+
         frame_geo = dlg.frameGeometry()
-        frame_geo.moveCenter(self.geometry().center())
-        dlg.move(frame_geo.topLeft())
+        viewer_center_global = self.viewer.mapToGlobal(self.viewer.rect().center())
+        frame_geo.moveCenter(viewer_center_global)
+        if screen is not None:
+            avail = screen.availableGeometry()
+            left = max(avail.left(), min(frame_geo.left(), avail.right() - frame_geo.width() + 1))
+            top = max(avail.top(), min(frame_geo.top(), avail.bottom() - frame_geo.height() + 1))
+            dlg.move(left, top)
+        else:
+            dlg.move(frame_geo.topLeft())
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             self.lane_polys = dlg.get_polys()
             self.save_lane_polys()
@@ -1690,6 +1717,30 @@ class RealWorldGUI(QtWidgets.QMainWindow):
         except Exception as e:
             print(f"[Intrinsic] finish error: {e}")
             traceback.print_exc()
+
+    def closeEvent(self, event):
+        """
+        GUI 종료 시 ROS/Qt 루프를 함께 종료
+        """
+        try:
+            if hasattr(self, "timer") and self.timer is not None:
+                self.timer.stop()
+            if hasattr(self, "_autostart_poll_timer") and self._autostart_poll_timer is not None:
+                self._autostart_poll_timer.stop()
+            if hasattr(self, "intrinsic_proc") and self.intrinsic_proc is not None:
+                if self.intrinsic_proc.state() != QtCore.QProcess.NotRunning:
+                    self.intrinsic_proc.kill()
+                    self.intrinsic_proc.waitForFinished(500)
+            if not rospy.is_shutdown():
+                rospy.signal_shutdown("GUI window closed")
+        except Exception:
+            traceback.print_exc()
+        if self.exit_process_group_on_close:
+            QtCore.QTimer.singleShot(0, lambda: os.killpg(os.getpgrp(), signal.SIGINT))
+        else:
+            QtWidgets.QApplication.quit()
+        event.accept()
+
 
     def _maybe_reload_extrinsic(self):
         """

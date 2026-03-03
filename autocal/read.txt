@@ -70,7 +70,7 @@ catkin_make --pkg autocal
 catkin_make --pkg mv_camera
 catkin_make --pkg 4fn_basic_viewer
 
-rosrun autocal autocal_batch_runner.py _iterations:=1
+rosrun autocal autocal_batch_runner.py _iterations:=10
 
 
 chmod +x src/autocal/src/nodes/*.py

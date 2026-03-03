@@ -17,6 +17,7 @@
 
 import sys
 import os
+import signal
 import json
 import time
 import re
@@ -211,6 +212,7 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         self.extrinsic_proc   = None
         self.extrinsic_mtime  = None
         self._cal_log_buf     = []
+        self.exit_process_group_on_close = bool(rospy.get_param("~exit_process_group_on_close", True))
 
         # 이미지/레이더 상태
         self.latest_frame     = None
@@ -1000,6 +1002,28 @@ class ConsumerGUI(QtWidgets.QMainWindow):
         for ln, sz in zip(lines, sizes):
             cv2.putText(disp, ln, (x0 + pad, ty), font, sc, (255, 255, 255), th)
             ty += line_h
+
+    def closeEvent(self, event):
+        """
+        메인 창 종료 시 ROS/Qt 및 실행 프로세스 그룹 종료를 요청
+        """
+        try:
+            if hasattr(self, "timer") and self.timer is not None:
+                self.timer.stop()
+            if hasattr(self, "extrinsic_proc") and self.extrinsic_proc is not None:
+                if self.extrinsic_proc.state() != QtCore.QProcess.NotRunning:
+                    self.extrinsic_proc.kill()
+                    self.extrinsic_proc.waitForFinished(500)
+            if not rospy.is_shutdown():
+                rospy.signal_shutdown("consumer gui closed")
+        except Exception:
+            traceback.print_exc()
+
+        if self.exit_process_group_on_close:
+            QtCore.QTimer.singleShot(0, lambda: os.killpg(os.getpgrp(), signal.SIGINT))
+        else:
+            QtWidgets.QApplication.quit()
+        event.accept()
 
     def _load_extrinsic(self):
         """
