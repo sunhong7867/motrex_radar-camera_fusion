@@ -1,6 +1,9 @@
 <launch>
   <arg name="radar_ip_addr" default="192.168.137.15"/>
   <arg name="radar_z_offset" default="0"/>
+  <arg name="camera_info_yaml" default="$(find autocal)/config/camera_intrinsic.yaml"/>
+  <arg name="camera_optical_frame" default="camera_optical_frame"/>
+
 
   <!-- Radar topic publisher -->
   <node pkg="4fn_basic_viewer" type="radar_node" name="radar_node" output="screen">
@@ -9,5 +12,8 @@
   </node>
 
   <!-- Camera topic publisher -->
-  <node pkg="mv_camera" type="camera_node.py" name="mindvision_camera_node" output="screen"/>
+  <node pkg="mv_camera" type="camera_node.py" name="mindvision_camera_node" output="screen">
+    <param name="camera_info_yaml" value="$(arg camera_info_yaml)"/>
+    <param name="camera_optical_frame" value="$(arg camera_optical_frame)"/>
+  </node>
 </launch>

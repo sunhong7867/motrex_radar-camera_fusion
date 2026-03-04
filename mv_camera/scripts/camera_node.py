@@ -5,8 +5,28 @@ import cv2
 import numpy as np
 import mvsdk
 import platform
-from sensor_msgs.msg import Image
+import rosparam
+from sensor_msgs.msg import CameraInfo, Image
 from cv_bridge import CvBridge
+
+def load_camera_info(camera_info_yaml):
+    msg = CameraInfo()
+    if not camera_info_yaml:
+        return msg
+
+    try:
+        params, _ = rosparam.load_file(camera_info_yaml)[0]
+        ci = params.get("camera_info", {})
+        msg.distortion_model = ci.get("distortion_model", "plumb_bob")
+        msg.D = ci.get("D", [])
+        msg.K = ci.get("K", [0.0] * 9)
+        msg.R = ci.get("R", [0.0] * 9)
+        msg.P = ci.get("P", [0.0] * 12)
+        rospy.loginfo(f"Loaded CameraInfo from {camera_info_yaml}")
+    except Exception as exc:
+        rospy.logwarn(f"Failed to load camera_info_yaml ({camera_info_yaml}): {exc}")
+
+    return msg
 
 def main():
     # 1. ROS 노드 초기화
@@ -15,7 +35,11 @@ def main():
     # 2. 토픽 발행자(Publisher) 생성
     # 토픽 이름: /camera/image_raw
     pub = rospy.Publisher('/camera/image_raw', Image, queue_size=10)
+    info_pub = rospy.Publisher('/camera/camera_info', CameraInfo, queue_size=10)
     bridge = CvBridge()
+    camera_info_yaml = rospy.get_param('~camera_info_yaml', '')
+    camera_optical_frame = rospy.get_param('~camera_optical_frame', 'camera_optical_frame')
+    camera_info = load_camera_info(camera_info_yaml)
     
     # 카메라 열거
     DevList = mvsdk.CameraEnumerateDevice()
@@ -76,6 +100,15 @@ def main():
             msg.header.frame_id = "camera_link"
             pub.publish(msg)
 
+            info_msg = camera_info
+            info_msg.header = msg.header
+            info_msg.header.frame_id = camera_optical_frame
+            if info_msg.width == 0:
+                info_msg.width = FrameHead.iWidth
+            if info_msg.height == 0:
+                info_msg.height = FrameHead.iHeight
+            info_pub.publish(info_msg)
+            
             # 5. 카메라 영상 출력
             # cv2.imshow("Camera View", frame)
             # cv2.waitKey(1)
